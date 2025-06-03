@@ -10,6 +10,7 @@ on:
       - '.github/scripts/**'
       - '.abi-check/**'
 
+
   push:
     branches:
       - 6X_STABLE
