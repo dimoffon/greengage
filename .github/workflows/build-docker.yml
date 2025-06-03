@@ -21,9 +21,6 @@ jobs:
           fetch-depth: 0
           submodules: 'recursive'
 
-      - name: Update all submodules
-        run: git submodule foreach --recursive "git pull"
-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
