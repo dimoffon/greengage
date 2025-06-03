@@ -10,6 +10,7 @@ on:
       - '.github/scripts/**'
       - '.abi-check/**'
 
+
   push:
     branches:
       - 6X_STABLE
@@ -39,8 +40,8 @@ jobs:
       - name: Get Greengage version variables
         id: vars
         run: |
-          remote_repo='https://github.com/GreengageDB/greengage.git'
-          git ls-remote --tags --refs --sort='v:refname' $remote_repo '6.*' | tail -n 1  > baseline_version_ref
+          remote_repo='https://github.com/dimoffon/greengage.git'
+          git ls-remote --tags --refs --sort='v:refname' $remote_repo 'main' | tail -n 1  > baseline_version_ref
           baseline_ref=$(cat baseline_version_ref | awk '{print $1}')
           baseline_version=$(cat baseline_version_ref | awk '{print $2}')
           echo "BASELINE_REF=${baseline_ref}" | tee -a $GITHUB_OUTPUT
