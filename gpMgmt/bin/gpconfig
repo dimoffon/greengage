@@ -16,6 +16,7 @@ import os
 import sys
 import re
 
+
 try:
     from gppylib.gpparseopts import OptParser, OptChecker
     from gppylib.gparray import GpArray
