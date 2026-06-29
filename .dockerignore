@@ -1,0 +1,20 @@
+# Keep the Docker build context small and force a clean in-image configure/build
+# (host build artifacts must not leak into the image).
+.git
+.idea
+gpAux/gpdemo/datadirs
+**/*.o
+**/*.a
+**/*.so
+**/*.t
+**/objfiles.txt
+**/.deps
+config.status
+config.log
+config.cache
+src/Makefile.global
+src/include/pg_config.h
+src/test/dr/.run
+**/regression.diffs
+**/regression.out
+**/results/

@@ -1,0 +1,45 @@
+# Greengage 7 DR test: two single-host demo clusters in separate containers
+# sharing a /archive volume (primary writes WAL there via archive_command, dr
+# recovers via restore_command -- no pgBackRest/WAL-G needed).
+#
+#   docker compose -f src/test/dr/docker-compose.yml up --build
+#   docker compose -f src/test/dr/docker-compose.yml logs -f dr     # watch the test
+#   docker compose -f src/test/dr/docker-compose.yml down -v        # tear down
+#
+# Both services share one image (built once from the repo root). The cluster
+# work is done by the per-service entrypoint scripts under ./scripts (bind-
+# mounted for fast iteration without rebuilding the image).
+version: "3.8"
+
+x-gpdb: &gpdb
+  build:
+    context: ../../..
+    dockerfile: src/test/dr/Dockerfile
+  image: greengage-dr-test:latest
+  privileged: true            # sysctls + shared memory for the cluster
+  init: true                  # reap the many child processes Greengage spawns
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile: 65535
+  volumes:
+    - wal_archive:/archive
+    - ./scripts:/dr/scripts:ro
+
+services:
+  primary:
+    <<: *gpdb
+    hostname: primary
+    command: ["/dr/scripts/primary-entrypoint.sh"]
+
+  dr:
+    <<: *gpdb
+    hostname: dr
+    depends_on:
+      - primary
+    environment:
+      DR_SEED: "1"            # 1 = run the M1.5 frozen-tuple topology seed
+    command: ["/dr/scripts/dr-entrypoint.sh"]
+
+volumes:
+  wal_archive:
