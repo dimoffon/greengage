@@ -73,6 +73,17 @@ DRResolveProtectedRelfilenodes(void)
 {
 	int			i;
 
+	/*
+	 * This runs during WAL replay, in the startup process, which has not yet
+	 * loaded the shared relation map -- RelationCacheInitializePhase2() (which
+	 * calls RelationMapInitializePhase2()) only runs later, in InitPostgres.
+	 * Without the shared map loaded, RelationMapOidToFilenode() below returns
+	 * InvalidOid for every (shared) topology catalog and the protected set would
+	 * be empty, making the filter a silent no-op.  Load the shared map now; it
+	 * is the on-disk map, which is exactly what redo is replaying against.
+	 */
+	RelationMapInitializePhase2();
+
 	dr_num_protected_filenodes = 0;
 
 	for (i = 0; i < DR_NUM_PROTECTED_CATALOGS; i++)
