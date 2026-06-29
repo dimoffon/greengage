@@ -8,11 +8,11 @@ ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
 
 cd "$DEMO"
 
-if [ ! -f "$DEMO/gpdemo-env.sh" ]; then
-	log "primary: creating demo cluster (coordinator + 1 segment, no mirrors)"
-	LANG=en_US.UTF-8 make create-demo-cluster \
-		PORT_BASE="$PORT_BASE" NUM_PRIMARY_MIRROR_PAIRS=1 WITH_MIRRORS=false
-fi
+# Remove any gpdemo-env.sh baked into the image from a host build, then create.
+rm -f "$DEMO/gpdemo-env.sh"
+log "primary: creating demo cluster (coordinator + 1 segment, no mirrors) ..."
+LANG=en_US.UTF-8 make create-demo-cluster \
+	PORT_BASE="$PORT_BASE" NUM_PRIMARY_MIRROR_PAIRS=1 WITH_MIRRORS=false 2>&1 | tail -25
 source "$DEMO/gpdemo-env.sh"
 
 log "primary: instances:"
@@ -33,6 +33,7 @@ while IFS=$'\t' read -r datadir port dbid content; do
 # --- GREENGAGE DR ARCHIVE ---
 wal_level = replica
 archive_mode = on
+archive_timeout = 30
 archive_command = 'test ! -f $WAL_ARCHIVE/seg%c/%f && cp %p $WAL_ARCHIVE/seg%c/%f'
 EOF
 	fi
@@ -72,9 +73,21 @@ log "primary: changing gp_segment_configuration (segment port -> +1000) to test 
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q -c \
 	"update gp_segment_configuration set port = port + 1000 where content = 0;" || true
-psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true
 echo "PRODUCTION_SEG0_PORT=$(psql -p "$PORT_BASE" -d postgres -Atc \
 	"select port from gp_segment_configuration where content=0;")" > "$ARCHIVE/primary_expected.env"
+
+# Create a restore point AFTER the change on the coordinator, then force its WAL
+# to the archive, so the DR replica can recover up to the restore point (replaying
+# -- and filtering -- the change) and promote there.
+PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -q -c \
+	"select pg_create_restore_point('dr_filter_test');" || true
+psql -p "$PORT_BASE" -d postgres -q -c "checkpoint;" >/dev/null 2>&1 || true
+for _ in 1 2 3; do
+	psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true
+	sleep 2
+done
+touch "$ARCHIVE/restorepoint_ready"
+log "primary: restore point 'dr_filter_test' created and archived"
 
 log "primary: done; idling so the cluster keeps archiving WAL"
 exec sleep infinity

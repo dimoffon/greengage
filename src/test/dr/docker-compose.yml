@@ -38,7 +38,12 @@ services:
     depends_on:
       - primary
     environment:
-      DR_SEED: "1"            # 1 = run the M1.5 frozen-tuple topology seed
+      # 0 = clean standby (demonstrates the redo filter end-to-end).
+      # 1 = also run the M1.5 frozen seed first -- NOTE: the standalone seed
+      #     advances the data dir's WAL, so resuming as a standby off the
+      #     production archive currently diverges (a seed/continuous-restore
+      #     integration problem to solve in the M4 create utility).
+      DR_SEED: "0"
     command: ["/dr/scripts/dr-entrypoint.sh"]
 
 volumes:

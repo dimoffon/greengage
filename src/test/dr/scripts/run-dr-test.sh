@@ -11,12 +11,9 @@ source "$ARCHIVE/primary_expected.env"   # PRODUCTION_SEG0_PORT
 
 q() { PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc "$1" 2>/dev/null; }
 
-log "dr-test: waiting for DR coordinator to accept read-only connections ..."
+log "dr-test: waiting for the promoted DR coordinator to accept connections ..."
 for _ in $(seq 1 60); do q "select 1" >/dev/null && break; sleep 2; done
 q "select 1" >/dev/null || die "DR coordinator never accepted connections (see startup.log)"
-
-log "dr-test: replaying production WAL ..."
-sleep 15
 
 echo "================ DR coordinator gp_segment_configuration ================"
 q "select dbid,content,role,port,hostname from gp_segment_configuration order by content;"

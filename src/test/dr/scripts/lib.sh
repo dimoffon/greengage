@@ -41,11 +41,25 @@ ensure_gpadmin() {
 setup_container() {
 	log "setup_container: preparing gpadmin user, sshd, and /archive"
 
+	# gpinitsystem/gpstop connect to the coordinator over the loopback, but the
+	# demo pg_hba.conf only lists IPv4 -- a connection over the IPv6 loopback
+	# (::1) is rejected ("no pg_hba.conf entry for host ::1"). Force IPv4: drop
+	# the ::1 localhost line from /etc/hosts (rewrite in place; it is a docker
+	# bind-mount) and prefer IPv4 in gai.conf.
+	grep -q '::ffff:0:0/96' /etc/gai.conf 2>/dev/null || \
+		echo 'precedence ::ffff:0:0/96 100' >> /etc/gai.conf
+	if grep -q '^::1' /etc/hosts 2>/dev/null; then
+		grep -v '^::1' /etc/hosts > /etc/hosts.new && cat /etc/hosts.new > /etc/hosts && rm -f /etc/hosts.new
+	fi
+
 	if ! id gpadmin >/dev/null 2>&1; then
 		useradd -m -s /bin/bash -G sudo gpadmin
 		echo 'gpadmin ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/gpadmin
 		echo 'gpadmin:password' | chpasswd
 	fi
+	# The image baked /home/gpadmin (and gpdb_src) as root via WORKDIR; give the
+	# home dir to gpadmin so it can create ~/.ssh etc.
+	mkdir -p /home/gpadmin && chown gpadmin:gpadmin /home/gpadmin
 
 	# Passwordless ssh to localhost (gpinitsystem/gpstart/gpstop need it).
 	su - gpadmin -c '

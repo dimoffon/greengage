@@ -34,17 +34,25 @@ a while; subsequent runs reuse the image.
 
 ## What it asserts
 
-1. The **primary** comes up, enables archiving, base-backs up each instance into
-   the shared volume, publishes a DR-local topology, then **changes
-   `gp_segment_configuration`** (bumps the segment's port by 1000) — generating
-   WAL for the protected topology catalog.
-2. The **dr** cluster restores the base backups, frozen-seeds DR-local topology
-   (`gpseed_dr_topology`, M1.5), arms `gp_dr_replica` + `dr_replica.signal` +
-   `restore_command`, and starts in continuous recovery.
-3. **Assertion** (`run-dr-test.sh`): after replaying the primary's WAL, the DR
-   coordinator's `gp_segment_configuration` must **not** reflect the primary's
-   port change — the redo filter skipped it — and (if seeded) the coordinator
-   hostname is the DR-local `dr`.
+1. The **primary** comes up, enables per-segment archiving, base-backs up each
+   instance into the shared volume, then **changes `gp_segment_configuration`**
+   (bumps the segment's port by 1000) and creates a restore point after it —
+   generating, and archiving, WAL for the protected topology catalog.
+2. The **dr** container restores the coordinator's base backup, arms
+   `gp_dr_replica` + `dr_replica.signal` + `restore_command`, and — in
+   **single-user mode** — recovers up to the restore point (so the change is
+   replayed, with the filter active) and reads `gp_segment_configuration`.
+   Single-user mode avoids the interconnect / FTS / dispatch that a *live* DR
+   coordinator would need: a DR coordinator holding production's topology can't
+   bind its interconnect, and serving reads from a coordinator still *in
+   recovery* is the separate M2′ "standby distributed read" milestone.
+3. **Assertion**: the DR coordinator replays *past* the change, but
+   `gp_segment_configuration` still shows the pre-change port — the redo filter
+   skipped production's change → `FILTER TEST: PASS`.
+
+This end-to-end test is what caught the original M1.3 bug: the protected-set
+resolution returned nothing during redo (the shared relmap isn't loaded in the
+startup process yet), so the filter was a silent no-op until fixed.
 
 ## Files
 
@@ -59,11 +67,14 @@ a while; subsequent runs reuse the image.
 
 ## Notes / status
 
-- This is a PoC fixture. The DR cluster runs its instances individually in
-  recovery (`pg_ctl`), and the test reads `gp_segment_configuration` in **utility
-  mode** — a full distributed query on the DR coordinator-in-recovery is the
-  separate M2′ "standby distributed read" milestone, not exercised here.
-- Reference recipe for the archive/basebackup/restore mechanics:
+- This is a PoC fixture. It verifies the **M1 redo filter only** (topology
+  independence). Bringing the DR cluster fully online as a queryable replica is
+  M2′/M3 (standby distributed read + consistent reads), not exercised here.
+- Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
-- `DR_SEED=0` in the `dr` service env runs the test without the frozen seed
-  (still a valid filter test: production's post-backup change must not appear).
+- **`DR_SEED`** (dr service env) defaults to `0`. With `DR_SEED=1` the DR
+  coordinator is also frozen-seeded with DR-local topology (`gpseed_dr_topology`,
+  M1.5) before recovery — the seed itself runs, but the standalone seed advances
+  the data dir's WAL, which then diverges from the production archive on resume.
+  Reconciling the frozen seed with continuous restore is a create-utility (M4)
+  problem; the filter test runs cleanly with the seed off.
