@@ -36,6 +36,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
+#include "access/dr_redo_filter.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
@@ -304,6 +305,7 @@ bool		InArchiveRecovery = false;
 
 static bool standby_signal_file_found = false;
 static bool recovery_signal_file_found = false;
+static bool dr_replica_signal_file_found = false;
 
 /* Was the last xlog file restored from archive, or local? */
 static bool restoredFromArchive = false;
@@ -5530,6 +5532,21 @@ readRecoverySignalFile(void)
 		recovery_signal_file_found = true;
 	}
 
+	/*
+	 * Greengage DR: an independent marker that this node is a read-only
+	 * disaster-recovery replica.  It does not influence the standby-vs-recovery
+	 * decision below; it only records that DR mode was requested at startup.
+	 * The apply-time topology redo filter and read-only enforcement key off
+	 * gp_dr_replica together with this marker, which is removed on promotion.
+	 */
+	if (stat(DR_REPLICA_SIGNAL_FILE, &stat_buf) == 0)
+	{
+		dr_replica_signal_file_found = true;
+		ereport(LOG,
+				(errmsg("disaster-recovery replica marker file \"%s\" found",
+						DR_REPLICA_SIGNAL_FILE)));
+	}
+
 	StandbyModeRequested = false;
 	ArchiveRecoveryRequested = false;
 	if (standby_signal_file_found)
@@ -5553,6 +5570,21 @@ readRecoverySignalFile(void)
 		ereport(FATAL,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("standby mode is not supported by single-user servers")));
+}
+
+/*
+ * Greengage DR: is this node running as a read-only disaster-recovery replica?
+ *
+ * True when the gp_dr_replica GUC is on AND the dr_replica.signal marker was
+ * present at startup.  Requiring both is deliberate: the create utility sets
+ * them together, and promotion removes the marker so DR mode disengages even
+ * if the GUC lingers in postgresql.auto.conf.  Callers that only care during
+ * WAL replay should additionally check RecoveryInProgress().
+ */
+bool
+IsDRReplicaMode(void)
+{
+	return gp_dr_replica && dr_replica_signal_file_found;
 }
 
 static void
@@ -7624,8 +7656,14 @@ StartupXLOG(void)
 					TransactionIdIsValid(record->xl_xid))
 					RecordKnownAssignedTransactionIds(record->xl_xid);
 
-				/* Now apply the WAL record itself */
-				RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+				/*
+				 * Now apply the WAL record itself.  On a Greengage DR replica,
+				 * skip records that modify only protected topology catalogs so
+				 * production's WAL does not overwrite the DR-local rows; the
+				 * replay LSN still advances via the record reader.
+				 */
+				if (!DRRedoShouldFilter(xlogreader))
+					RmgrTable[record->xl_rmid].rm_redo(xlogreader);
 
 				/*
 				 * After redo, check whether the backup pages associated with

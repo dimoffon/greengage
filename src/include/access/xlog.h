@@ -314,6 +314,9 @@ extern bool RecoveryInProgress(void);
 extern RecoveryState GetRecoveryState(void);
 extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
+
+/* Greengage DR: read-only disaster-recovery replica mode */
+extern bool IsDRReplicaMode(void);
 extern bool XLogInsertAllowed(void);
 extern void GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
@@ -397,6 +400,7 @@ extern SessionBackupState get_backup_status(void);
 /* File path names (all relative to $PGDATA) */
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
+#define DR_REPLICA_SIGNAL_FILE	"dr_replica.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
 #define BACKUP_LABEL_OLD		"backup_label.old"
 

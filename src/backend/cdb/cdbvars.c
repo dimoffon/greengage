@@ -334,6 +334,9 @@ bool		log_autostats = true;
 /* GUC to toggle JIT instrumentation output for EXPLAIN */
 bool		gp_explain_jit = true;
 
+/* Disaster Recovery (DR): this node is a read-only DR replica (see gp_dr_replica GUC) */
+bool		gp_dr_replica = false;
+
 /* --------------------------------------------------------------------------------------------------
  * Server debugging
  */
