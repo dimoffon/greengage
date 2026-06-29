@@ -25,10 +25,12 @@
 #include "storage/relfilenode.h"
 
 /*
- * Resolve the protected relfilenode set from the shared relmapper at startup.
- * (Implemented in M1.3; a safe no-op until then.)
+ * Resolve the protected relfilenode set from the shared relmapper.  Done lazily
+ * on first use; call DRInvalidateProtectedRelfilenodes() to force a recompute
+ * (e.g. after a shared relmap update is replayed).
  */
 extern void DRResolveProtectedRelfilenodes(void);
+extern void DRInvalidateProtectedRelfilenodes(void);
 
 /* True if rnode is one of the protected cluster-topology catalogs. */
 extern bool DRRelfilenodeIsProtected(const RelFileNode *rnode);

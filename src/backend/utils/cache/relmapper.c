@@ -43,6 +43,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/dr_redo_filter.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -1046,6 +1047,16 @@ relmap_redo(XLogReaderState *record)
 		LWLockRelease(RelationMappingLock);
 
 		pfree(dbpath);
+
+		/*
+		 * Greengage DR: a shared relmap update may change which filenode backs
+		 * a protected topology catalog, so recompute the DR redo filter's
+		 * protected set on next use.  (Under the DR contract those catalogs are
+		 * never remapped on production, so this normally leaves the set
+		 * unchanged.)
+		 */
+		if (xlrec->dbid == InvalidOid && IsDRReplicaMode())
+			DRInvalidateProtectedRelfilenodes();
 	}
 	else
 		elog(PANIC, "relmap_redo: unknown op code %u", info);

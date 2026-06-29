@@ -6,8 +6,13 @@
  * See dr_redo_filter.h for the rationale.  This file provides:
  *	- DRRedoShouldFilter(): the per-record predicate called from the main redo
  *	  loop in xlog.c, and
- *	- DRRelfilenodeIsProtected()/DRResolveProtectedRelfilenodes(): the protected
- *	  topology-catalog set, resolved via the shared relmapper at startup.
+ *	- DRResolveProtectedRelfilenodes()/DRRelfilenodeIsProtected(): the protected
+ *	  cluster-topology catalog set, resolved via the shared relmapper.
+ *
+ * The protected catalogs are shared relations, so their relfilenodes live in
+ * the shared relation map (global/pg_filenode.map) rather than in pg_class.
+ * We resolve OID -> filenode through RelationMapOidToFilenode(oid, shared=true)
+ * and match WAL block tags in the global tablespace against the result.
  *
  * Portions Copyright (c) 2026-Present, Greengage contributors.
  *
@@ -21,33 +26,111 @@
 #include "access/dr_redo_filter.h"
 #include "access/xlog.h"
 #include "access/xlogrecord.h"
+#include "catalog/pg_tablespace_d.h"	/* GLOBALTABLESPACE_OID */
+#include "utils/relmapper.h"
 
 /*
- * DRRelfilenodeIsProtected
- *		Is rnode one of the protected cluster-topology catalogs?
+ * The shared cluster-topology catalogs whose contents describe THIS (DR)
+ * cluster, not production, and so must never be overwritten by replayed
+ * production WAL: gp_segment_configuration (with its indexes and TOAST) plus
+ * gp_configuration_history, gp_id and gp_version_at_initdb.
  *
- * The protected set is resolved from the shared relmapper at startup
- * (see DRResolveProtectedRelfilenodes()).  Until that is implemented (M1.3)
- * this returns false, so DRRedoShouldFilter() is a strict no-op and replay
- * behaves exactly as on a normal standby.
+ * Raw OIDs are used deliberately.  gp_version.h and gp_version_at_initdb.h both
+ * define GpVersionRelationId with different values (5003 vs 5103), so pulling
+ * the symbolic macros in here would be fragile; these BKI-assigned OIDs are
+ * stable.
  */
-bool
-DRRelfilenodeIsProtected(const RelFileNode *rnode)
-{
-	/* M1.3: match rnode against the relmapper-resolved protected set. */
-	return false;
-}
+static const Oid dr_protected_catalog_oids[] = {
+	5036,						/* gp_segment_configuration */
+	7139,						/* gp_segment_config_content_preferred_role_index */
+	7140,						/* gp_segment_config_dbid_index */
+	6092,						/* gp_segment_configuration TOAST table */
+	6093,						/* gp_segment_configuration TOAST index */
+	5106,						/* gp_configuration_history */
+	5101,						/* gp_id */
+	5103						/* gp_version_at_initdb */
+};
+
+#define DR_NUM_PROTECTED_CATALOGS \
+	(sizeof(dr_protected_catalog_oids) / sizeof(dr_protected_catalog_oids[0]))
+
+/* Resolved filenodes (a subset of the OIDs above that are actually mapped). */
+static Oid	dr_protected_filenodes[DR_NUM_PROTECTED_CATALOGS];
+static int	dr_num_protected_filenodes = 0;
+static bool dr_protected_resolved = false;
 
 /*
  * DRResolveProtectedRelfilenodes
- *		Resolve the protected topology-catalog relfilenodes (M1.3).
+ *		Resolve the protected topology-catalog OIDs to relfilenodes via the
+ *		shared relmapper.
  *
- * Placeholder; wired up when the protected set is implemented.
+ * Called lazily the first time the filter runs, and again (via invalidation)
+ * after a shared relmap update is replayed.  Catalogs that are not mapped
+ * relations are reported and left unprotected rather than silently ignored.
  */
 void
 DRResolveProtectedRelfilenodes(void)
 {
-	/* M1.3 */
+	int			i;
+
+	dr_num_protected_filenodes = 0;
+
+	for (i = 0; i < DR_NUM_PROTECTED_CATALOGS; i++)
+	{
+		Oid			reloid = dr_protected_catalog_oids[i];
+		Oid			filenode = RelationMapOidToFilenode(reloid, true /* shared */ );
+
+		if (OidIsValid(filenode))
+			dr_protected_filenodes[dr_num_protected_filenodes++] = filenode;
+		else
+			elog(WARNING,
+				 "DR redo filter: topology catalog %u is not a mapped relation; "
+				 "its pages will not be protected on this DR replica",
+				 reloid);
+	}
+
+	dr_protected_resolved = true;
+}
+
+/*
+ * DRInvalidateProtectedRelfilenodes
+ *		Force the protected set to be recomputed on next use.
+ *
+ * Invoked from relmap_redo() after a shared relmap update.  Under the DR
+ * contract the protected catalogs are never remapped on production (the
+ * VACUUM FULL / CLUSTER / REINDEX prohibition, M1.4), so in practice the
+ * recomputed set is unchanged; this only keeps us consistent if some other
+ * shared catalog is remapped.
+ */
+void
+DRInvalidateProtectedRelfilenodes(void)
+{
+	dr_protected_resolved = false;
+}
+
+/*
+ * DRRelfilenodeIsProtected
+ *		Is rnode one of the protected cluster-topology catalogs?
+ */
+bool
+DRRelfilenodeIsProtected(const RelFileNode *rnode)
+{
+	int			i;
+
+	if (!dr_protected_resolved)
+		return false;
+
+	/* The protected catalogs are shared: global tablespace, no database. */
+	if (rnode->spcNode != GLOBALTABLESPACE_OID || rnode->dbNode != InvalidOid)
+		return false;
+
+	for (i = 0; i < dr_num_protected_filenodes; i++)
+	{
+		if (rnode->relNode == dr_protected_filenodes[i])
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -68,6 +151,9 @@ DRRedoShouldFilter(XLogReaderState *record)
 
 	if (!IsDRReplicaMode())
 		return false;
+
+	if (!dr_protected_resolved)
+		DRResolveProtectedRelfilenodes();
 
 	for (block_id = 0; block_id <= XLR_MAX_BLOCK_ID; block_id++)
 	{
