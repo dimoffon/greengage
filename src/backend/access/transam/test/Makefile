@@ -39,5 +39,6 @@ varsup.t: \
 
 dr_redo_filter.t: \
 	$(MOCK_DIR)/backend/access/transam/xlog_mock.o \
+	$(MOCK_DIR)/backend/utils/cache/relmapper_mock.o \
 	$(MOCK_DIR)/backend/access/hash/hash_mock.o \
 	$(MOCK_DIR)/backend/utils/fmgr/fmgr_mock.o

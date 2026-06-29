@@ -6,11 +6,37 @@
 #include "postgres.h"
 
 /*
+ * Mock ereport so the FATAL path in DRRejectForbiddenRemap can be intercepted
+ * (pattern from varsup_test.c).
+ */
+#undef ereport
+#define ereport(elevel, ...) \
+	do { \
+		ereport_mock(elevel); \
+	} while(0)
+
+static int	expected_elevel;
+
+static void
+ereport_mock(int elevel)
+{
+	assert_int_equal(elevel, expected_elevel);
+	if (elevel >= ERROR)
+		siglongjmp(*PG_exception_stack, 1);
+}
+
+/*
  * Unit under test.  Including the .c directly gives the test access to the
  * file-scope protected-set state, so the matching logic can be exercised
  * without going through the relmapper.
  */
 #include "../dr_redo_filter.c"
+
+static void
+expect_ereport(int log_level)
+{
+	expected_elevel = log_level;
+}
 
 /*
  * Preload the protected relfilenode set, bypassing
@@ -177,6 +203,47 @@ test_dr_mode_no_blocks_applies(void **state)
 	assert_false(DRRedoShouldFilter(&rec));
 }
 
+/* ---- DRRejectForbiddenRemap(): the M1.4 safety net (RelationMapOidToFilenode + ereport mocked) ---- */
+
+/* A protected catalog whose filenode is changing must halt replay (FATAL). */
+static void
+test_remap_protected_changed_fatals(void **state)
+{
+	expect_any(RelationMapOidToFilenode, relationId);
+	expect_any(RelationMapOidToFilenode, shared);
+	will_return(RelationMapOidToFilenode, 100);	/* current filenode */
+
+	expect_ereport(FATAL);
+
+	PG_TRY();
+	{
+		DRRejectForbiddenRemap(5036, 200);	/* protected oid, new filenode != current */
+		assert_false("expected ereport(FATAL)");
+	}
+	PG_CATCH();
+	{
+	}
+	PG_END_TRY();
+}
+
+/* A protected catalog whose filenode is unchanged is fine (no halt). */
+static void
+test_remap_protected_unchanged_ok(void **state)
+{
+	expect_any(RelationMapOidToFilenode, relationId);
+	expect_any(RelationMapOidToFilenode, shared);
+	will_return(RelationMapOidToFilenode, 100);
+
+	DRRejectForbiddenRemap(5036, 100);	/* same filenode -> returns, no ereport */
+}
+
+/* A non-protected OID is ignored entirely (no relmap lookup, no halt). */
+static void
+test_remap_nonprotected_ignored(void **state)
+{
+	DRRejectForbiddenRemap(99999, 200);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -192,7 +259,10 @@ main(int argc, char *argv[])
 		unit_test(test_dr_mode_filters_protected_record),
 		unit_test(test_dr_mode_applies_nonprotected_record),
 		unit_test(test_dr_mode_mixed_blocks_applies),
-		unit_test(test_dr_mode_no_blocks_applies)
+		unit_test(test_dr_mode_no_blocks_applies),
+		unit_test(test_remap_protected_changed_fatals),
+		unit_test(test_remap_protected_unchanged_ok),
+		unit_test(test_remap_nonprotected_ignored)
 	};
 
 	return run_tests(tests);

@@ -1029,6 +1029,24 @@ relmap_redo(XLogReaderState *record)
 				 xlrec->nbytes);
 		memcpy(&newmap, xlrec->data, sizeof(newmap));
 
+		/*
+		 * Greengage DR: before applying a shared relmap update, refuse to remap
+		 * a protected topology catalog.  Such a remap means production ran a
+		 * VACUUM FULL / CLUSTER / REINDEX / TRUNCATE on the catalog, which would
+		 * orphan this replica's frozen-seeded topology rows.  Halt with FATAL so
+		 * the node can be re-seeded, instead of silently corrupting DR's
+		 * topology.  This runs before any on-disk write, so the replay LSN does
+		 * not advance past the offending record.
+		 */
+		if (xlrec->dbid == InvalidOid && IsDRReplicaMode())
+		{
+			int			i;
+
+			for (i = 0; i < newmap.num_mappings; i++)
+				DRRejectForbiddenRemap(newmap.mappings[i].mapoid,
+									   newmap.mappings[i].mapfilenode);
+		}
+
 		/* We need to construct the pathname for this database */
 		dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
 
@@ -1049,11 +1067,9 @@ relmap_redo(XLogReaderState *record)
 		pfree(dbpath);
 
 		/*
-		 * Greengage DR: a shared relmap update may change which filenode backs
-		 * a protected topology catalog, so recompute the DR redo filter's
-		 * protected set on next use.  (Under the DR contract those catalogs are
-		 * never remapped on production, so this normally leaves the set
-		 * unchanged.)
+		 * Greengage DR: the protected catalogs are rejected above; an update to
+		 * other shared catalogs can still shift mappings, so recompute the DR
+		 * redo filter's protected set on next use.
 		 */
 		if (xlrec->dbid == InvalidOid && IsDRReplicaMode())
 			DRInvalidateProtectedRelfilenodes();

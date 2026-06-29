@@ -109,6 +109,44 @@ DRInvalidateProtectedRelfilenodes(void)
 }
 
 /*
+ * DRRejectForbiddenRemap
+ *		Halt the DR replica if a protected topology catalog is being remapped.
+ *
+ * Called for each mapping in an incoming shared relmap update (see relmap_redo).
+ * A protected catalog's filenode only changes via VACUUM FULL / CLUSTER /
+ * REINDEX / TRUNCATE on production -- operations that would orphan this
+ * replica's frozen-seeded topology rows.  Rather than silently corrupt the DR
+ * topology, stop replay so an operator re-seeds this node from a fresh base
+ * backup.  FATAL (not PANIC) is deliberate: it halts the postmaster instead of
+ * looping crash recovery on the same record, and the caller invokes this before
+ * any on-disk write so the replay LSN does not advance past the record.
+ *
+ * The current (pre-update) filenode is read from the live shared relmap, which
+ * relmap_redo has not yet overwritten at the call site.
+ */
+void
+DRRejectForbiddenRemap(Oid mapoid, Oid new_filenode)
+{
+	int			i;
+
+	for (i = 0; i < DR_NUM_PROTECTED_CATALOGS; i++)
+	{
+		Oid			cur;
+
+		if (dr_protected_catalog_oids[i] != mapoid)
+			continue;
+
+		cur = RelationMapOidToFilenode(mapoid, true /* shared */ );
+		if (OidIsValid(cur) && cur != new_filenode)
+			ereport(FATAL,
+					(errmsg("disaster-recovery replica: protected topology catalog %u was rebuilt on production (relfilenode %u -> %u)",
+							mapoid, cur, new_filenode),
+					 errhint("VACUUM FULL, CLUSTER, REINDEX or TRUNCATE on a cluster-topology catalog is incompatible with an attached DR replica; re-create this DR node from a fresh base backup and re-run the topology seed.")));
+		return;
+	}
+}
+
+/*
  * DRRelfilenodeIsProtected
  *		Is rnode one of the protected cluster-topology catalogs?
  */

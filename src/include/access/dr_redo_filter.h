@@ -32,6 +32,12 @@
 extern void DRResolveProtectedRelfilenodes(void);
 extern void DRInvalidateProtectedRelfilenodes(void);
 
+/*
+ * Halt the DR replica (FATAL) if an incoming shared relmap update would change
+ * a protected topology catalog's filenode.  Called per-mapping from relmap_redo.
+ */
+extern void DRRejectForbiddenRemap(Oid mapoid, Oid new_filenode);
+
 /* True if rnode is one of the protected cluster-topology catalogs. */
 extern bool DRRelfilenodeIsProtected(const RelFileNode *rnode);
 
