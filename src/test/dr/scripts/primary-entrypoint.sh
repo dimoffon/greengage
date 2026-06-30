@@ -66,17 +66,29 @@ touch "$READY_MARKER"
 log "primary: ready (base backups + topology published, archiving live)"
 
 # --- generate WAL that changes the protected topology catalog, to exercise the
-#     DR redo filter: production bumps the segment's port; the DR replica must
-#     NOT pick this up (its frozen-seeded DR-local rows stay intact). ---
+#     DR redo filter. The DR replica must NOT pick this change up. ---
+#
+# We change seg0's *hostname*, NOT its port/address.  The coordinator connects to
+# a segment by `address` (resolved to hostaddr) + `port` (cdbconn.c); `hostname`
+# is only a DNS fallback (cdbutil.c).  So this keeps production fully dispatchable
+# -- an earlier version bumped the port, which pointed the coordinator at a port
+# the segment wasn't listening on and broke production's own query dispatch.
 sleep 5
-log "primary: changing gp_segment_configuration (segment port -> +1000) to test the DR filter"
+log "primary: changing gp_segment_configuration (seg0 hostname) to test the DR filter"
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q -c \
-	"update gp_segment_configuration set port = port + 1000 where content = 0;" || true
+	"update gp_segment_configuration set hostname = 'prod-seg0-CHANGED' where content = 0;" || true
 {
-	echo "PRODUCTION_SEG0_PORT=$(psql -p "$PORT_BASE" -d postgres -Atc "select port from gp_segment_configuration where content=0;")"
+	echo "PRODUCTION_SEG0_HOSTNAME=$(psql -p "$PORT_BASE" -d postgres -Atc "select hostname from gp_segment_configuration where content=0;")"
 	echo "PRODUCTION_CHANGE_LSN=$(psql -p "$PORT_BASE" -d postgres -Atc "select pg_current_wal_lsn();")"
 } > "$ARCHIVE/primary_expected.env"
+
+# Prove production still dispatches after the change (the point of using hostname).
+if psql -p "$PORT_BASE" -d postgres -Atc "select count(*) from dr_marker;" >/dev/null 2>&1; then
+	log "primary: OK -- distributed query still dispatches after the change (uses address, not hostname)"
+else
+	log "primary: WARNING -- distributed query failed after the change"
+fi
 
 # Create a restore point AFTER the change on the coordinator, then force its WAL
 # to the archive, so the DR replica can recover up to the restore point (replaying

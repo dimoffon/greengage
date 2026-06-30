@@ -37,9 +37,11 @@ a while; subsequent runs reuse the image.
 
 1. The **primary** comes up, enables per-segment archiving, base-backs up each
    instance into the shared volume, then **changes `gp_segment_configuration`**
-   (bumps the segment's port by 1000), records the change's WAL LSN, and
-   force-archives it — generating, and shipping, WAL for the protected topology
-   catalog.
+   — it rewrites seg0's `hostname` (a *non-breaking* field: the coordinator
+   dispatches by `address`+`port`, so production stays fully queryable; an
+   earlier version bumped the port and broke production's own dispatch) — records
+   the change's WAL LSN, and force-archives it, shipping WAL for the protected
+   topology catalog.
 2. The **dr** container restores the coordinator's base backup, arms
    `gp_dr_replica` + `dr_replica.signal` + `standby.signal` + `restore_command`,
    and starts the coordinator as a **live, continuous hot-standby**. It does
@@ -47,8 +49,8 @@ a while; subsequent runs reuse the image.
    the coordinator accepts read connections **while in recovery**. It then waits
    to replay past the recorded change LSN.
 3. **Assertions** (against the live coordinator, utility mode):
-   - **M1** — `gp_segment_configuration` still shows the pre-change port: the
-     redo filter skipped production's change.
+   - **M1** — `gp_segment_configuration` still shows seg0's pre-change hostname:
+     the redo filter skipped production's change.
    - **M2 reads** — a coordinator-only catalog `SELECT` works in recovery.
    - **M2 writes refused** — `SELECT … FOR UPDATE`, `INSERT`, and `CREATE TABLE`
      all fail (the first two with the DR-specific "read-only disaster-recovery

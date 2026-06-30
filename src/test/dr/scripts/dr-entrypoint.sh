@@ -96,12 +96,12 @@ refused() {  # $1=label  $2=sql -- assert the statement is refused on the DR rep
 }
 
 echo "================ M1 + M2 assertions on the LIVE DR coordinator (in recovery) ================"
-# M1 (redo filter): production bumped seg0 port to $PRODUCTION_SEG0_PORT; DR must not show it.
-drport=$(q "select port from gp_segment_configuration where content=0;")
-if [ -n "$drport" ] && [ "$drport" != "$PRODUCTION_SEG0_PORT" ]; then
-	ok_ "M1 redo filter: DR seg0 port still $drport (production changed it to $PRODUCTION_SEG0_PORT)"
+# M1 (redo filter): production changed seg0 hostname to $PRODUCTION_SEG0_HOSTNAME; DR must not show it.
+drhost=$(q "select hostname from gp_segment_configuration where content=0;")
+if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
+	ok_ "M1 redo filter: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
 else
-	no_ "M1 redo filter: DR seg0 port=$drport, production=$PRODUCTION_SEG0_PORT"
+	no_ "M1 redo filter: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
 fi
 # M2 (reads work): coordinator-only catalog read while in recovery.
 if [ "$(q "select count(*) > 0 from gp_segment_configuration;")" = t ]; then
