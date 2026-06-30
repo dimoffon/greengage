@@ -65,6 +65,15 @@ done < <(list_instances)
 touch "$READY_MARKER"
 log "primary: ready (base backups + topology published, archiving live)"
 
+# Create a user table AFTER the base backup, so it exists only in the WAL the DR
+# replays -- proving the redo filter is SELECTIVE: valid (non-topology) changes
+# ARE applied on the DR; only the protected topology catalogs are skipped.
+sleep 3
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table dr_wal_applied (id int, note text) distributed by (id);
+	 insert into dr_wal_applied values (1, 'created on production AFTER the base backup');" || true
+log "primary: created table dr_wal_applied (post-base-backup; DR must replay it via WAL)"
+
 # --- generate WAL that changes the protected topology catalog, to exercise the
 #     DR redo filter. The DR replica must NOT pick this change up. ---
 #

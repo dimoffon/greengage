@@ -103,6 +103,14 @@ if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
 else
 	no_ "M1 redo filter: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
 fi
+# M1 (selective): a user table created on production AFTER the base backup must
+# appear on the DR via WAL replay -- the filter only skips protected catalogs,
+# it applies everything else.
+if [ "$(q "select count(*) from pg_class where relname = 'dr_wal_applied';")" = 1 ]; then
+	ok_ "M1 selective: user table 'dr_wal_applied' (created post-backup on production) replayed onto the DR catalog"
+else
+	no_ "M1 selective: user table 'dr_wal_applied' NOT present on the DR (valid change not applied)"
+fi
 # M2 (reads work): coordinator-only catalog read while in recovery.
 if [ "$(q "select count(*) > 0 from gp_segment_configuration;")" = t ]; then
 	ok_ "M2 coordinator-only read works (count(gp_segment_configuration) > 0)"
