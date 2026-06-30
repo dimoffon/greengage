@@ -26,13 +26,26 @@ done
 
 COORD=${DR_DATADIR[-1]}
 
-# Frozen-tuple seed (M1.5), BEFORE arming recovery. Off by default: the
-# standalone seed advances local WAL and currently diverges from the production
-# archive (see the DR_SEED note in docker-compose.yml).
+# Frozen-tuple seed (M1.5) + recovery-start preservation (M4), BEFORE arming
+# recovery.  The single-user seed consumes backup_label and advances pg_control
+# past the backup LSN, which would fork production's timeline on resume.  We save
+# the recovery-start state (backup_label + pg_control) before the seed and restore
+# it after: recovery then resumes from the backup checkpoint and refetches
+# production's WAL from the archive (restore_command), while the seed's frozen
+# gp_segment_configuration pages -- protected, hence filtered -- persist.
 if [ "$DR_SEED" = 1 ]; then
-	log "dr: frozen-seeding DR-local gp_segment_configuration (gpseed_dr_topology)"
-	"$SRC/gpMgmt/bin/gpseed_dr_topology" "$COORD" "$TOPO_FILE" || \
-		log "dr: WARNING gpseed_dr_topology failed (continuing)"
+	log "dr: M4 seed: preserving recovery-start state, then frozen-seeding DR-local topology"
+	have_label=
+	[ -f "$COORD/backup_label" ] && { cp -p "$COORD/backup_label" "$COORD/backup_label.drsave"; have_label=1; }
+	cp -p "$COORD/global/pg_control" "$COORD/pg_control.drsave"
+	if "$SRC/gpMgmt/bin/gpseed_dr_topology" "$COORD" "$TOPO_FILE"; then
+		[ -n "$have_label" ] && mv "$COORD/backup_label.drsave" "$COORD/backup_label"
+		mv "$COORD/pg_control.drsave" "$COORD/global/pg_control"
+		log "dr: M4 seed: done; recovery-start state restored (will resume production WAL from the archive)"
+	else
+		log "dr: WARNING gpseed_dr_topology failed; leaving node unseeded"
+		rm -f "$COORD/backup_label.drsave" "$COORD/pg_control.drsave"
+	fi
 fi
 
 log "dr: waiting for production to create + archive the restore point ..."
@@ -102,6 +115,15 @@ if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
 	ok_ "M1 redo filter: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
 else
 	no_ "M1 redo filter: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
+fi
+# M4 (seed): when seeded, the DR carries genuinely DR-LOCAL topology ('dr'),
+# proving topology independence -- not merely "ignored production's change".
+if [ "$DR_SEED" = 1 ]; then
+	if [ "$drhost" = "dr" ]; then
+		ok_ "M4 seed: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
+	else
+		no_ "M4 seed: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
+	fi
 fi
 # M1 (selective): a user table created on production AFTER the base backup must
 # appear on the DR via WAL replay -- the filter only skips protected catalogs,

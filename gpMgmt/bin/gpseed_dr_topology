@@ -28,8 +28,23 @@
 # NOTE (PoC): this is the focused frozen-seed step only.  Allocating DR dbids,
 # restoring the base backup with --target-gp-dbid, and writing restore_command /
 # arming gp_dr_replica + dr_replica.signal belong to the create utility (M4).
-# The single-user catalog DML below needs validation on a live coordinator data
-# directory (the M0 fixture); it is the reference implementation of the seed.
+#
+# CRITICAL (M4): the single-user run below CONSUMES backup_label and advances
+# pg_control past the backup LSN.  If the node then resumes as a standby off the
+# production archive, its WAL has forked production's timeline.  The create
+# utility MUST therefore preserve the recovery-start state around this seed: copy
+# backup_label and global/pg_control aside before, and restore them after, so
+# recovery resumes from the backup checkpoint and refetches production's WAL from
+# the archive.  The seed's frozen gp_segment_configuration pages are higher-LSN
+# but protected (filtered on replay), so they persist.  Validated end-to-end by
+# the src/test/dr docker fixture (DR_SEED=1).
+#
+# CAVEAT: VACUUM FREEZE also bumps pg_class.relfrozenxid for gp_segment_configuration
+# (a non-protected catalog), so that one pg_class page carries the seed's LSN.
+# Production changes to *that exact page* within the tiny (backup-LSN, seed-LSN]
+# window would be LSN-shadowed on the DR.  The window is sub-second and the page
+# is gp_segment_configuration's own pg_class row; acceptable for the PoC, to be
+# hardened in the create utility (e.g. minimise seed WAL / re-resolve on resume).
 #
 set -euo pipefail
 
