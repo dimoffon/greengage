@@ -306,6 +306,7 @@ bool		InArchiveRecovery = false;
 static bool standby_signal_file_found = false;
 static bool recovery_signal_file_found = false;
 static bool dr_replica_signal_file_found = false;
+static bool dr_replica_signal_file_checked = false;
 
 /* Was the last xlog file restored from archive, or local? */
 static bool restoredFromArchive = false;
@@ -5546,6 +5547,7 @@ readRecoverySignalFile(void)
 				(errmsg("disaster-recovery replica marker file \"%s\" found",
 						DR_REPLICA_SIGNAL_FILE)));
 	}
+	dr_replica_signal_file_checked = true;
 
 	StandbyModeRequested = false;
 	ArchiveRecoveryRequested = false;
@@ -5584,7 +5586,29 @@ readRecoverySignalFile(void)
 bool
 IsDRReplicaMode(void)
 {
-	return gp_dr_replica && dr_replica_signal_file_found;
+	if (!gp_dr_replica)
+		return false;
+
+	/*
+	 * The dr_replica.signal marker is detected eagerly in the startup process
+	 * (readRecoverySignalFile), but a backend forks from the postmaster and
+	 * never runs recovery, so its copy of dr_replica_signal_file_found would
+	 * stay false and the read-only enforcement guards (which run in backends)
+	 * would be silent no-ops.  Determine the marker here on first use and cache
+	 * it; it lives in the data directory, which is every backend's working
+	 * directory, and is stable for the life of the process (promotion, which
+	 * removes it, restarts the cluster).
+	 */
+	if (!dr_replica_signal_file_checked)
+	{
+		struct stat stat_buf;
+
+		dr_replica_signal_file_found =
+			(stat(DR_REPLICA_SIGNAL_FILE, &stat_buf) == 0);
+		dr_replica_signal_file_checked = true;
+	}
+
+	return dr_replica_signal_file_found;
 }
 
 static void
