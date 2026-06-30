@@ -90,7 +90,9 @@ to the backends where the enforcement runs).
   *coordinator-only* (catalog / entry-DB-singleton) reads; dispatching a
   distributed read-only query to reader-only gangs is the separate **M2′**
   milestone, and consistent as-of reads are **M3** — neither is exercised here.
-  Only the DR coordinator is started; the DR segment is not.
+  The DR segment (content 0) is now also started in recovery (M2′ I-0) and serves
+  segment-local reads; dispatching a query from the coordinator to it is M2′
+  SR-1/SR-2, not yet implemented.
 - Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
 - **`DR_SEED`** (dr service env) defaults to `1`: the DR coordinator is

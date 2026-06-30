@@ -153,4 +153,34 @@ fi
 log "dr: DR coordinator left RUNNING in recovery (utility-mode reads). Connect with:"
 log "dr:   sudo docker-compose -f src/test/dr/docker-compose.yml exec dr \\"
 log "dr:        env PGOPTIONS='-c gp_role=utility' psql -p ${PORT_BASE} postgres"
+
+# --- M2' I-0: bring the DR SEGMENT (content 0) up in recovery too, so the
+#     coordinator can (after SR-1 + SR-2) dispatch a read-only distributed query
+#     to it.  For now this just smoke-tests that the segment serves reads while in
+#     recovery -- the dispatch path itself is M2' SR-1/SR-2 (not yet implemented).
+SEG0=${DR_DATADIR[0]}
+: > "$SEG0/postgresql.auto.conf"
+cat >> "$SEG0/postgresql.conf" <<EOF
+
+# --- GREENGAGE DR REPLICA (segment) ---
+gp_dr_replica = on
+restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
+recovery_target_timeline = 'current'
+EOF
+touch "$SEG0/dr_replica.signal"               # filter + read-only enforcement + hot_standby auto-enable
+touch "$SEG0/standby.signal"                  # continuous archive recovery (%c resolves to 0 on the segment)
+
+log "dr: M2' I-0: starting DR segment (content 0) in continuous hot-standby recovery (gp_role=execute) ..."
+pg_ctl -D "$SEG0" -l "$SEG0/startup.log" -W -o "-c gp_role=execute" start
+sok=
+for _ in $(seq 1 80); do PGOPTIONS='-c gp_role=utility' psql -p 7002 -d postgres -Atc 'select 1' >/dev/null 2>&1 && { sok=1; break; }; sleep 3; done
+if [ -n "$sok" ]; then
+	scount=$(PGOPTIONS='-c gp_role=utility' psql -p 7002 -d postgres -Atc 'select count(*) from dr_marker' 2>/dev/null)
+	log "dr: M2' I-0: PASS -- DR segment is LIVE in recovery; segment-local 'select count(*) from dr_marker' = ${scount:-<none>}"
+else
+	log "dr: M2' I-0: FAIL -- DR segment did not accept connections; logs:"
+	tail -20 "$SEG0/startup.log" >&2 2>/dev/null || true
+	cat "$SEG0"/log/*.csv 2>/dev/null | tail -20 >&2 || true
+fi
+
 exec sleep infinity
