@@ -38,6 +38,7 @@
 #include "cdb/cdbvars.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"			/* IsDRReplicaMode */
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "cdb/cdbfts.h"
@@ -268,6 +269,19 @@ static void
 currentDtxActivate(void)
 {
 	bool signal_dtx_recovery;
+
+	/*
+	 * A distributed transaction must never be activated on a disaster-recovery
+	 * replica.  Assigning a distributed xid below mutates cluster-wide shared
+	 * state (ShmemVariableCache->nextGxid) -- the GP analog of GetNewTransactionId(),
+	 * which is itself refused during recovery.  This is the deepest backstop:
+	 * coordinator-local read-only queries (all a DR replica serves) never reach
+	 * here, so anything that does is an attempted write/2PC and is refused.
+	 */
+	if (IsDRReplicaMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot start a distributed transaction on a read-only disaster-recovery replica")));
 
 	if (ShmemVariableCache->GxidCount <= GXID_PRETCH_THRESHOLD &&
 		(GetDtxRecoveryEvent() & DTX_RECOVERY_EVENT_BUMP_GXID) == 0)

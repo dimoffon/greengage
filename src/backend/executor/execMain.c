@@ -45,6 +45,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"			/* IsDRReplicaMode */
 #include "catalog/namespace.h"
 #include "catalog/pg_publication.h"
 #include "commands/matview.h"
@@ -1632,6 +1633,25 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 {
 	ListCell   *l;
 	int         rti;
+
+	/*
+	 * A disaster-recovery replica is strictly read-only.  Because it is always
+	 * in recovery, stock hot standby already forces XactReadOnly, but it still
+	 * exempts SELECT ... FOR UPDATE/SHARE (the CDB block further down), which a
+	 * DR replica must also reject.  Refuse anything that is not a pure
+	 * read-only SELECT here, with a DR-specific message, so locking/writing
+	 * statements fail fast and clearly instead of deep in the executor or DTM.
+	 */
+	if (IsDRReplicaMode() &&
+		(plannedstmt->commandType != CMD_SELECT ||
+		 plannedstmt->rowMarks != NIL ||
+		 plannedstmt->hasModifyingCTE ||
+		 plannedstmt->intoClause != NULL ||
+		 plannedstmt->refreshClause != NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot execute %s on a read-only disaster-recovery replica",
+						CreateCommandTag((Node *) plannedstmt))));
 
 	/*
 	 * CREATE TABLE AS or SELECT INTO?
