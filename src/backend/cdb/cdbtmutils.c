@@ -151,6 +151,8 @@ DtxContextToString(DtxContext context)
 			return "Coordinator Distributed-Capable";
 		case DTX_CONTEXT_QD_RETRY_PHASE_2:
 			return "Coordinator Retry Phase 2";
+		case DTX_CONTEXT_QD_STANDBY_READER:
+			return "Coordinator Standby Reader";
 		case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
 			return "Segment Entry DB Singleton";
 		case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:

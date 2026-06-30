@@ -140,6 +140,15 @@ typedef enum
 	DTX_CONTEXT_QD_RETRY_PHASE_2,
 
 	/**
+	 * On QD (Greengage disaster-recovery): the coordinator is a read-only DR
+	 * replica permanently in archive recovery and is dispatching a read-only
+	 * distributed query.  Unlike DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE it allocates
+	 * NO distributed xid (never calls currentDtxActivate), writes no WAL, and
+	 * dispatches a pre-captured distributed snapshot to reader-only gangs.
+	 */
+	DTX_CONTEXT_QD_STANDBY_READER,
+
+	/**
 	 * TODO: how is something an Entry db?  fix this documentation
 	 */
 	DTX_CONTEXT_QE_ENTRY_DB_SINGLETON,

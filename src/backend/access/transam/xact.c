@@ -2426,11 +2426,14 @@ StartTransaction(void)
 	AtStart_ResourceOwner();
 
 	/*
-	 * Transactions may be started while recovery is in progress, if
-	 * hot standby is enabled.  This mode is not supported in
-	 * Greengage yet.
+	 * Transactions may be started while recovery is in progress, if hot standby
+	 * is enabled.  A distributed transaction in recovery is otherwise not
+	 * supported in Greengage -- EXCEPT the disaster-recovery standby reader
+	 * (DTX_CONTEXT_QD_STANDBY_READER), which is a read-only distributed query
+	 * dispatched from a coordinator that is permanently in recovery.
 	 */
-	AssertImply(DistributedTransactionContext != DTX_CONTEXT_LOCAL_ONLY,
+	AssertImply(DistributedTransactionContext != DTX_CONTEXT_LOCAL_ONLY &&
+				DistributedTransactionContext != DTX_CONTEXT_QD_STANDBY_READER,
 				!s->startedInRecovery);
 	/*
 	 * MPP Modification
@@ -2441,6 +2444,7 @@ StartTransaction(void)
 	switch (DistributedTransactionContext)
 	{
 		case DTX_CONTEXT_LOCAL_ONLY:
+		case DTX_CONTEXT_QD_STANDBY_READER:	/* DR read-only: no shared-mem write */
 		case DTX_CONTEXT_QD_RETRY_PHASE_2:
 		case DTX_CONTEXT_QE_FINISH_PREPARED:
 		{
@@ -6725,6 +6729,7 @@ EndLocalDistribXact(bool isCommit)
 
 		case DTX_CONTEXT_QE_READER:
 		case DTX_CONTEXT_QE_ENTRY_DB_SINGLETON:
+		case DTX_CONTEXT_QD_STANDBY_READER:	/* DR read-only: no local distrib xact */
 			// QD or QE Writer will handle it.
 			break;
 

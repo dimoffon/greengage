@@ -158,6 +158,7 @@ qdSerializeDtxContextInfo(int *size, bool wantSnapshot, bool inCursor,
 	switch (currentDistributedTransactionContext)
 	{
 		case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
+		case DTX_CONTEXT_QD_STANDBY_READER:
 		case DTX_CONTEXT_LOCAL_ONLY:
 			DtxContextInfo_CreateOnCoordinator(&TempQDDtxContextInfo, inCursor,
 										  txnOptions, snapshot);

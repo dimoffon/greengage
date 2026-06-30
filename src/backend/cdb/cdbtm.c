@@ -1670,6 +1670,7 @@ setupRegularDtxContext(void)
 	switch (DistributedTransactionContext)
 	{
 		case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
+		case DTX_CONTEXT_QD_STANDBY_READER:
 			/* Continue in this context.  Do not touch QEDtxContextInfo, etc. */
 			break;
 
@@ -1704,7 +1705,20 @@ setupRegularDtxContext(void)
 			Assert(DistributedTransactionContext == DTX_CONTEXT_LOCAL_ONLY);
 
 			if (isDtxQueryDispatcher())
-				setDistributedTransactionContext(DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE);
+			{
+				/*
+				 * Greengage DR: a read-only DR replica coordinator (always in
+				 * archive recovery) becomes a standby reader -- it allocates no
+				 * distributed xid and dispatches to reader-only gangs -- rather
+				 * than a distributed-capable QD.  Read-only enforcement
+				 * (ExecCheckXactReadOnly) has already rejected anything that
+				 * would write, so a statement reaching here is a read.
+				 */
+				if (IsDRReplicaMode())
+					setDistributedTransactionContext(DTX_CONTEXT_QD_STANDBY_READER);
+				else
+					setDistributedTransactionContext(DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE);
+			}
 
 			break;
 	}
