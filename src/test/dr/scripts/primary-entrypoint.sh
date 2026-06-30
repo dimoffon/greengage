@@ -73,8 +73,10 @@ log "primary: changing gp_segment_configuration (segment port -> +1000) to test 
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q -c \
 	"update gp_segment_configuration set port = port + 1000 where content = 0;" || true
-echo "PRODUCTION_SEG0_PORT=$(psql -p "$PORT_BASE" -d postgres -Atc \
-	"select port from gp_segment_configuration where content=0;")" > "$ARCHIVE/primary_expected.env"
+{
+	echo "PRODUCTION_SEG0_PORT=$(psql -p "$PORT_BASE" -d postgres -Atc "select port from gp_segment_configuration where content=0;")"
+	echo "PRODUCTION_CHANGE_LSN=$(psql -p "$PORT_BASE" -d postgres -Atc "select pg_current_wal_lsn();")"
+} > "$ARCHIVE/primary_expected.env"
 
 # Create a restore point AFTER the change on the coordinator, then force its WAL
 # to the archive, so the DR replica can recover up to the restore point (replaying

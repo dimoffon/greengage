@@ -1,7 +1,8 @@
 # Greengage DR — docker test environment
 
 A minimal, dependency-light test for the disaster-recovery (DR) read-replica
-feature (milestone M1, the apply-time topology redo filter). Two single-host
+feature — milestone **M1** (the apply-time topology redo filter) and **M2**
+(read-only enforcement on a live, in-recovery DR coordinator). Two single-host
 Greengage demo clusters run in separate containers that share a `/archive`
 volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
 `archive_command`, the DR cluster reads it back with `restore_command`.
@@ -36,23 +37,30 @@ a while; subsequent runs reuse the image.
 
 1. The **primary** comes up, enables per-segment archiving, base-backs up each
    instance into the shared volume, then **changes `gp_segment_configuration`**
-   (bumps the segment's port by 1000) and creates a restore point after it —
-   generating, and archiving, WAL for the protected topology catalog.
+   (bumps the segment's port by 1000), records the change's WAL LSN, and
+   force-archives it — generating, and shipping, WAL for the protected topology
+   catalog.
 2. The **dr** container restores the coordinator's base backup, arms
-   `gp_dr_replica` + `dr_replica.signal` + `restore_command`, and — in
-   **single-user mode** — recovers up to the restore point (so the change is
-   replayed, with the filter active) and reads `gp_segment_configuration`.
-   Single-user mode avoids the interconnect / FTS / dispatch that a *live* DR
-   coordinator would need: a DR coordinator holding production's topology can't
-   bind its interconnect, and serving reads from a coordinator still *in
-   recovery* is the separate M2′ "standby distributed read" milestone.
-3. **Assertion**: the DR coordinator replays *past* the change, but
-   `gp_segment_configuration` still shows the pre-change port — the redo filter
-   skipped production's change → `FILTER TEST: PASS`.
+   `gp_dr_replica` + `dr_replica.signal` + `standby.signal` + `restore_command`,
+   and starts the coordinator as a **live, continuous hot-standby**. It does
+   *not* set `hot_standby` — DR mode auto-enables it in the postmaster (M2) — so
+   the coordinator accepts read connections **while in recovery**. It then waits
+   to replay past the recorded change LSN.
+3. **Assertions** (against the live coordinator, utility mode):
+   - **M1** — `gp_segment_configuration` still shows the pre-change port: the
+     redo filter skipped production's change.
+   - **M2 reads** — a coordinator-only catalog `SELECT` works in recovery.
+   - **M2 writes refused** — `SELECT … FOR UPDATE`, `INSERT`, and `CREATE TABLE`
+     all fail (the first two with the DR-specific "read-only disaster-recovery
+     replica" error). → `DR M1+M2 TEST: PASS`.
 
-This end-to-end test is what caught the original M1.3 bug: the protected-set
-resolution returned nothing during redo (the shared relmap isn't loaded in the
-startup process yet), so the filter was a silent no-op until fixed.
+   The DR coordinator is left **running**, so you can connect and read it:
+   `… exec dr env PGOPTIONS='-c gp_role=utility' psql -p 7000 postgres`.
+
+This end-to-end test is what caught two silent-no-op bugs that unit tests missed:
+the M1.3 protected-set resolution (the shared relmap isn't loaded during redo)
+and the M2 `IsDRReplicaMode()` flag (set only in the startup process, invisible
+to the backends where the enforcement runs).
 
 ## Files
 
@@ -61,15 +69,18 @@ startup process yet), so the filter was a silent no-op until fixed.
 | `Dockerfile` | Ubuntu 24.04 + build deps; builds Greengage (`--disable-orca --without-python`) to `/usr/local/greengage-db-devel`; gpadmin/sshd handled at runtime. |
 | `docker-compose.yml` | `primary` + `dr` services, shared `wal_archive` volume, `privileged`/`sysctls`/`ulimits`/`init`. |
 | `scripts/lib.sh` | Shared helpers + container (gpadmin/sshd) setup. |
-| `scripts/primary-entrypoint.sh` | Build cluster, archive, base-backup, change topology. |
-| `scripts/dr-entrypoint.sh` | Restore, frozen-seed, arm DR mode + restore, start in recovery. |
-| `scripts/run-dr-test.sh` | The M1 filter assertion. |
+| `scripts/primary-entrypoint.sh` | Build cluster, archive, base-backup, change topology, record change LSN. |
+| `scripts/dr-entrypoint.sh` | Restore, arm DR mode, start the coordinator as a live hot-standby, run the M1+M2 assertions. |
+| `scripts/run-dr-test.sh` | Earlier standalone M1 assertion (superseded; assertions now inline in `dr-entrypoint.sh`). |
 
 ## Notes / status
 
-- This is a PoC fixture. It verifies the **M1 redo filter only** (topology
-  independence). Bringing the DR cluster fully online as a queryable replica is
-  M2′/M3 (standby distributed read + consistent reads), not exercised here.
+- This is a PoC fixture. It verifies **M1** (topology redo filter) and **M2**
+  (read-only enforcement + coordinator-only reads in recovery). The DR
+  coordinator serves only *coordinator-only* (catalog / entry-DB-singleton)
+  reads; dispatching a distributed read-only query to reader-only gangs is the
+  separate **M2′** milestone, and consistent as-of reads are **M3** — neither is
+  exercised here. Only the DR coordinator is started; the DR segment is not.
 - Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
 - **`DR_SEED`** (dr service env) defaults to `0`. With `DR_SEED=1` the DR
