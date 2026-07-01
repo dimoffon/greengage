@@ -596,6 +596,25 @@ pg_last_xact_replay_timestamp(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Greengage DR (M5): report the name of the restore point recovery is currently
+ * PAUSED at -- the served consistency point (N) under M3 stop-and-go.  Returns
+ * NULL when the node is not paused at a restore point.  Unlike
+ * pg_is_wal_replay_paused(), this never errors when recovery is not in progress,
+ * so gp_stat_dr_replica can call it on every node including a promoted one.
+ */
+Datum
+pg_last_paused_restore_point(PG_FUNCTION_ARGS)
+{
+	char		name[MAXFNAMELEN];
+
+	GetPausedRestorePointName(name, sizeof(name));
+	if (name[0] == '\0')
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(cstring_to_text(name));
+}
+
+/*
  * Returns bool with current recovery mode, a global state.
  */
 Datum

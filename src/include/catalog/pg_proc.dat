@@ -6084,6 +6084,12 @@
   prorettype => 'timestamptz', proargtypes => '',
   prosrc => 'pg_last_xact_replay_timestamp' },
 
+# Greengage DR (M5): served consistency point under M3 stop-and-go.
+{ oid => '7016', descr => 'name of the restore point recovery is paused at (Greengage DR)',
+  proname => 'pg_last_paused_restore_point', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'pg_last_paused_restore_point' },
+
 { oid => '3071', descr => 'pause wal replay',
   proname => 'pg_wal_replay_pause', provolatile => 'v', prorettype => 'void',
   proargtypes => '', prosrc => 'pg_wal_replay_pause' },

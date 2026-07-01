@@ -762,6 +762,17 @@ typedef struct XLogCtlData
 	bool		recoveryPause;
 
 	/*
+	 * Greengage DR (M3 stop-and-go / M5 observability): the name of the restore
+	 * point this node is currently PAUSED at.  Set under info_lck when
+	 * pauseRecoveryOnRestorePoint matches the configured target, cleared on
+	 * resume in SetRecoveryPause(false).  Empty string => not paused at a
+	 * restore point.  Exposed via GetPausedRestorePointName() so any backend can
+	 * report the served consistency point without reaching into startup-process
+	 * state.
+	 */
+	char		pausedRestorePointName[MAXFNAMELEN];
+
+	/*
 	 * lastFpwDisableRecPtr points to the start of the last replayed
 	 * XLOG_FPW_CHANGE record that instructs full_page_writes is disabled.
 	 */
@@ -5990,6 +6001,12 @@ pauseRecoveryOnRestorePoint(XLogReaderState *record)
 							recordRestorePointData->rp_name,
 							timestamptz_to_str(recordRestorePointData->rp_time))));
 
+			/* Greengage DR: publish the served restore-point name (M5). */
+			SpinLockAcquire(&XLogCtl->info_lck);
+			strlcpy(XLogCtl->pausedRestorePointName,
+					recordRestorePointData->rp_name, MAXFNAMELEN);
+			SpinLockRelease(&XLogCtl->info_lck);
+
 			SetRecoveryPause(true);
 			recoveryPausesHere();
 
@@ -6219,6 +6236,14 @@ SetRecoveryPause(bool recoveryPause)
 {
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->recoveryPause = recoveryPause;
+	/*
+	 * Greengage DR: resuming replay leaves the served restore point, so forget
+	 * its name.  This is the single choke point for every unpause transition
+	 * (pg_wal_replay_resume -> here), so clearing here keeps the reported
+	 * served-N from ever going stale.
+	 */
+	if (!recoveryPause)
+		XLogCtl->pausedRestorePointName[0] = '\0';
 	SpinLockRelease(&XLogCtl->info_lck);
 }
 
@@ -6355,6 +6380,19 @@ GetLatestXTime(void)
 	SpinLockRelease(&XLogCtl->info_lck);
 
 	return xtime;
+}
+
+/*
+ * Greengage DR (M5): copy the name of the restore point recovery is currently
+ * PAUSED at into buf (empty string if not paused at a restore point).  Safe to
+ * call from any backend and whether or not recovery is in progress.
+ */
+void
+GetPausedRestorePointName(char *buf, Size buflen)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	strlcpy(buf, XLogCtl->pausedRestorePointName, buflen);
+	SpinLockRelease(&XLogCtl->info_lck);
 }
 
 /*

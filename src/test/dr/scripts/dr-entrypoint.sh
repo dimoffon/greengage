@@ -313,6 +313,36 @@ if [ -n "$sok" ]; then
 	else
 		log "================ M3 STOP-AND-GO TEST: FAIL ($f3 of $((p3+f3)) failed) ================"
 	fi
+
+	# --- M5: DR observability.  The cluster is now paused at dr_rp_straddle_done,
+	#     so gp_stat_dr_replica / _summary should report all 3 nodes in recovery,
+	#     paused, at that same consistent restore point. ---
+	echo "================ M5: gp_stat_dr_replica observability (paused at dr_rp_straddle_done) ================"
+	p5=0; f5=0
+	ok5() { log "dr-test: PASS  $1"; p5=$((p5+1)); }
+	no5() { log "dr-test: FAIL  $1"; f5=$((f5+1)); }
+	rows=$(dsp "select count(*) from gp_stat_dr_replica;")
+	[ "$rows" = 3 ] && ok5 "M5: gp_stat_dr_replica has 3 rows (coordinator + 2 segments)" \
+					|| no5 "M5: gp_stat_dr_replica rows = '$rows' (expected 3)"
+	r=$(dsp "select count(*) from gp_stat_dr_replica where dr_replica and in_recovery;")
+	[ "$r" = 3 ] && ok5 "M5: all 3 nodes report dr_replica=t and in_recovery=t" \
+				 || no5 "M5: dr_replica/in_recovery nodes = '$r' (expected 3)"
+	r=$(dsp "select count(*) from gp_stat_dr_replica where restore_point = 'dr_rp_straddle_done';")
+	[ "$r" = 3 ] && ok5 "M5: all 3 nodes report restore_point='dr_rp_straddle_done' (per-node served N via new C accessor)" \
+				 || no5 "M5: nodes at dr_rp_straddle_done = '$r' (expected 3)"
+	r=$(dsp "select node_count||'|'||all_in_recovery||'|'||all_paused||'|'||coalesce(consistent_restore_point,'<null>') from gp_stat_dr_replica_summary;")
+	[ "$r" = "3|t|t|dr_rp_straddle_done" ] \
+		&& ok5 "M5: summary = 3 nodes, all_in_recovery, all_paused, consistent_restore_point=dr_rp_straddle_done" \
+		|| no5 "M5: summary = '$r' (expected 3|t|t|dr_rp_straddle_done)"
+	r=$(dsp "select rpo_seconds >= 0 from gp_stat_dr_replica_summary;")
+	[ "$r" = t ] && ok5 "M5: summary rpo_seconds is a finite, non-negative RPO" \
+				 || no5 "M5: rpo_seconds check = '$r'"
+	echo "===================================================================================================="
+	if [ "$f5" -eq 0 ]; then
+		log "================ M5 OBSERVABILITY TEST: PASS ($p5/$((p5+f5))) ================"
+	else
+		log "================ M5 OBSERVABILITY TEST: FAIL ($f5 of $((p5+f5)) failed) ================"
+	fi
 fi
 
 exec sleep infinity
