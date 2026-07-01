@@ -164,5 +164,21 @@ for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal(
 touch "$ARCHIVE/gg_ready"
 log "primary: gg_recovery target dr_rp_switch (gg_switch=5) created + archived"
 
+# --- gg_recovery promote target: a FINAL distributed restore point dr_rp_promote,
+#     created only AFTER the DR has armed its pause for it (marker
+#     $ARCHIVE/dr_wants_promote_rp).  The DR is FOLLOWING continuously by then, so
+#     creating dr_rp_promote after the pause is armed lets the DR catch it at a
+#     clean cross-node cut instead of overshooting -- giving the promote test a
+#     fresh consistent restore point to promote the whole cluster at. ---
+log "primary: waiting for the DR to request the promote restore point ..."
+for _ in $(seq 1 600); do [ -f "$ARCHIVE/dr_wants_promote_rp" ] && break; sleep 2; done
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table gg_promote (id int) distributed by (id); insert into gg_promote select generate_series(1,7);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp_promote');" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -q -c "checkpoint;" >/dev/null 2>&1 || true
+for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true; sleep 2; done
+touch "$ARCHIVE/promote_rp_ready"
+log "primary: gg_recovery promote target dr_rp_promote (gg_promote=7) created + archived"
+
 log "primary: done; idling so the cluster keeps archiving WAL"
 exec sleep infinity

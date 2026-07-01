@@ -1,17 +1,18 @@
 #!/bin/bash
-# dr-entrypoint.sh -- seed the DR cluster from the primary's base backups, arm
-# DR mode (gp_dr_replica + dr_replica.signal) + continuous restore, start the
-# instances in recovery, then run the filter test.
+# dr-entrypoint.sh -- build the DR cluster with `gg_recovery create-replica`
+# (restore base backups + frozen-seed DR-local topology + arm DR mode + start every
+# node in continuous archive recovery), then run the milestone regression suite:
+# M1 (redo filter) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
+# M5 (observability), the gg_recovery switch/follow/stats utility test, and finally
+# the gg_recovery promote test (DR -> online read-write).
 set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
 
-DR_SEED=${DR_SEED:-1}   # 1 = run the frozen-tuple topology seed (M1.5)
-
 log "dr: waiting for primary to publish base backups ..."
 for _ in $(seq 1 600); do [ -f "$READY_MARKER" ] && break; sleep 2; done
 [ -f "$READY_MARKER" ] || die "timed out waiting for $READY_MARKER"
-log "dr: primary ready; seeding DR cluster"
+log "dr: primary ready; building DR cluster"
 
 # Derive the DR layout (content -> datadir, content -> port) from the published
 # topology, so the fixture scales with the segment count (coordinator + N segments).
@@ -23,71 +24,43 @@ while IFS=$'\t' read -r dbid content role prefrole mode status port hostname add
 done < "$TOPO_FILE"
 ALL_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n)             # -1 0 1 ...
 SEG_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n | grep -v '^-')  # 0 1 ...
-
-# Restore each instance's base backup into the DR demo layout.
-for content in $ALL_CONTENTS; do
-	dest=${DR_DATADIR[$content]}
-	rm -rf "$dest"; mkdir -p "$(dirname "$dest")"
-	cp -a "$BASEBACKUP/seg$content" "$dest"
-	chmod 700 "$dest"
-	log "dr:   restored content $content -> $dest (port ${DR_PORT[$content]})"
-done
-
 COORD=${DR_DATADIR[-1]}
 
-# Frozen-tuple seed (M1.5) + recovery-start preservation (M4), BEFORE arming
-# recovery.  The single-user seed consumes backup_label and advances pg_control
-# past the backup LSN, which would fork production's timeline on resume.  We save
-# the recovery-start state (backup_label + pg_control) before the seed and restore
-# it after: recovery then resumes from the backup checkpoint and refetches
-# production's WAL from the archive (restore_command), while the seed's frozen
-# gp_segment_configuration pages -- protected, hence filtered -- persist.
-if [ "$DR_SEED" = 1 ]; then
-	log "dr: M4 seed: preserving recovery-start state, then frozen-seeding DR-local topology"
-	have_label=
-	[ -f "$COORD/backup_label" ] && { cp -p "$COORD/backup_label" "$COORD/backup_label.drsave"; have_label=1; }
-	cp -p "$COORD/global/pg_control" "$COORD/pg_control.drsave"
-	if "$SRC/gpMgmt/bin/gpseed_dr_topology" "$COORD" "$TOPO_FILE"; then
-		[ -n "$have_label" ] && mv "$COORD/backup_label.drsave" "$COORD/backup_label"
-		mv "$COORD/pg_control.drsave" "$COORD/global/pg_control"
-		log "dr: M4 seed: done; recovery-start state restored (will resume production WAL from the archive)"
-	else
-		log "dr: WARNING gpseed_dr_topology failed; leaving node unseeded"
-		rm -f "$COORD/backup_label.drsave" "$COORD/pg_control.drsave"
-	fi
-fi
+# The full node list (coordinator + every segment) as "datadir:port", used by the
+# M3 pause/advance helpers and the promote test so they act on the whole cluster
+# regardless of segment count.  Coordinator first (ALL_CONTENTS sorts -1 ahead).
+NODES=()
+for content in $ALL_CONTENTS; do NODES+=("${DR_DATADIR[$content]}:${DR_PORT[$content]}"); done
 
 log "dr: waiting for production to create + archive the restore point ..."
 for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2; done
 
-# Arm DR mode + continuous archive recovery and bring the coordinator up as a
-# LIVE hot-standby that serves read-only queries while permanently in recovery.
-# hot_standby is enabled automatically by DR mode (gp_dr_replica +
-# dr_replica.signal) in the postmaster, so we deliberately do NOT set it here --
-# that exercises the M2 auto-enable path.  The redo filter stays active, so
-# production's gp_segment_configuration change is skipped during replay.
-: > "$COORD/postgresql.auto.conf"             # drop production sync-rep settings
-cat >> "$COORD/postgresql.conf" <<EOF
+# --- M4: build the whole DR cluster in one shot via the gg_recovery utility.
+#     create-replica restores each instance's base backup, frozen-seeds the
+#     DR-local topology into the coordinator (hostname 'dr'), gates on the WAL
+#     archive being complete enough to reach consistency, arms DR mode
+#     (gp_dr_replica + restore_command + dr_replica.signal + standby.signal) on
+#     every node with the M3 pause target dr_rp1, and starts each in archive
+#     recovery.  This exercises the SAME code path an operator would run, instead
+#     of open-coding the restore/seed/arm/start inline. ---
+GG="python3 $SRC/gpMgmt/bin/gg_recovery"
+export PGPORT="$PORT_BASE" PGDATABASE=postgres
+log "dr: building the DR replica via 'gg_recovery create-replica' (M4) ..."
+set +e
+$GG create-replica \
+	--topology "$TOPO_FILE" \
+	--basebackup-dir "$BASEBACKUP" \
+	--wal-archive "$WAL_ARCHIVE" \
+	--pause-at dr_rp1 \
+	--force 2>&1 | sed 's/^/    gg_recovery: /'
+cr_rc=${PIPESTATUS[0]}
+set -e
+[ "$cr_rc" = 0 ] || log "dr: WARNING create-replica exit=$cr_rc (continuing; assertions below will show the real state)"
 
-# --- GREENGAGE DR REPLICA ---
-gp_dr_replica = on
-restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
-recovery_target_timeline = 'current'
-gp_pause_on_restore_point_replay = 'dr_rp1'   # M3 stop-and-go: pause replay at restore point dr_rp1
-EOF
-touch "$COORD/dr_replica.signal"              # arms IsDRReplicaMode() + redo filter + hot_standby auto-enable
-touch "$COORD/standby.signal"                 # continuous archive recovery (stays in recovery)
-
-source "$ARCHIVE/primary_expected.env"
 q()     { PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc "$1" 2>/dev/null; }
 # Returns 0 even when the statement errors (that is the expected case here), so
 # the command substitution does not trip `set -e`; the error text is captured.
 qfail() { PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -v ON_ERROR_STOP=0 -qtAc "$1" 2>&1 || true; }
-
-log "dr: starting DR coordinator in continuous hot-standby recovery (hot_standby auto-enabled by DR mode) ..."
-# -W: do not wait. A continuous hot-standby never reports "ready" to pg_ctl's
-# liveness wait the way a normal server does, so we launch and poll ourselves.
-pg_ctl -D "$COORD" -l "$COORD/startup.log" -W -o "-c gp_role=dispatch" start
 
 log "dr: waiting for the in-recovery coordinator to accept read connections ..."
 ok=
@@ -100,6 +73,7 @@ if [ -z "$ok" ]; then
 fi
 log "dr: coordinator is LIVE in recovery and accepting read connections"
 
+source "$ARCHIVE/primary_expected.env"
 log "dr: waiting to replay past production's change (LSN ${PRODUCTION_CHANGE_LSN}) ..."
 for _ in $(seq 1 60); do
 	[ "$(q "select pg_last_wal_replay_lsn() >= '${PRODUCTION_CHANGE_LSN}'::pg_lsn")" = t ] && break
@@ -126,14 +100,13 @@ if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
 else
 	no_ "M1 redo filter: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
 fi
-# M4 (seed): when seeded, the DR carries genuinely DR-LOCAL topology ('dr'),
-# proving topology independence -- not merely "ignored production's change".
-if [ "$DR_SEED" = 1 ]; then
-	if [ "$drhost" = "dr" ]; then
-		ok_ "M4 seed: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
-	else
-		no_ "M4 seed: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
-	fi
+# M4 (seed): create-replica frozen-seeds the DR-local topology, so the DR carries a
+# genuinely DR-LOCAL hostname ('dr') -- proving topology independence, not merely
+# "ignored production's change".
+if [ "$drhost" = "dr" ]; then
+	ok_ "M4 seed: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
+else
+	no_ "M4 seed: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
 fi
 # M1 (selective): a user table created on production AFTER the base backup must
 # appear on the DR via WAL replay -- the filter only skips protected catalogs,
@@ -164,33 +137,9 @@ log "dr: DR coordinator left RUNNING in recovery (utility-mode reads). Connect w
 log "dr:   sudo docker-compose -f src/test/dr/docker-compose.yml exec dr \\"
 log "dr:        env PGOPTIONS='-c gp_role=utility' psql -p ${PORT_BASE} postgres"
 
-# --- M2' I-0: bring every DR SEGMENT up in recovery too, so the coordinator can
-#     dispatch a read-only distributed query to them.  NODES is the full node list
-#     (coordinator + every segment) as "datadir:port", used by the M3 pause/advance
-#     helpers so they act on the whole cluster regardless of segment count. ---
-NODES=("$COORD:7000")
-arm_segment() {  # $1 = segment datadir -- arm DR mode + continuous restore + M3 pause
-	: > "$1/postgresql.auto.conf"
-	if ! grep -q 'GREENGAGE DR REPLICA (segment)' "$1/postgresql.conf"; then
-		cat >> "$1/postgresql.conf" <<EOF
-
-# --- GREENGAGE DR REPLICA (segment) ---
-gp_dr_replica = on
-restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
-recovery_target_timeline = 'current'
-gp_pause_on_restore_point_replay = 'dr_rp1'   # M3 stop-and-go: pause replay at restore point dr_rp1
-EOF
-	fi
-	touch "$1/dr_replica.signal"              # filter + read-only enforcement + hot_standby auto-enable
-	touch "$1/standby.signal"                 # continuous archive recovery (%c resolves to the content id)
-}
-for c in $SEG_CONTENTS; do
-	sd=${DR_DATADIR[$c]}; sp=${DR_PORT[$c]}
-	arm_segment "$sd"
-	NODES+=("$sd:$sp")
-	log "dr: M2' I-0: starting DR segment (content $c, port $sp) in continuous hot-standby recovery (gp_role=execute) ..."
-	pg_ctl -D "$sd" -l "$sd/startup.log" -W -o "-c gp_role=execute" start
-done
+# --- M2' I-0: every DR SEGMENT is already up in recovery (create-replica started
+#     the whole cluster).  Verify each accepts utility reads so the coordinator can
+#     dispatch a read-only distributed query to them. ---
 sok=1
 for c in $SEG_CONTENTS; do
 	sd=${DR_DATADIR[$c]}; sp=${DR_PORT[$c]}; up=
@@ -360,8 +309,6 @@ if [ -n "$sok" ]; then
 	# --- gg_recovery: the DR recovery-control utility (switch / follow / stats).
 	#     The cluster is paused at dr_rp_straddle_done; drive it forward to
 	#     dr_rp_switch, then into continuous (follow) mode. ---
-	GG="python3 $SRC/gpMgmt/bin/gg_recovery"
-	export PGPORT=7000 PGDATABASE=postgres
 	echo "================ gg_recovery: DR recovery-control utility ================"
 	p6=0; f6=0
 	ok6() { log "dr-test: PASS  $1"; p6=$((p6+1)); }
@@ -392,6 +339,66 @@ if [ -n "$sok" ]; then
 		log "================ gg_recovery TEST: PASS ($p6/$((p6+f6))) ================"
 	else
 		log "================ gg_recovery TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
+	fi
+
+	# --- gg_recovery promote: DR read-replica -> online read-write cluster.
+	#     The cluster is currently FOLLOWING (from the follow test), so it has no
+	#     consistent cut.  We pre-arm a switch to dr_rp_promote -- a distributed
+	#     restore point the primary creates only AFTER we ask for it (via the
+	#     dr_wants_promote_rp marker) -- so the free-running nodes catch it cleanly
+	#     at a common cut, then promote the whole cluster there and prove it is
+	#     online + writable (gp_dr_replica=off, distributed writes succeed). ---
+	echo "================ gg_recovery promote: DR -> online read-write ================"
+	p7=0; f7=0
+	ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
+	no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
+	# switch arms the pause target (via ALTER SYSTEM) synchronously before it starts
+	# polling; touching the marker on a short delay guarantees the pause is armed on
+	# every node BEFORE the primary creates dr_rp_promote -- so no node overshoots it.
+	( sleep 5; touch "$ARCHIVE/dr_wants_promote_rp" ) &
+	if $GG switch dr_rp_promote 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_promote'"; then
+		ok7 "gg_recovery switch dr_rp_promote: all 3 nodes reached the promote cut (pre-armed while following)"
+	else
+		no7 "gg_recovery switch dr_rp_promote: did not reach on all nodes"
+	fi
+	if $GG promote --at dr_rp_promote --yes 2>&1 | tee /tmp/gg_promote.log | grep -q "promoted to online read-write"; then
+		ok7 "gg_recovery promote: reported the cluster promoted to online read-write"
+	else
+		no7 "gg_recovery promote: did not report success"; tail -8 /tmp/gg_promote.log >&2
+	fi
+	# every node must now be OUT of recovery.
+	outrec=0
+	for nd in "${NODES[@]}"; do
+		[ "$(PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_is_in_recovery();' 2>/dev/null)" = f ] && outrec=$((outrec+1))
+	done
+	[ "$outrec" = "${#NODES[@]}" ] && ok7 "gg_recovery promote: all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
+								  || no7 "gg_recovery promote: only $outrec/${#NODES[@]} nodes out of recovery"
+	# gp_dr_replica must be OFF now -- DR mode disengaged by the phase-2 restart.
+	drg=$(PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc 'show gp_dr_replica;' 2>/dev/null)
+	[ "$drg" = off ] && ok7 "gg_recovery promote: gp_dr_replica=off (DR mode disengaged)" \
+					 || no7 "gg_recovery promote: gp_dr_replica='$drg' (expected off)"
+	# the promoted cluster must accept a DISTRIBUTED write (FTS/DTX online). Poll:
+	# FTS needs a probe cycle after the restart before dispatch is healthy.
+	wok=
+	for _ in $(seq 1 30); do
+		if psql -p "$PORT_BASE" -d postgres -q -c \
+			"create table gg_online_write (x int) distributed by (x); insert into gg_online_write values (1);" >/dev/null 2>&1; then wok=1; break; fi
+		sleep 2
+	done
+	if [ -n "$wok" ] && [ "$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_online_write;' 2>/dev/null)" = 1 ]; then
+		ok7 "gg_recovery promote: distributed WRITE succeeds on the promoted cluster (online read-write)"
+	else
+		no7 "gg_recovery promote: distributed write did NOT succeed after promote"
+	fi
+	# the data as-of the promote cut (dr_rp_promote) must be readable = 7 rows.
+	r=$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_promote;' 2>/dev/null)
+	[ "$r" = 7 ] && ok7 "gg_recovery promote: data as-of dr_rp_promote is present (gg_promote=7)" \
+				 || no7 "gg_recovery promote: gg_promote='$r' (expected 7)"
+	echo "============================================================================="
+	if [ "$f7" -eq 0 ]; then
+		log "================ gg_recovery PROMOTE TEST: PASS ($p7/$((p7+f7))) ================"
+	else
+		log "================ gg_recovery PROMOTE TEST: FAIL ($f7 of $((p7+f7)) failed) ================"
 	fi
 fi
 
