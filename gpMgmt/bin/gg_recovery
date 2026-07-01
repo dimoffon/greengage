@@ -16,6 +16,11 @@ Subcommands
         <restore_point> must be a point production has already created and that is
         AHEAD of where the cluster is now (recovery only moves forward).
 
+  pause
+        Immediately pause replay on every node at its current point.  Unlike
+        switch, this is NOT a cross-node consistent cut (each node halts wherever
+        it happens to be).  Resume with switch or follow.
+
   follow
         Continuous recovery with NO cross-node consistent view: clears the pause
         target on every node and resumes, so each node free-runs to the end of the
@@ -173,6 +178,23 @@ def cmd_switch(restore_point):
     return 1
 
 
+def cmd_pause():
+    nodes = get_nodes()
+    print("gg_recovery pause: pausing replay on %d node(s) at their current point" % len(nodes))
+    for content, address, port in nodes:
+        host, p = _conn(content, address, port)
+        rc, out, err = _psql(p, "select pg_wal_replay_pause();", host=host)
+        note = ""
+        if err and "not in progress" not in err.lower():
+            note = "  [warn: %s]" % err.splitlines()[0]
+        print("  %-13s (port %d): paused%s" % (_label(content), port, note))
+    print("gg_recovery pause: replay halted.")
+    print("  NOTE: an IMMEDIATE pause halts each node wherever it is, which is NOT a")
+    print("        cross-node consistent cut.  For a consistent, safe-to-serve point use")
+    print("        'switch <rp>'.  Resume with 'switch <rp>' or 'follow'.")
+    return 0
+
+
 def cmd_follow():
     nodes = get_nodes()
     print("gg_recovery follow: switching %d node(s) to CONTINUOUS recovery "
@@ -237,11 +259,14 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_switch = sub.add_parser("switch", help="pause every node at <restore_point> (stop-and-go)")
     p_switch.add_argument("restore_point", help="the restore point to pause the whole cluster at")
+    sub.add_parser("pause", help="immediately pause replay on every node (not a consistent cut)")
     sub.add_parser("follow", help="continuous recovery, no cross-node consistent view")
     sub.add_parser("stats", help="print recovery statistics")
     args = ap.parse_args()
     if args.cmd == "switch":
         return cmd_switch(args.restore_point)
+    if args.cmd == "pause":
+        return cmd_pause()
     if args.cmd == "follow":
         return cmd_follow()
     if args.cmd == "stats":
