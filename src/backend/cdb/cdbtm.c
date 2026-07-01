@@ -407,14 +407,14 @@ void
 setupDtxTransaction(void)
 {
 	/*
-	 * Greengage DR: a standby reader dispatches read-only queries with NO
-	 * distributed transaction (no gxid).  Several dispatch paths call this
-	 * directly -- notably InitPlan dispatch via cdbdisp_query.c, which is why the
-	 * executor-level guard is not sufficient -- so make it a no-op for the
-	 * standby reader.  Without this the InitPlan dispatch reaches
-	 * currentDtxActivate and the M2 backstop refuses it.
+	 * Greengage DR: a DR replica is read-only and never opens a distributed
+	 * transaction (no gxid, no WAL).  Gate on IsDRReplicaMode() rather than the
+	 * QD context: some dispatch paths (e.g. InitPlan/subplan) reach here with the
+	 * context not yet resolved to DTX_CONTEXT_QD_STANDBY_READER, and we must
+	 * still refuse DTX activation.  Read-only enforcement has already rejected
+	 * anything that writes, so this only suppresses the gxid for reads.
 	 */
-	if (DistributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
+	if (IsDRReplicaMode())
 		return;
 
 	if (!IsTransactionState())
@@ -442,14 +442,14 @@ doDispatchSubtransactionInternalCmd(DtxProtocolCommand cmdType)
 	bool		succeeded = false;
 
 	/*
-	 * Greengage DR: a standby reader has no distributed transaction, so it must
-	 * not dispatch internal subtransaction commands (BEGIN_INTERNAL / RELEASE /
+	 * Greengage DR: a DR replica has no distributed transaction, so it must not
+	 * dispatch internal subtransaction commands (BEGIN_INTERNAL / RELEASE /
 	 * ROLLBACK) to segments -- doing so would activate a DTX (currentDtxActivate,
 	 * the M2 backstop) and pack needDtx=true, turning segment QEs into writers,
 	 * both illegal in recovery.  InitPlan/subplan savepoints stay QD-local; the
 	 * read-only subplan query is dispatched separately like any other read.
 	 */
-	if (DistributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
+	if (IsDRReplicaMode())
 		return true;
 
 	if (currentGxactWriterGangLost())

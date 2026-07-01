@@ -658,14 +658,12 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			needDtx = (queryDesc->plannedstmt->hasInitPlans ||
 					   ExecutorSaysTransactionDoesWrites());
 			/*
-			 * Greengage DR: a standby-reader QD never opens a distributed
-			 * transaction (no gxid, no WAL).  A read-only SELECT with an InitPlan
-			 * would otherwise force one here; skip it.  Writes are already
-			 * rejected by read-only enforcement, so this only suppresses the
-			 * gxid for legitimate reads on a DR replica.
+			 * Greengage DR: a DR replica never opens a distributed transaction
+			 * (no gxid, no WAL).  A read-only SELECT with an InitPlan would
+			 * otherwise force one here; skip it.  Writes are already rejected by
+			 * read-only enforcement, so this only suppresses the gxid for reads.
 			 */
-			if (needDtx &&
-				DistributedTransactionContext != DTX_CONTEXT_QD_STANDBY_READER)
+			if (needDtx && !IsDRReplicaMode())
 				setupDtxTransaction();
 
 			/*
