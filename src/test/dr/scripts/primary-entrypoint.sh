@@ -10,9 +10,9 @@ cd "$DEMO"
 
 # Remove any gpdemo-env.sh baked into the image from a host build, then create.
 rm -f "$DEMO/gpdemo-env.sh"
-log "primary: creating demo cluster (coordinator + 1 segment, no mirrors) ..."
+log "primary: creating demo cluster (coordinator + 2 segments, no mirrors) ..."
 LANG=en_US.UTF-8 make create-demo-cluster \
-	PORT_BASE="$PORT_BASE" NUM_PRIMARY_MIRROR_PAIRS=1 WITH_MIRRORS=false 2>&1 | tail -25
+	PORT_BASE="$PORT_BASE" NUM_PRIMARY_MIRROR_PAIRS=2 WITH_MIRRORS=false 2>&1 | tail -25
 source "$DEMO/gpdemo-env.sh"
 
 log "primary: instances:"
@@ -55,12 +55,14 @@ while IFS=$'\t' read -r datadir port dbid content; do
 	log "primary:   content $content (dbid $dbid, port $port) -> $BASEBACKUP/seg$content"
 done < <(list_instances)
 
-# Publish the DR-local topology (same dbids/ports/layout, but hostname 'dr').
-# datadirs mirror the primary's demo layout inside the dr container's $DEMO.
-{
-	echo -e "1\t-1\tp\tp\tn\tu\t7000\tdr\tdr\t$DEMO/datadirs/qddir/demoDataDir-1"
-	echo -e "2\t0\tp\tp\ts\tu\t7002\tdr\tdr\t$DEMO/datadirs/dbfast1/demoDataDir0"
-} > "$TOPO_FILE"
+# Publish the DR-local topology: the primary's own layout (same dbids/ports/
+# datadirs -- the dr container mirrors the demo layout under the same $DEMO path)
+# but with hostname + address forced to 'dr', so the seeded DR catalog is
+# genuinely DR-local.  Generated from the live config, so it scales with the
+# segment count (coordinator + N segments) automatically.
+psql -p "$PORT_BASE" -d postgres -Atc \
+	"select dbid||E'\t'||content||E'\t'||role||E'\t'||preferred_role||E'\t'||mode||E'\t'||status||E'\t'||port||E'\tdr\tdr\t'||datadir
+	   from gp_segment_configuration order by content;" > "$TOPO_FILE"
 
 touch "$READY_MARKER"
 log "primary: ready (base backups + topology published, archiving live)"

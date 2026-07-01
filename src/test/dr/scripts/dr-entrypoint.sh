@@ -13,15 +13,24 @@ for _ in $(seq 1 600); do [ -f "$READY_MARKER" ] && break; sleep 2; done
 [ -f "$READY_MARKER" ] || die "timed out waiting for $READY_MARKER"
 log "dr: primary ready; seeding DR cluster"
 
+# Derive the DR layout (content -> datadir, content -> port) from the published
+# topology, so the fixture scales with the segment count (coordinator + N segments).
+declare -A DR_DATADIR DR_PORT
+while IFS=$'\t' read -r dbid content role prefrole mode status port hostname address datadir; do
+	[ -n "${content:-}" ] || continue
+	DR_DATADIR[$content]=$datadir
+	DR_PORT[$content]=$port
+done < "$TOPO_FILE"
+ALL_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n)             # -1 0 1 ...
+SEG_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n | grep -v '^-')  # 0 1 ...
+
 # Restore each instance's base backup into the DR demo layout.
-declare -A DR_DATADIR=( [-1]="$DEMO/datadirs/qddir/demoDataDir-1"
-                        [0]="$DEMO/datadirs/dbfast1/demoDataDir0" )
-for content in -1 0; do
+for content in $ALL_CONTENTS; do
 	dest=${DR_DATADIR[$content]}
 	rm -rf "$dest"; mkdir -p "$(dirname "$dest")"
 	cp -a "$BASEBACKUP/seg$content" "$dest"
 	chmod 700 "$dest"
-	log "dr:   restored content $content -> $dest"
+	log "dr:   restored content $content -> $dest (port ${DR_PORT[$content]})"
 done
 
 COORD=${DR_DATADIR[-1]}
@@ -155,13 +164,15 @@ log "dr: DR coordinator left RUNNING in recovery (utility-mode reads). Connect w
 log "dr:   sudo docker-compose -f src/test/dr/docker-compose.yml exec dr \\"
 log "dr:        env PGOPTIONS='-c gp_role=utility' psql -p ${PORT_BASE} postgres"
 
-# --- M2' I-0: bring the DR SEGMENT (content 0) up in recovery too, so the
-#     coordinator can (after SR-1 + SR-2) dispatch a read-only distributed query
-#     to it.  For now this just smoke-tests that the segment serves reads while in
-#     recovery -- the dispatch path itself is M2' SR-1/SR-2 (not yet implemented).
-SEG0=${DR_DATADIR[0]}
-: > "$SEG0/postgresql.auto.conf"
-cat >> "$SEG0/postgresql.conf" <<EOF
+# --- M2' I-0: bring every DR SEGMENT up in recovery too, so the coordinator can
+#     dispatch a read-only distributed query to them.  NODES is the full node list
+#     (coordinator + every segment) as "datadir:port", used by the M3 pause/advance
+#     helpers so they act on the whole cluster regardless of segment count. ---
+NODES=("$COORD:7000")
+arm_segment() {  # $1 = segment datadir -- arm DR mode + continuous restore + M3 pause
+	: > "$1/postgresql.auto.conf"
+	if ! grep -q 'GREENGAGE DR REPLICA (segment)' "$1/postgresql.conf"; then
+		cat >> "$1/postgresql.conf" <<EOF
 
 # --- GREENGAGE DR REPLICA (segment) ---
 gp_dr_replica = on
@@ -169,21 +180,31 @@ restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
 recovery_target_timeline = 'current'
 gp_pause_on_restore_point_replay = 'dr_rp1'   # M3 stop-and-go: pause replay at restore point dr_rp1
 EOF
-touch "$SEG0/dr_replica.signal"               # filter + read-only enforcement + hot_standby auto-enable
-touch "$SEG0/standby.signal"                  # continuous archive recovery (%c resolves to 0 on the segment)
-
-log "dr: M2' I-0: starting DR segment (content 0) in continuous hot-standby recovery (gp_role=execute) ..."
-pg_ctl -D "$SEG0" -l "$SEG0/startup.log" -W -o "-c gp_role=execute" start
-sok=
-for _ in $(seq 1 80); do PGOPTIONS='-c gp_role=utility' psql -p 7002 -d postgres -Atc 'select 1' >/dev/null 2>&1 && { sok=1; break; }; sleep 3; done
-if [ -n "$sok" ]; then
-	scount=$(PGOPTIONS='-c gp_role=utility' psql -p 7002 -d postgres -Atc 'select count(*) from dr_marker' 2>/dev/null)
-	log "dr: M2' I-0: PASS -- DR segment is LIVE in recovery; segment-local 'select count(*) from dr_marker' = ${scount:-<none>}"
-else
-	log "dr: M2' I-0: FAIL -- DR segment did not accept connections; logs:"
-	tail -20 "$SEG0/startup.log" >&2 2>/dev/null || true
-	cat "$SEG0"/log/*.csv 2>/dev/null | tail -20 >&2 || true
-fi
+	fi
+	touch "$1/dr_replica.signal"              # filter + read-only enforcement + hot_standby auto-enable
+	touch "$1/standby.signal"                 # continuous archive recovery (%c resolves to the content id)
+}
+for c in $SEG_CONTENTS; do
+	sd=${DR_DATADIR[$c]}; sp=${DR_PORT[$c]}
+	arm_segment "$sd"
+	NODES+=("$sd:$sp")
+	log "dr: M2' I-0: starting DR segment (content $c, port $sp) in continuous hot-standby recovery (gp_role=execute) ..."
+	pg_ctl -D "$sd" -l "$sd/startup.log" -W -o "-c gp_role=execute" start
+done
+sok=1
+for c in $SEG_CONTENTS; do
+	sd=${DR_DATADIR[$c]}; sp=${DR_PORT[$c]}; up=
+	for _ in $(seq 1 80); do PGOPTIONS='-c gp_role=utility' psql -p "$sp" -d postgres -Atc 'select 1' >/dev/null 2>&1 && { up=1; break; }; sleep 3; done
+	if [ -n "$up" ]; then
+		scount=$(PGOPTIONS='-c gp_role=utility' psql -p "$sp" -d postgres -Atc 'select count(*) from dr_marker' 2>/dev/null)
+		log "dr: M2' I-0: PASS -- DR segment content $c LIVE in recovery; segment-local count(dr_marker)=${scount:-<none>}"
+	else
+		sok=
+		log "dr: M2' I-0: FAIL -- DR segment content $c did not accept connections; logs:"
+		tail -20 "$sd/startup.log" >&2 2>/dev/null || true
+		cat "$sd"/log/*.csv 2>/dev/null | tail -20 >&2 || true
+	fi
+done
 
 # --- M2' SR-1: dispatched read-only DISTRIBUTED queries.  The coordinator (in
 #     recovery) enters DTX_CONTEXT_QD_STANDBY_READER -- no gxid -- and dispatches
@@ -202,7 +223,7 @@ if [ -n "$sok" ]; then
 	[ "$r" = 1 ] && okp "M2' dispatch: 'select count(*) from dr_marker' = 1 (aggregated from the segment)" \
 				 || nop "M2' dispatch count = '$r'"
 	r=$(dsp 'select gp_segment_id from dr_marker;')
-	[ "$r" = 0 ] && okp "M2' dispatch: row served by gp_segment_id=0 (real dispatch to the DR segment)" \
+	echo "$r" | grep -qE '^[0-9]+$' && okp "M2' dispatch: row served by gp_segment_id=$r (real dispatch to a DR segment)" \
 				 || nop "M2' dispatch gp_segment_id = '$r'"
 	r=$(dsp 'select (select count(*) from dr_marker);')
 	[ "$r" = 1 ] && okp "M2' dispatch: InitPlan-bearing read works (no gxid, no DTX backstop)" \
@@ -225,23 +246,30 @@ if [ -n "$sok" ]; then
 	#     dr_rp1.  Show reads are STABLE as-of dr_rp1 (dr_m3 has 1 row), then after
 	#     advancing to dr_rp2 they reflect as-of dr_rp2 (dr_m3 has 2 rows).  While
 	#     paused there is zero replay, hence zero recovery-conflict cancellation. ---
-	paused() { PGOPTIONS='-c gp_role=utility' psql -p "$1" -d postgres -Atc 'select pg_is_wal_replay_paused();' 2>/dev/null; }
-	advance() {  # $1=from $2=to : rearm the pause GUC (SIGHUP) + resume replay on both nodes
-		local dp dd pp
-		for dp in "$COORD:7000" "$SEG0:7002"; do
-			dd=${dp%:*}; pp=${dp#*:}
+	advance() {  # $1=from $2=to : rearm the pause GUC (SIGHUP) + resume replay on ALL nodes
+		local nd dd pp
+		for nd in "${NODES[@]}"; do
+			dd=${nd%:*}; pp=${nd##*:}
 			sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
 			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
 			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
 		done
 	}
+	all_paused() {  # true iff EVERY node (coordinator + all segments) has replay paused
+		local nd pp
+		for nd in "${NODES[@]}"; do
+			pp=${nd##*:}
+			[ "$(PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_is_wal_replay_paused();' 2>/dev/null)" = t ] || return 1
+		done
+		return 0
+	}
 	p3=0; f3=0
 	ok3() { log "dr-test: PASS  $1"; p3=$((p3+1)); }
 	no3() { log "dr-test: FAIL  $1"; f3=$((f3+1)); }
 	echo "================ M3 stop-and-go: reads gated by restore point (dr_rp1 -> dr_rp2) ================"
-	for _ in $(seq 1 90); do [ "$(paused 7000)" = t ] && [ "$(paused 7002)" = t ] && break; sleep 2; done
-	if [ "$(paused 7000)" = t ] && [ "$(paused 7002)" = t ]; then
-		ok3 "M3: both DR nodes PAUSED at restore point dr_rp1 (replay stopped)"
+	for _ in $(seq 1 90); do all_paused && break; sleep 2; done
+	if all_paused; then
+		ok3 "M3: all ${#NODES[@]} DR nodes PAUSED at restore point dr_rp1 (replay stopped)"
 		r=$(dsp 'select count(*) from dr_m3;')
 		[ "$r" = 1 ] && ok3 "M3: as-of dr_rp1, dr_m3 count = 1 (the 2nd insert is beyond rp1)" \
 					 || no3 "M3: as-of dr_rp1 dr_m3 = '$r' (expected 1)"
@@ -255,7 +283,7 @@ if [ -n "$sok" ]; then
 		[ "$r" = 2 ] && ok3 "M3: after advancing to dr_rp2, dr_m3 count = 2 (new data now visible as-of rp2)" \
 					 || no3 "M3: as-of dr_rp2 dr_m3 = '$r' (expected 2)"
 	else
-		no3 "M3: DR nodes did not pause at dr_rp1 (coord=$(paused 7000) seg=$(paused 7002))"
+		no3 "M3: not all ${#NODES[@]} DR nodes paused at dr_rp1"
 	fi
 	echo "==============================================================================================="
 	if [ "$f3" -eq 0 ]; then
