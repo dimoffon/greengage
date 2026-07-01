@@ -2133,6 +2133,76 @@ CreateDistributedSnapshot(DistributedSnapshot *ds)
 	return true;
 }
 
+/*
+ * CreateDRStandbyDistributedSnapshot
+ *
+ * Build the distributed snapshot for a Greengage disaster-recovery standby
+ * reader (DTX_CONTEXT_QD_STANDBY_READER).  A DR replica is permanently in
+ * archive recovery, so the live-QD CreateDistributedSnapshot cannot be used: it
+ * errors on shmNumCommittedGxacts!=0 (the expected case at a restore point),
+ * reads latestCompletedGxid (never advanced by redo), and walks allTmGxact
+ * (empty -- no live distributed writers).  This reconstructs an as-of-N snapshot
+ * from replayed state instead:
+ *
+ *  - xmax = nextGxid, which redo advances (XLOG_NEXTGXID) to track production's
+ *    gxid allocation.  It is an UPPER bound, which is safe for a paused replica:
+ *    no committed-and-replayed tuple exists above the true replayed horizon, and
+ *    while paused no further WAL is applied.
+ *
+ *  - the in-progress (INVISIBLE) set is shmCommittedGxidArray: the
+ *    distributed-committed-but-not-forgotten gxids.  This INVERTS the live-primary
+ *    meaning (there they are committed/visible).  Because the QD
+ *    XLOG_XACT_DISTRIBUTED_COMMIT is written OUTSIDE the gp_create_restore_point
+ *    TwophaseCommitLock barrier, at the cut such a txn is committed on the
+ *    coordinator but only PREPARED (invisible) on the segments.  Treating it as
+ *    invisible on the coordinator too makes the cross-node read consistent
+ *    (no torn read).  Fully-forgotten txns are absent from the array => visible.
+ *
+ * NB: correctness for the straddle case (shmNumCommittedGxacts>0) still needs a
+ * fault-injector build to manufacture it and a multi-segment cluster to sign off
+ * cross-segment coherence; the empty-array common case is exercised by src/test/dr.
+ */
+static bool
+CreateDRStandbyDistributedSnapshot(DistributedSnapshot *ds)
+{
+	int			i;
+	int			count = 0;
+	DistributedTransactionId xmin;
+	DistributedTransactionId xmax;
+	DistributedSnapshotId distribSnapshotId;
+
+	Assert(LWLockHeldByMe(ProcArrayLock));
+	Assert(ds->inProgressXidArray != NULL);
+
+	xmax = ShmemVariableCache->nextGxid;
+	xmin = xmax;
+
+	for (i = 0; i < *shmNumCommittedGxacts; i++)
+	{
+		DistributedTransactionId gxid = shmCommittedGxidArray[i];
+
+		if (gxid == InvalidDistributedTransactionId || gxid >= xmax)
+			continue;
+		if (gxid < xmin)
+			xmin = gxid;
+		ds->inProgressXidArray[count++] = gxid;
+	}
+
+	distribSnapshotId = pg_atomic_add_fetch_u32((pg_atomic_uint32 *)shmNextSnapshotId, 1);
+
+	ds->xminAllDistributedSnapshots = xmin;
+	ds->distribSnapshotId = distribSnapshotId;
+	ds->xmin = xmin;
+	ds->xmax = xmax;
+	ds->count = count;
+
+	elog((Debug_print_full_dtm ? LOG : DEBUG5),
+		 "CreateDRStandbyDistributedSnapshot: xmin="UINT64_FORMAT" xmax="UINT64_FORMAT" in-doubt(invisible)=%d",
+		 xmin, xmax, count);
+
+	return true;
+}
+
 /*----------
  * GetMaxSnapshotXidCount -- get max size for snapshot XID array
  *
@@ -2493,15 +2563,18 @@ GetSnapshotData(Snapshot snapshot, DtxContext distributedTransactionContext)
 
 	/*
 	 * GP: QD takes a distributed snapshot iff QD not in retry phase and the
-	 * query needs distributed snapshot.  The DR standby reader does too: for now
-	 * it builds one from the current replayed state (a placeholder D_N); M3 will
-	 * replace this with the consistent published horizon snapshot.
+	 * query needs one.  A DR standby reader (permanently in recovery) builds an
+	 * as-of-N snapshot from replayed state instead (M3), since the live-QD
+	 * builder cannot run during continuous recovery.
 	 */
 	if ((distributedTransactionContext == DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE ||
 		 distributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER) &&
 			!Debug_disable_distributed_snapshot && needDistributedSnapshot)
 	{
-		CreateDistributedSnapshot(ds);
+		if (distributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
+			CreateDRStandbyDistributedSnapshot(ds);
+		else
+			CreateDistributedSnapshot(ds);
 		snapshot->haveDistribSnapshot = true;
 
 		ereport(Debug_print_full_dtm ? LOG : DEBUG5,
