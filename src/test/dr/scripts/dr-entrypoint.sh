@@ -64,6 +64,7 @@ cat >> "$COORD/postgresql.conf" <<EOF
 gp_dr_replica = on
 restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
 recovery_target_timeline = 'current'
+gp_pause_on_restore_point_replay = 'dr_rp1'   # M3 stop-and-go: pause replay at restore point dr_rp1
 EOF
 touch "$COORD/dr_replica.signal"              # arms IsDRReplicaMode() + redo filter + hot_standby auto-enable
 touch "$COORD/standby.signal"                 # continuous archive recovery (stays in recovery)
@@ -166,6 +167,7 @@ cat >> "$SEG0/postgresql.conf" <<EOF
 gp_dr_replica = on
 restore_command = 'cp $WAL_ARCHIVE/seg%c/%f %p'
 recovery_target_timeline = 'current'
+gp_pause_on_restore_point_replay = 'dr_rp1'   # M3 stop-and-go: pause replay at restore point dr_rp1
 EOF
 touch "$SEG0/dr_replica.signal"               # filter + read-only enforcement + hot_standby auto-enable
 touch "$SEG0/standby.signal"                  # continuous archive recovery (%c resolves to 0 on the segment)
@@ -217,6 +219,49 @@ if [ -n "$sok" ]; then
 		log "================ M2' DISTRIBUTED-READ TEST: PASS ($p2/$((p2+f2))) ================"
 	else
 		log "================ M2' DISTRIBUTED-READ TEST: FAIL ($f2 of $((p2+f2)) failed) ================"
+	fi
+
+	# --- M3 (stop-and-go): the DR is armed to PAUSE replay at restore point
+	#     dr_rp1.  Show reads are STABLE as-of dr_rp1 (dr_m3 has 1 row), then after
+	#     advancing to dr_rp2 they reflect as-of dr_rp2 (dr_m3 has 2 rows).  While
+	#     paused there is zero replay, hence zero recovery-conflict cancellation. ---
+	paused() { PGOPTIONS='-c gp_role=utility' psql -p "$1" -d postgres -Atc 'select pg_is_wal_replay_paused();' 2>/dev/null; }
+	advance() {  # $1=from $2=to : rearm the pause GUC (SIGHUP) + resume replay on both nodes
+		local dp dd pp
+		for dp in "$COORD:7000" "$SEG0:7002"; do
+			dd=${dp%:*}; pp=${dp#*:}
+			sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
+			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
+			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
+		done
+	}
+	p3=0; f3=0
+	ok3() { log "dr-test: PASS  $1"; p3=$((p3+1)); }
+	no3() { log "dr-test: FAIL  $1"; f3=$((f3+1)); }
+	echo "================ M3 stop-and-go: reads gated by restore point (dr_rp1 -> dr_rp2) ================"
+	for _ in $(seq 1 90); do [ "$(paused 7000)" = t ] && [ "$(paused 7002)" = t ] && break; sleep 2; done
+	if [ "$(paused 7000)" = t ] && [ "$(paused 7002)" = t ]; then
+		ok3 "M3: both DR nodes PAUSED at restore point dr_rp1 (replay stopped)"
+		r=$(dsp 'select count(*) from dr_m3;')
+		[ "$r" = 1 ] && ok3 "M3: as-of dr_rp1, dr_m3 count = 1 (the 2nd insert is beyond rp1)" \
+					 || no3 "M3: as-of dr_rp1 dr_m3 = '$r' (expected 1)"
+		r=$(dsp 'select count(*) from dr_m3;')
+		[ "$r" = 1 ] && ok3 "M3: repeated read STABLE at dr_rp1 (=1; paused => no replay, no cancellation)" \
+					 || no3 "M3: repeated read changed = '$r'"
+		log "dr-test: M3 advancing dr_rp1 -> dr_rp2 (rearm GUC + SIGHUP + resume on both nodes) ..."
+		advance dr_rp1 dr_rp2
+		for _ in $(seq 1 90); do [ "$(dsp 'select count(*) from dr_m3;')" = 2 ] && break; sleep 2; done
+		r=$(dsp 'select count(*) from dr_m3;')
+		[ "$r" = 2 ] && ok3 "M3: after advancing to dr_rp2, dr_m3 count = 2 (new data now visible as-of rp2)" \
+					 || no3 "M3: as-of dr_rp2 dr_m3 = '$r' (expected 2)"
+	else
+		no3 "M3: DR nodes did not pause at dr_rp1 (coord=$(paused 7000) seg=$(paused 7002))"
+	fi
+	echo "==============================================================================================="
+	if [ "$f3" -eq 0 ]; then
+		log "================ M3 STOP-AND-GO TEST: PASS ($p3/$((p3+f3))) ================"
+	else
+		log "================ M3 STOP-AND-GO TEST: FAIL ($f3 of $((p3+f3)) failed) ================"
 	fi
 fi
 

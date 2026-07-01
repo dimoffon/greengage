@@ -112,5 +112,20 @@ done
 touch "$ARCHIVE/restorepoint_ready"
 log "primary: restore point 'dr_filter_test' created and archived"
 
+# --- M3 (stop-and-go): two DISTRIBUTED restore points with data between them, so
+#     the DR can pause at dr_rp1 (as-of rp1: dr_m3 has 1 row) and later advance to
+#     dr_rp2 (as-of rp2: dr_m3 has 2 rows).  gp_create_restore_point dispatches to
+#     every segment under TwophaseCommitLock, so each DR node gets its own
+#     restore-point record to pause at. ---
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table dr_m3 (id int) distributed by (id); insert into dr_m3 values (1);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp1');" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -q -c "insert into dr_m3 values (2);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp2');" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -q -c "checkpoint;" >/dev/null 2>&1 || true
+for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true; sleep 2; done
+touch "$ARCHIVE/m3_ready"
+log "primary: M3 restore points dr_rp1 (dr_m3=1) and dr_rp2 (dr_m3=2) created + archived"
+
 log "primary: done; idling so the cluster keeps archiving WAL"
 exec sleep infinity
