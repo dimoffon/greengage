@@ -42,6 +42,18 @@ Subcommands
         which IsDRReplicaMode() is false, writes succeed, and FTS/DTX run.
         IRREVERSIBLE (recovery only moves forward).
 
+  create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir>
+                 [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]
+        Build a DR replica (M4): restore each instance's base backup (taken on
+        production with pg_basebackup --target-gp-dbid) into its DR data dir, gate
+        on the WAL archive being complete enough to reach consistency (fail-closed),
+        frozen-seed the DR-local topology into the coordinator's
+        gp_segment_configuration, re-fetch the backup-tail WAL from the archive over
+        pg_wal (so the seed cannot fork the timeline), arm DR mode
+        (gp_dr_replica + restore_command + dr_replica.signal + standby.signal) on
+        every node, and start each in archive recovery.  Runs before any node is up,
+        so the node list comes from the topology tsv, not gp_segment_configuration.
+
 Connection
 ----------
 Run this on the DR coordinator host.  The coordinator is reached locally (via the
@@ -53,6 +65,7 @@ even when the cluster has no consistent serve point.
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -379,6 +392,169 @@ def cmd_promote(at=None, no_restart=False, assume_yes=False, timeout=300):
     return 0
 
 
+def _parse_topology(path):
+    """Parse a dr_topology.tsv (>=10 tab cols: dbid content role prefrole mode
+    status port hostname address datadir).  Return [dict(...)] ordered by content."""
+    rows = []
+    with open(path) as f:
+        for ln, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            cols = line.split("\t")
+            if len(cols) < 10:
+                sys.exit("gg_recovery create-replica: %s:%d has %d columns, need >=10" % (path, ln, len(cols)))
+            rows.append({"dbid": int(cols[0]), "content": int(cols[1]), "role": cols[2],
+                         "port": int(cols[6]), "datadir": cols[9]})
+    if not any(r["content"] == -1 for r in rows):
+        sys.exit("gg_recovery create-replica: topology has no coordinator (content=-1) row")
+    return sorted(rows, key=lambda r: r["content"])
+
+
+def _backup_label_start_file(datadir):
+    """Return the START WAL segment file name from a datadir's backup_label, or None."""
+    try:
+        with open(os.path.join(datadir, "backup_label")) as f:
+            for line in f:
+                if line.startswith("START WAL LOCATION"):
+                    # START WAL LOCATION: 0/2000028 (file 000000010000000000000002)
+                    if "(file " in line:
+                        return line.split("(file ", 1)[1].split(")", 1)[0].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _archive_dir(wal_archive, content):
+    return os.path.join(wal_archive, "seg%d" % content)
+
+
+def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=None,
+                       pause_at=None, scratch_seed=False, no_start=False, force=False):
+    rows = _parse_topology(topology)
+    if restore_command is None:
+        restore_command = "cp %s/seg%%c/%%f %%p" % wal_archive
+    # gpseed_dr_topology ships beside gg_recovery in $GPHOME/bin; also try PATH and $GPHOME.
+    here = os.path.dirname(os.path.abspath(__file__))
+    seed_prog = next((c for c in (
+        os.path.join(here, "gpseed_dr_topology"),
+        shutil.which("gpseed_dr_topology"),
+        os.path.join(os.environ.get("GPHOME", ""), "bin", "gpseed_dr_topology"),
+    ) if c and os.path.exists(c)), None)
+    if not seed_prog:
+        sys.exit("gg_recovery create-replica: cannot find gpseed_dr_topology "
+                 "(looked next to gg_recovery, on PATH, and in $GPHOME/bin)")
+    print("gg_recovery create-replica: building a DR replica for %d instance(s) from %s"
+          % (len(rows), basebackup_dir))
+
+    # --- 1. safety / idempotence ---
+    for r in rows:
+        dd = r["datadir"]
+        if os.path.exists(os.path.join(dd, "postmaster.pid")):
+            sys.exit("gg_recovery create-replica: %s has a postmaster.pid (running?); refusing." % dd)
+        if os.path.exists(dd) and os.listdir(dd) and not force:
+            sys.exit("gg_recovery create-replica: %s is non-empty; use --force to overwrite." % dd)
+
+    # --- 2. restore each instance's base backup ---
+    for r in rows:
+        dd, c = r["datadir"], r["content"]
+        src = os.path.join(basebackup_dir, "seg%d" % c)
+        if not os.path.isdir(src):
+            sys.exit("gg_recovery create-replica: base backup %s not found" % src)
+        _run(["rm", "-rf", dd]); os.makedirs(os.path.dirname(dd), exist_ok=True)
+        rc, out, err = _run(["cp", "-a", src, dd])
+        if rc != 0:
+            sys.exit("gg_recovery create-replica: restore of content %d failed: %s" % (c, err))
+        os.chmod(dd, 0o700)
+        if not os.path.exists(os.path.join(dd, "backup_label")):
+            sys.exit("gg_recovery create-replica: content %d base backup has no backup_label "
+                     "(was it taken with pg_basebackup --target-gp-dbid?)" % c)
+        print("  restored content %d -> %s" % (c, dd))
+
+    # --- 3. archive-completeness GATE (fail closed): the WAL to reach consistency
+    #     ([REDO..backup end]) must be in the archive, else recovery could replay
+    #     the seed's forked WAL and permanently fork the timeline. ---
+    for r in rows:
+        c, dd = r["content"], r["datadir"]
+        adir = _archive_dir(wal_archive, c)
+        start_file = _backup_label_start_file(dd)
+        if not os.path.isdir(adir) or not os.listdir(adir):
+            sys.exit("gg_recovery create-replica: WAL archive %s is missing/empty; refusing (fail-closed)." % adir)
+        if start_file and not os.path.exists(os.path.join(adir, start_file)):
+            sys.exit("gg_recovery create-replica: archive %s lacks the backup START WAL segment %s; "
+                     "refusing (fail-closed)." % (adir, start_file))
+        print("  archive gate OK for content %d (start=%s)" % (c, start_file or "?"))
+
+    # --- 4. frozen-topology seed on the COORDINATOR (content=-1) ---
+    coord = next(r for r in rows if r["content"] == -1)
+    cdd = coord["datadir"]
+    if scratch_seed:
+        sys.exit("gg_recovery create-replica: --scratch-seed not yet implemented in this PoC")
+    print("  seeding DR-local topology into the coordinator (%s)" % cdd)
+    label = os.path.join(cdd, "backup_label")
+    ctl = os.path.join(cdd, "global", "pg_control")
+    have_label = os.path.exists(label)
+    # (a) save recovery-start state
+    if have_label:
+        _run(["cp", "-p", label, label + ".drsave"])
+    _run(["cp", "-p", ctl, ctl + ".drsave"])
+    rc, out, err = _run([seed_prog, cdd, topology])
+    if rc != 0:
+        sys.exit("gg_recovery create-replica: gpseed_dr_topology failed: %s" % (err or out))
+    # (a) restore recovery-start state so recovery resumes from the backup checkpoint
+    if have_label:
+        _run(["mv", label + ".drsave", label])
+    _run(["mv", ctl + ".drsave", ctl])
+    # (c) re-fetch: overwrite any pg_wal segment the seed forked with the archive's
+    #     copy, so replay never depends on archive-over-pg_wal precedence.
+    pg_wal = os.path.join(cdd, "pg_wal")
+    adir = _archive_dir(wal_archive, -1)
+    refetched = 0
+    if os.path.isdir(adir):
+        for fn in os.listdir(adir):
+            dst = os.path.join(pg_wal, fn)
+            if os.path.exists(dst) and len(fn) == 24 and fn.isalnum():   # a WAL segment present in both
+                _run(["cp", "-f", os.path.join(adir, fn), dst]); refetched += 1
+    print("  seed done; re-fetched %d WAL segment(s) from the archive over pg_wal" % refetched)
+
+    # --- 5. arm DR mode on every node ---
+    for r in rows:
+        dd = r["datadir"]
+        open(os.path.join(dd, "postgresql.auto.conf"), "w").close()   # drop production sync-rep settings
+        with open(os.path.join(dd, "postgresql.conf"), "a") as f:
+            f.write("\n# --- GREENGAGE DR REPLICA (gg_recovery create-replica) ---\n")
+            f.write("gp_dr_replica = on\n")
+            f.write("restore_command = '%s'\n" % restore_command)
+            f.write("recovery_target_timeline = 'current'\n")
+            if pause_at:
+                f.write("gp_pause_on_restore_point_replay = '%s'\n" % pause_at)
+        open(os.path.join(dd, "dr_replica.signal"), "w").close()
+        open(os.path.join(dd, "standby.signal"), "w").close()
+    print("  armed DR mode (gp_dr_replica + restore_command + dr_replica.signal + standby.signal)")
+
+    if no_start:
+        print("gg_recovery create-replica: DONE (armed, not started; --no-start).")
+        return 0
+
+    # --- 6. start each node in recovery + poll for liveness ---
+    for r in rows:
+        dd, c, port = r["datadir"], r["content"], r["port"]
+        role = "dispatch" if c == -1 else "execute"
+        _run(["pg_ctl", "-D", dd, "-l", os.path.join(dd, "startup.log"),
+              "-W", "-o", "-c gp_role=%s" % role, "start"])
+        print("  started content %d (port %d, gp_role=%s) in recovery" % (c, port, role))
+    ok = 0
+    for r in rows:
+        port = r["port"]
+        for _ in range(80):
+            rc, out, err = _psql(port, "select 1;")
+            if out == "1":
+                ok += 1; break
+            time.sleep(3)
+    print("gg_recovery create-replica: DONE -- %d/%d node(s) live in recovery." % (ok, len(rows)))
+    return 0 if ok == len(rows) else 1
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="gg_recovery",
@@ -395,6 +571,19 @@ def main():
                         help="phase 1 only: exit recovery but leave DR mode armed (demo/inspection)")
     p_prom.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_prom.add_argument("--timeout", type=int, default=300, help="seconds to wait per phase (default 300)")
+    p_cr = sub.add_parser("create-replica", help="build a DR replica from per-instance base backups")
+    p_cr.add_argument("--topology", required=True, metavar="TSV",
+                      help="dr_topology.tsv (dbid content role prefrole mode status port host addr datadir)")
+    p_cr.add_argument("--basebackup-dir", required=True, metavar="DIR",
+                      help="directory containing seg<content>/ base backups (pg_basebackup --target-gp-dbid)")
+    p_cr.add_argument("--wal-archive", required=True, metavar="DIR",
+                      help="per-content WAL archive root (seg<content>/ segments)")
+    p_cr.add_argument("--restore-command", metavar="CMD",
+                      help="restore_command (default: cp <wal-archive>/seg%%c/%%f %%p)")
+    p_cr.add_argument("--pause-at", metavar="RP", help="arm gp_pause_on_restore_point_replay at this restore point")
+    p_cr.add_argument("--scratch-seed", action="store_true", help="(reserved) seed on a scratch datadir copy")
+    p_cr.add_argument("--no-start", action="store_true", help="arm the replica but do not start it")
+    p_cr.add_argument("--force", action="store_true", help="overwrite non-empty data directories")
     args = ap.parse_args()
     if args.cmd == "switch":
         return cmd_switch(args.restore_point)
@@ -407,6 +596,11 @@ def main():
     if args.cmd == "promote":
         return cmd_promote(at=args.at, no_restart=args.no_restart,
                            assume_yes=args.yes, timeout=args.timeout)
+    if args.cmd == "create-replica":
+        return cmd_create_replica(topology=args.topology, basebackup_dir=args.basebackup_dir,
+                                  wal_archive=args.wal_archive, restore_command=args.restore_command,
+                                  pause_at=args.pause_at, scratch_seed=args.scratch_seed,
+                                  no_start=args.no_start, force=args.force)
     return 2
 
 
