@@ -32,6 +32,16 @@ Subcommands
         paused? served restore point, replay LSN, replay age, and whether there is
         a consistent serve point (all nodes paused at the same restore point).
 
+  promote [--at <rp>] [--no-restart] [--yes] [--timeout <secs>]
+        Promote the DR cluster to a normal ONLINE read-write cluster, cutting every
+        node at the SAME restore point.  Refuses unless all nodes are paused at one
+        consistent restore point (== --at, if given).  Phase 1: pg_promote() +
+        resume on every node (segments first, then coordinator) so each exits
+        recovery exactly after that point.  Phase 2 (unless --no-restart): stop each
+        node, remove the DR markers, set gp_dr_replica=off, and restart -- after
+        which IsDRReplicaMode() is false, writes succeed, and FTS/DTX run.
+        IRREVERSIBLE (recovery only moves forward).
+
 Connection
 ----------
 Run this on the DR coordinator host.  The coordinator is reached locally (via the
@@ -252,6 +262,123 @@ def cmd_stats():
     return 0
 
 
+def _run(cmd, timeout=600):
+    """Run a local subprocess (pg_ctl etc.); return (rc, stdout, stderr)."""
+    try:
+        r = subprocess.run(cmd, env=dict(os.environ), capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, "", str(e)
+
+
+def get_datadirs():
+    """{content: datadir} for the coordinator + primary segments (for pg_ctl in promote)."""
+    rc, out, err = _psql(
+        COORD_PORT,
+        "select content||'%s'||datadir from gp_segment_configuration where role='p' order by content;" % FIELDSEP)
+    dd = {}
+    for line in out.splitlines():
+        c, d = line.split(FIELDSEP)
+        dd[int(c)] = d
+    return dd
+
+
+def _wait_out_of_recovery(node_tuples, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(node_state(*n).get("in_recovery") is False for n in node_tuples):
+            return True
+        time.sleep(2)
+    return False
+
+
+def cmd_promote(at=None, no_restart=False, assume_yes=False, timeout=300):
+    nodes = get_nodes()
+    # --- precondition: every node paused at ONE consistent restore point (computed
+    #     client-side over utility-mode reads, since the dispatched summary view
+    #     breaks as nodes leave recovery). ---
+    states = [node_state(*n) for n in nodes]
+    if not all(s["ok"] for s in states):
+        sys.exit("gg_recovery promote: some nodes are unreachable; refusing.")
+    if not all(s["in_recovery"] for s in states):
+        sys.exit("gg_recovery promote: not every node is in recovery; refusing.")
+    if not all(s["paused"] for s in states):
+        sys.exit("gg_recovery promote: not every node is paused -- run 'gg_recovery switch <rp>' "
+                 "to reach a consistent restore point first.")
+    served = set(s["restore_point"] for s in states)
+    if len(served) != 1 or "" in served:
+        sys.exit("gg_recovery promote: nodes are NOT at a single consistent restore point (%s); "
+                 "run 'gg_recovery switch <rp>' first." % sorted(served))
+    consistent_n = next(iter(served))
+    if at and consistent_n != at:
+        sys.exit("gg_recovery promote: cluster is at '%s', not --at '%s'; refusing." % (consistent_n, at))
+
+    print("gg_recovery promote: promoting the whole cluster at consistent restore point '%s'"
+          % consistent_n)
+    if not assume_yes:
+        sys.stderr.write("  This is IRREVERSIBLE (recovery only moves forward). Type 'yes' to continue: ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() != "yes":
+            sys.exit("gg_recovery promote: aborted.")
+
+    segs = [n for n in nodes if n[0] != -1]
+    coord = next(n for n in nodes if n[0] == -1)
+
+    # --- phase 1: exit recovery at N, SEGMENTS FIRST then COORDINATOR ---
+    print("gg_recovery promote: phase 1 -- exiting recovery (segments first)")
+    for content, address, port in segs:
+        host, p = _conn(content, address, port)
+        _psql(p, "select pg_promote(false);", host=host)      # arm the promote trigger
+        _psql(p, "select pg_wal_replay_resume();", host=host)  # unpause -> recovery ends AFTER N
+        print("  %-13s (port %d): promote armed + resumed" % (_label(content), port))
+    if not _wait_out_of_recovery(segs, timeout):
+        sys.exit("gg_recovery promote: segments did not exit recovery within %ds." % timeout)
+    print("  all segments out of recovery")
+    c, a, p_ = coord
+    host, cp = _conn(c, a, p_)
+    _psql(cp, "select pg_promote(false);", host=host)
+    _psql(cp, "select pg_wal_replay_resume();", host=host)
+    if not _wait_out_of_recovery([coord], timeout):
+        sys.exit("gg_recovery promote: coordinator did not exit recovery within %ds." % timeout)
+    print("  coordinator out of recovery")
+
+    if no_restart:
+        print("gg_recovery promote: --no-restart -- nodes are OUT of recovery but STILL DR-read-only")
+        print("  (gp_dr_replica GUC + dr_replica.signal persist until a restart). Demo/inspection only.")
+        return 0
+
+    # --- phase 2: disengage DR mode (restart) -- gp_dr_replica is PGC_POSTMASTER,
+    #     so it (and the process-cached dr_replica.signal) only lift on restart. ---
+    print("gg_recovery promote: phase 2 -- disengaging DR mode (stop, clear markers, restart)")
+    datadirs = get_datadirs()
+    for content, address, port in nodes:      # auto.conf overrides postgresql.conf's gp_dr_replica=on
+        host, p = _conn(content, address, port)
+        _psql(p, "alter system set gp_dr_replica = off;", host=host)
+    for content, address, port in nodes:
+        dd = datadirs.get(content)
+        if dd:
+            _run(["pg_ctl", "-D", dd, "-m", "fast", "-w", "stop"])
+            for marker in ("dr_replica.signal", "standby.signal"):
+                try:
+                    os.remove(os.path.join(dd, marker))
+                except OSError:
+                    pass
+    # start SEGMENTS first, then the coordinator (so the coordinator's freshly-started
+    # FTS probes live segments and does not mark them down).
+    for content, address, port in segs + [coord]:
+        dd = datadirs.get(content)
+        if not dd:
+            print("  %-13s: no datadir known -- restart it manually" % _label(content)); continue
+        role = "dispatch" if content == -1 else "execute"
+        rc, out, err = _run(["pg_ctl", "-D", dd, "-w", "-o", "-c gp_role=%s" % role, "start"])
+        print("  %-13s (port %d): markers cleared, gp_dr_replica=off, restarted as normal %s%s"
+              % (_label(content), port, "coordinator" if content == -1 else "segment",
+                 "" if rc == 0 else "  [warn: %s]" % (err.strip().splitlines() or [""])[-1]))
+    print("gg_recovery promote: DONE -- cluster promoted to online read-write "
+          "(as-of restore point '%s')." % consistent_n)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="gg_recovery",
@@ -262,6 +389,12 @@ def main():
     sub.add_parser("pause", help="immediately pause replay on every node (not a consistent cut)")
     sub.add_parser("follow", help="continuous recovery, no cross-node consistent view")
     sub.add_parser("stats", help="print recovery statistics")
+    p_prom = sub.add_parser("promote", help="promote the DR cluster to a normal online read-write cluster")
+    p_prom.add_argument("--at", metavar="RP", help="require the consistent cut to equal this restore point")
+    p_prom.add_argument("--no-restart", action="store_true",
+                        help="phase 1 only: exit recovery but leave DR mode armed (demo/inspection)")
+    p_prom.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    p_prom.add_argument("--timeout", type=int, default=300, help="seconds to wait per phase (default 300)")
     args = ap.parse_args()
     if args.cmd == "switch":
         return cmd_switch(args.restore_point)
@@ -271,6 +404,9 @@ def main():
         return cmd_follow()
     if args.cmd == "stats":
         return cmd_stats()
+    if args.cmd == "promote":
+        return cmd_promote(at=args.at, no_restart=args.no_restart,
+                           assume_yes=args.yes, timeout=args.timeout)
     return 2
 
 
