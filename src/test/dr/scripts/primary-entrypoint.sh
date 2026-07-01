@@ -153,5 +153,16 @@ for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal(
 touch "$ARCHIVE/m3_ready"
 log "primary: M3 restore points (dr_rp1/dr_rp2) + straddle (dr_rp_straddle/_done, coord dbid=${CDBID:-?}) created + archived"
 
+# --- gg_recovery target: an extra distributed restore point AFTER
+#     dr_rp_straddle_done (with its own data), so the gg_recovery utility test can
+#     advance the whole cluster to it (dr_rp_straddle_done -> dr_rp_switch). ---
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table gg_switch (id int) distributed by (id); insert into gg_switch select generate_series(1,5);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp_switch');" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -q -c "checkpoint;" >/dev/null 2>&1 || true
+for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true; sleep 2; done
+touch "$ARCHIVE/gg_ready"
+log "primary: gg_recovery target dr_rp_switch (gg_switch=5) created + archived"
+
 log "primary: done; idling so the cluster keeps archiving WAL"
 exec sleep infinity

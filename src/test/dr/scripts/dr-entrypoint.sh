@@ -356,6 +356,43 @@ if [ -n "$sok" ]; then
 	else
 		log "================ M5 OBSERVABILITY TEST: FAIL ($f5 of $((p5+f5)) failed) ================"
 	fi
+
+	# --- gg_recovery: the DR recovery-control utility (switch / follow / stats).
+	#     The cluster is paused at dr_rp_straddle_done; drive it forward to
+	#     dr_rp_switch, then into continuous (follow) mode. ---
+	GG="python3 $SRC/gpMgmt/bin/gg_recovery"
+	export PGPORT=7000 PGDATABASE=postgres
+	echo "================ gg_recovery: DR recovery-control utility ================"
+	p6=0; f6=0
+	ok6() { log "dr-test: PASS  $1"; p6=$((p6+1)); }
+	no6() { log "dr-test: FAIL  $1"; f6=$((f6+1)); }
+	for _ in $(seq 1 60); do [ -f "$ARCHIVE/gg_ready" ] && break; sleep 2; done
+	if $GG stats 2>&1 | grep -q "consistent serve point: dr_rp_straddle_done"; then
+		ok6 "gg_recovery stats: consistent serve point = dr_rp_straddle_done"
+	else
+		no6 "gg_recovery stats: did not report dr_rp_straddle_done"; $GG stats 2>&1 | tail -6 >&2
+	fi
+	if $GG switch dr_rp_switch 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_switch'"; then
+		ok6 "gg_recovery switch dr_rp_switch: all 3 nodes advanced to the new restore point"
+	else
+		no6 "gg_recovery switch dr_rp_switch: did not reach on all nodes"
+	fi
+	r=$(dsp "select count(*) from gg_switch;")
+	[ "$r" = 5 ] && ok6 "gg_recovery switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \
+				 || no6 "gg_recovery switch: gg_switch = '$r' (expected 5)"
+	$GG follow >/dev/null 2>&1
+	sleep 4
+	if $GG stats 2>&1 | grep -q "consistent serve point: none"; then
+		ok6 "gg_recovery follow: continuous mode -- stats reports no consistent serve point"
+	else
+		no6 "gg_recovery follow: stats still reports a consistent serve point"
+	fi
+	echo "========================================================================="
+	if [ "$f6" -eq 0 ]; then
+		log "================ gg_recovery TEST: PASS ($p6/$((p6+f6))) ================"
+	else
+		log "================ gg_recovery TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
+	fi
 fi
 
 exec sleep infinity
