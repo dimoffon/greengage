@@ -441,6 +441,17 @@ doDispatchSubtransactionInternalCmd(DtxProtocolCommand cmdType)
 	char		gid[TMGIDSIZE];
 	bool		succeeded = false;
 
+	/*
+	 * Greengage DR: a standby reader has no distributed transaction, so it must
+	 * not dispatch internal subtransaction commands (BEGIN_INTERNAL / RELEASE /
+	 * ROLLBACK) to segments -- doing so would activate a DTX (currentDtxActivate,
+	 * the M2 backstop) and pack needDtx=true, turning segment QEs into writers,
+	 * both illegal in recovery.  InitPlan/subplan savepoints stay QD-local; the
+	 * read-only subplan query is dispatched separately like any other read.
+	 */
+	if (DistributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
+		return true;
+
 	if (currentGxactWriterGangLost())
 	{
 		ereport(WARNING,
