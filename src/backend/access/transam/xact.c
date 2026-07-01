@@ -2428,12 +2428,19 @@ StartTransaction(void)
 	/*
 	 * Transactions may be started while recovery is in progress, if hot standby
 	 * is enabled.  A distributed transaction in recovery is otherwise not
-	 * supported in Greengage -- EXCEPT the disaster-recovery standby reader
-	 * (DTX_CONTEXT_QD_STANDBY_READER), which is a read-only distributed query
-	 * dispatched from a coordinator that is permanently in recovery.
+	 * supported in Greengage -- EXCEPT the disaster-recovery read path: the
+	 * standby-reader QD (DTX_CONTEXT_QD_STANDBY_READER) and, on a DR segment
+	 * (IS_STANDBY_QE()), the read-only QE contexts it dispatches to
+	 * (AUTO_COMMIT_IMPLICIT publisher + QE_READER + entry-DB singleton).  The
+	 * writer contexts still assert, so a dispatched WRITE to a segment in
+	 * recovery crashes as it should.
 	 */
 	AssertImply(DistributedTransactionContext != DTX_CONTEXT_LOCAL_ONLY &&
-				DistributedTransactionContext != DTX_CONTEXT_QD_STANDBY_READER,
+				DistributedTransactionContext != DTX_CONTEXT_QD_STANDBY_READER &&
+				!(IS_STANDBY_QE() &&
+				  (DistributedTransactionContext == DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT ||
+				   DistributedTransactionContext == DTX_CONTEXT_QE_READER ||
+				   DistributedTransactionContext == DTX_CONTEXT_QE_ENTRY_DB_SINGLETON)),
 				!s->startedInRecovery);
 	/*
 	 * MPP Modification
