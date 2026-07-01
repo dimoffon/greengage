@@ -2495,8 +2495,21 @@ StartTransaction(void)
 			if (gp_enable_slow_writer_testmode)
 				pg_usleep(500000);
 
+			/*
+			 * Greengage DR: a standby QE (permanently in recovery) never has a
+			 * distributed xid -- the DR coordinator dispatches read-only
+			 * distributed queries as DTX_CONTEXT_QD_STANDBY_READER with no gxid.
+			 * Most such queries land on reader gangs, but a read-only query that
+			 * UNIONs coordinator-entry rows with segment rows (e.g.
+			 * gp_stat_dr_replica) is planned onto a WRITER gang, reaching this
+			 * writer-context path with an invalid gxid.  That is expected and safe
+			 * here: writes are already refused at the coordinator (M2 read-only
+			 * enforcement), so a writer QE on a standby only ever runs read-only
+			 * work.  Do not error in that case.
+			 */
 			if (DistributedTransactionContext != DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT &&
-				QEDtxContextInfo.distributedXid == InvalidDistributedTransactionId)
+				QEDtxContextInfo.distributedXid == InvalidDistributedTransactionId &&
+				!IS_STANDBY_QE())
 			{
 				elog(ERROR,
 					 "distributed transaction id is invalid in context %s",

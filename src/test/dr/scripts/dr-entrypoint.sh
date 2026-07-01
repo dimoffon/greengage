@@ -331,12 +331,25 @@ if [ -n "$sok" ]; then
 	[ "$r" = 3 ] && ok5 "M5: all 3 nodes report restore_point='dr_rp_straddle_done' (per-node served N via new C accessor)" \
 				 || no5 "M5: nodes at dr_rp_straddle_done = '$r' (expected 3)"
 	r=$(dsp "select node_count||'|'||all_in_recovery||'|'||all_paused||'|'||coalesce(consistent_restore_point,'<null>') from gp_stat_dr_replica_summary;")
-	[ "$r" = "3|t|t|dr_rp_straddle_done" ] \
+	[ "$r" = "3|true|true|dr_rp_straddle_done" ] \
 		&& ok5 "M5: summary = 3 nodes, all_in_recovery, all_paused, consistent_restore_point=dr_rp_straddle_done" \
-		|| no5 "M5: summary = '$r' (expected 3|t|t|dr_rp_straddle_done)"
+		|| no5 "M5: summary = '$r' (expected 3|true|true|dr_rp_straddle_done)"
 	r=$(dsp "select rpo_seconds >= 0 from gp_stat_dr_replica_summary;")
 	[ "$r" = t ] && ok5 "M5: summary rpo_seconds is a finite, non-negative RPO" \
 				 || no5 "M5: rpo_seconds check = '$r'"
+	# Faithful served-N: re-point the pause GUC to a name never reached, WITHOUT
+	# resuming.  The view must still report the ACTUALLY-reached restore point
+	# (pg_last_paused_restore_point / XLogCtl), proving it is the C accessor and
+	# not the configured GUC -- the correctness gap the M5 plan flagged.
+	for nd in "${NODES[@]}"; do
+		sed -i "s/gp_pause_on_restore_point_replay = 'dr_rp_straddle_done'/gp_pause_on_restore_point_replay = 'never_reached'/" "${nd%:*}/postgresql.conf"
+		PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_reload_conf();' >/dev/null 2>&1 || true
+	done
+	sleep 3
+	r=$(dsp "select coalesce(consistent_restore_point,'<null>') from gp_stat_dr_replica_summary;")
+	[ "$r" = "dr_rp_straddle_done" ] \
+		&& ok5 "M5: served-N is FAITHFUL -- view still reports dr_rp_straddle_done after GUC re-pointed to 'never_reached' (C accessor, not GUC)" \
+		|| no5 "M5: served-N = '$r' after GUC re-point (expected dr_rp_straddle_done; a GUC-based served-N would wrongly show 'never_reached')"
 	echo "===================================================================================================="
 	if [ "$f5" -eq 0 ]; then
 		log "================ M5 OBSERVABILITY TEST: PASS ($p5/$((p5+f5))) ================"
