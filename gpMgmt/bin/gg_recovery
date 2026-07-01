@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""gg_recovery -- control a Greengage DR read-replica's recovery.
+
+A DR read-replica is a second Greengage cluster kept current from production via
+WAL archiving and permanently in archive recovery.  Every node (coordinator +
+each primary segment) replays independently; this tool drives the whole cluster
+as one.
+
+Subcommands
+-----------
+  switch <restore_point>
+        Stop-and-go: make every node pause at restore point <restore_point>.
+        Re-points the pause target on the coordinator and every primary segment,
+        reloads config, resumes replay, and waits until ALL nodes are paused at
+        <restore_point> -- i.e. a consistent, safe-to-serve as-of-N cut.
+        <restore_point> must be a point production has already created and that is
+        AHEAD of where the cluster is now (recovery only moves forward).
+
+  follow
+        Continuous recovery with NO cross-node consistent view: clears the pause
+        target on every node and resumes, so each node free-runs to the end of the
+        archived WAL and keeps following it.  Freshest reads, but a distributed
+        query can be torn across segments.
+
+  stats
+        Print per-node recovery statistics and a cluster summary: in recovery?
+        paused? served restore point, replay LSN, replay age, and whether there is
+        a consistent serve point (all nodes paused at the same restore point).
+
+Connection
+----------
+Run this on the DR coordinator host.  The coordinator is reached locally (via the
+standard libpq environment: PGPORT, PGDATABASE, ...); the node list and each
+segment's address/port come from the DR's own gp_segment_configuration.  All
+connections are utility-mode (no dispatch), so switch/follow/stats keep working
+even when the cluster has no consistent serve point.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+COORD_PORT = int(os.environ.get("PGPORT", "7000"))
+DB = os.environ.get("PGDATABASE", "postgres")
+FIELDSEP = "\x1f"  # unit separator -- unambiguous vs restore-point names
+
+
+def _psql(port, sql, host=None, timeout=60):
+    """Run SQL in utility mode; return (rc, stdout, stderr) with output trimmed."""
+    env = dict(os.environ)
+    env["PGOPTIONS"] = "-c gp_role=utility " + env.get("PGOPTIONS", "")
+    cmd = ["psql", "-p", str(port), "-d", DB, "-v", "ON_ERROR_STOP=0", "-qtAc", sql]
+    if host:
+        cmd[1:1] = ["-h", host]
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, "", str(e)
+
+
+def get_nodes():
+    """[(content, address, port)] for the coordinator + primary segments."""
+    rc, out, err = _psql(
+        COORD_PORT,
+        "select content||'%s'||address||'%s'||port "
+        "from gp_segment_configuration where role='p' order by content;" % (FIELDSEP, FIELDSEP),
+    )
+    if rc != 0 or not out:
+        sys.exit("gg_recovery: cannot read gp_segment_configuration on the coordinator "
+                 "(port %d): %s" % (COORD_PORT, err or "no rows"))
+    nodes = []
+    for line in out.splitlines():
+        content, address, port = line.split(FIELDSEP)
+        nodes.append((int(content), address, int(port)))
+    return nodes
+
+
+def _conn(content, address, port):
+    """Return (host, port) for connecting to a node in utility mode.
+
+    PoC / single-host demo: every node is co-located on this host, so each is
+    reached by its LOCAL socket on its own port (the demo pg_hba grants
+    'local ... trust', whereas a plain TCP psql to a segment is rejected by its
+    pg_hba -- only the coordinator's privileged dispatch path connects by TCP).
+
+    A multi-host deployment would instead connect to each segment by <address>
+    with a matching pg_hba entry, or run this tool once per host; <address> is
+    kept in the node list for exactly that.
+    """
+    return (None, port)
+
+
+def _label(content):
+    return "coordinator" if content == -1 else "segment %d" % content
+
+
+def node_state(content, address, port):
+    host, port = _conn(content, address, port)
+    sql = (
+        "select coalesce(pg_is_in_recovery()::text,'') ||'%(s)s'|| "
+        "coalesce((case when pg_is_in_recovery() then pg_is_wal_replay_paused() else false end)::text,'') ||'%(s)s'|| "
+        "coalesce(pg_last_paused_restore_point(),'') ||'%(s)s'|| "
+        "coalesce(pg_last_wal_replay_lsn()::text,'') ||'%(s)s'|| "
+        "coalesce(round(extract(epoch from now()-pg_last_xact_replay_timestamp()))::text,'');"
+        % {"s": FIELDSEP}
+    )
+    rc, out, err = _psql(port, sql, host=host)
+    if rc != 0 or not out:
+        return {"content": content, "ok": False, "err": err or "no response"}
+    parts = (out.split(FIELDSEP) + [""] * 5)[:5]
+    inrec, paused, rp, lsn, age = parts
+    truthy = ("t", "true")
+    return {
+        "content": content, "ok": True,
+        "in_recovery": inrec in truthy,
+        "paused": paused in truthy,
+        "restore_point": rp,
+        "replay_lsn": lsn,
+        "replay_age": age,
+    }
+
+
+def _repoint_and_resume(nodes, target):
+    """ALTER SYSTEM the pause target + reload + resume, on every node.
+
+    Each statement is issued as its OWN psql command: ALTER SYSTEM must run
+    outside a transaction block, and psql batches ;-separated statements into one
+    implicit transaction (which would abort the ALTER SYSTEM and skip the resume).
+    """
+    quoted = target.replace("'", "''")
+    for content, address, port in nodes:
+        host, p = _conn(content, address, port)
+        rc1, _, e1 = _psql(p, "alter system set gp_pause_on_restore_point_replay = '%s';" % quoted, host=host)
+        _psql(p, "select pg_reload_conf();", host=host)
+        _rc, _o, e3 = _psql(p, "select pg_wal_replay_resume();", host=host)
+        notes = []
+        if e1:
+            notes.append(e1.splitlines()[0])
+        # "recovery is not paused" is expected/benign when a node is already following
+        if e3 and "not paused" not in e3.lower() and "not in progress" not in e3.lower():
+            notes.append(e3.splitlines()[0])
+        suffix = ("  [warn: %s]" % "; ".join(notes)) if notes else ""
+        print("  %-13s (port %d): re-pointed + resumed%s" % (_label(content), port, suffix))
+
+
+def cmd_switch(restore_point):
+    nodes = get_nodes()
+    print("gg_recovery switch: re-pointing %d node(s) to restore point '%s'"
+          % (len(nodes), restore_point))
+    _repoint_and_resume(nodes, restore_point)
+    print("gg_recovery switch: waiting for every node to reach '%s' ..." % restore_point)
+    deadline = time.time() + 300
+    states = []
+    while time.time() < deadline:
+        states = [node_state(*n) for n in nodes]
+        if all(s["ok"] and s["paused"] and s["restore_point"] == restore_point for s in states):
+            print("gg_recovery switch: DONE -- all %d node(s) paused at '%s' "
+                  "(consistent serve point)" % (len(nodes), restore_point))
+            return 0
+        time.sleep(2)
+    print("gg_recovery switch: TIMEOUT -- not all nodes reached '%s':" % restore_point)
+    for s in states:
+        if s["ok"]:
+            print("  %-13s: paused=%s at '%s'"
+                  % (_label(s["content"]), "yes" if s["paused"] else "no", s["restore_point"] or "-"))
+        else:
+            print("  %-13s: UNREACHABLE (%s)" % (_label(s["content"]), s["err"]))
+    print("  (is '%s' a restore point production created AHEAD of the current point, "
+          "and already archived?)" % restore_point)
+    return 1
+
+
+def cmd_follow():
+    nodes = get_nodes()
+    print("gg_recovery follow: switching %d node(s) to CONTINUOUS recovery "
+          "(no cross-node consistent view)" % len(nodes))
+    _repoint_and_resume(nodes, "")
+    print("gg_recovery follow: cluster is now free-running to the end of the archived WAL.")
+    print("  NOTE: reads are best-effort and may be torn across segments; there is no")
+    print("        consistent serve point until you run 'gg_recovery switch <rp>' again.")
+    return 0
+
+
+def cmd_stats():
+    nodes = get_nodes()
+    states = [node_state(*n) for n in nodes]
+
+    print("gg_recovery: DR read-replica recovery status\n")
+    hdr = "  %-8s %-11s %-11s %-6s %-22s %-16s %s"
+    print(hdr % ("content", "role", "in_recovery", "paused", "restore_point", "replay_lsn", "replay_age"))
+    print("  " + " ".join("-" * n for n in (8, 11, 11, 6, 22, 16, 10)))
+    for s in states:
+        role = "coordinator" if s["content"] == -1 else "segment"
+        if not s["ok"]:
+            print("  %-8s %-11s  UNREACHABLE: %s" % (s["content"], role, s["err"]))
+            continue
+        age = (s["replay_age"] + "s") if s["replay_age"] else "-"
+        print(hdr % (s["content"], role,
+                     "yes" if s["in_recovery"] else "no",
+                     "yes" if s["paused"] else "no",
+                     s["restore_point"] or "-", s["replay_lsn"] or "-", age))
+
+    reachable = [s for s in states if s["ok"]]
+    all_rec = bool(reachable) and all(s["in_recovery"] for s in reachable)
+    all_paused = bool(reachable) and all(s["paused"] for s in reachable)
+    any_paused = any(s["paused"] for s in reachable)
+    served = set(s["restore_point"] for s in reachable if s["paused"])
+    consistent = all_paused and len(served) == 1 and "" not in served
+    ages = [int(s["replay_age"]) for s in reachable if s["replay_age"]]
+    rpo = max(ages) if ages else None
+
+    if not all_paused and any_paused:
+        mode = "partially paused (advancing)"
+    elif all_paused:
+        mode = "all paused"
+    else:
+        mode = "following (continuous)"
+    print()
+    print("  cluster: %d node(s), %s, %s"
+          % (len(states), "all in recovery" if all_rec else "NOT all in recovery", mode))
+    if consistent:
+        print("  consistent serve point: %s   (safe to serve as-of-N reads)" % next(iter(served)))
+    else:
+        print("  consistent serve point: none   (following, advancing, or nodes skewed)")
+    if rpo is not None:
+        print("  RPO: ~%ds behind production's last replayed commit" % rpo)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="gg_recovery",
+        description="Control a Greengage DR read-replica's recovery (switch / follow / stats).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p_switch = sub.add_parser("switch", help="pause every node at <restore_point> (stop-and-go)")
+    p_switch.add_argument("restore_point", help="the restore point to pause the whole cluster at")
+    sub.add_parser("follow", help="continuous recovery, no cross-node consistent view")
+    sub.add_parser("stats", help="print recovery statistics")
+    args = ap.parse_args()
+    if args.cmd == "switch":
+        return cmd_switch(args.restore_point)
+    if args.cmd == "follow":
+        return cmd_follow()
+    if args.cmd == "stats":
+        return cmd_stats()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
