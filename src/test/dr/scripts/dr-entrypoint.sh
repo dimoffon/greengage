@@ -282,6 +282,28 @@ if [ -n "$sok" ]; then
 		r=$(dsp 'select count(*) from dr_m3;')
 		[ "$r" = 2 ] && ok3 "M3: after advancing to dr_rp2, dr_m3 count = 2 (new data now visible as-of rp2)" \
 					 || no3 "M3: as-of dr_rp2 dr_m3 = '$r' (expected 2)"
+
+		# --- M3 STRADDLE: advance to dr_rp_straddle, where a distributed 2PC txn T
+		#     spanning both segments straddles the cut -- its DISTRIBUTED_COMMIT is
+		#     replayed on the coordinator (shmCommittedGxidArray != 0) but it is
+		#     prepared-only on the segments.  CreateDRStandbyDistributedSnapshot must
+		#     EXCLUDE T (in-doubt) and NOT error, so dr_straddle shows only the 10
+		#     baseline rows; after advancing past T's forget, T's 20 rows appear (30). ---
+		log "dr-test: M3 straddle: advancing dr_rp2 -> dr_rp_straddle (the straddle cut) ..."
+		advance dr_rp2 dr_rp_straddle
+		for _ in $(seq 1 90); do all_paused && break; sleep 2; done
+		r=$(dsp 'select count(*) from dr_straddle;')
+		if [ "$r" = 10 ]; then
+			ok3 "M3 straddle: at the cut dr_straddle count = 10 (in-doubt 2PC txn excluded; no shmNumCommittedGxacts error)"
+		else
+			no3 "M3 straddle: at the cut dr_straddle = '$r' (expected 10; $(echo "$r" | grep -iE 'ERROR' | head -1))"
+		fi
+		log "dr-test: M3 straddle: advancing dr_rp_straddle -> dr_rp_straddle_done (past T's forget) ..."
+		advance dr_rp_straddle dr_rp_straddle_done
+		for _ in $(seq 1 90); do [ "$(dsp 'select count(*) from dr_straddle;')" = 30 ] && break; sleep 2; done
+		r=$(dsp 'select count(*) from dr_straddle;')
+		[ "$r" = 30 ] && ok3 "M3 straddle: after advancing past the forget, dr_straddle count = 30 (T now visible)" \
+					 || no3 "M3 straddle: past-forget dr_straddle = '$r' (expected 30)"
 	else
 		no3 "M3: not all ${#NODES[@]} DR nodes paused at dr_rp1"
 	fi

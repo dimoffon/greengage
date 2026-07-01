@@ -124,10 +124,34 @@ psql -p "$PORT_BASE" -d postgres -q -c \
 psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp1');" >/dev/null 2>&1 || true
 psql -p "$PORT_BASE" -d postgres -q -c "insert into dr_m3 values (2);" || true
 psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp2');" >/dev/null 2>&1 || true
+
+# --- M3 STRADDLE: a distributed txn T that spans BOTH segments (real 2PC) whose QD
+#     DISTRIBUTED_COMMIT lands BEFORE dr_rp_straddle but whose commit-prepared
+#     broadcast + forget land AFTER.  The dtm_broadcast_commit_prepared fault
+#     (cdbtm.c) suspends T after its DISTRIBUTED_COMMIT and before it takes
+#     TwophaseCommitLock SHARED, so the restore point's EXCLUSIVE lock slips in
+#     between.  At the DR cut, T is committed on the coordinator (shmCommittedGxidArray
+#     != 0) but prepared-only on the segments -- exactly what the DR-standby snapshot
+#     builder must EXCLUDE.  dr_straddle: 10 baseline rows + T's 20 rows (=30 total). ---
+CDBID=$(psql -p "$PORT_BASE" -d postgres -Atc "select dbid from gp_segment_configuration where content=-1;")
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table dr_straddle (id int) distributed by (id); insert into dr_straddle select generate_series(1,10);" || true
+psql -p "$PORT_BASE" -d postgres -Atc \
+	"select gp_inject_fault_infinite('dtm_broadcast_commit_prepared', 'suspend', $CDBID);" >/dev/null 2>&1 || true
+( psql -p "$PORT_BASE" -d postgres -c "insert into dr_straddle select generate_series(101,120);" >/dev/null 2>&1 ) &
+TPID=$!
+psql -p "$PORT_BASE" -d postgres -Atc \
+	"select gp_wait_until_triggered_fault('dtm_broadcast_commit_prepared', 1, $CDBID);" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp_straddle');" >/dev/null 2>&1 || true
+psql -p "$PORT_BASE" -d postgres -Atc \
+	"select gp_inject_fault('dtm_broadcast_commit_prepared', 'reset', $CDBID);" >/dev/null 2>&1 || true
+wait "$TPID" 2>/dev/null || true
+psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp_straddle_done');" >/dev/null 2>&1 || true
+
 psql -p "$PORT_BASE" -d postgres -q -c "checkpoint;" >/dev/null 2>&1 || true
 for _ in 1 2 3; do psql -p "$PORT_BASE" -d postgres -q -c "select pg_switch_wal();" >/dev/null 2>&1 || true; sleep 2; done
 touch "$ARCHIVE/m3_ready"
-log "primary: M3 restore points dr_rp1 (dr_m3=1) and dr_rp2 (dr_m3=2) created + archived"
+log "primary: M3 restore points (dr_rp1/dr_rp2) + straddle (dr_rp_straddle/_done, coord dbid=${CDBID:-?}) created + archived"
 
 log "primary: done; idling so the cluster keeps archiving WAL"
 exec sleep infinity
