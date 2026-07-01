@@ -183,4 +183,36 @@ else
 	cat "$SEG0"/log/*.csv 2>/dev/null | tail -20 >&2 || true
 fi
 
+# --- M2' SR-1: dispatched read-only DISTRIBUTED queries.  The coordinator (in
+#     recovery) enters DTX_CONTEXT_QD_STANDBY_READER -- no gxid -- and dispatches
+#     to the segment (also in recovery), which serves as a non-writing reader.
+#     Default psql on the coordinator is dispatch mode (utility is the override). ---
+if [ -n "$sok" ]; then
+	dsp() { psql -p "$PORT_BASE" -d postgres -v ON_ERROR_STOP=0 -qtAc "$1" 2>&1; }
+	p2=0; f2=0
+	okp() { log "dr-test: PASS  $1"; p2=$((p2+1)); }
+	nop() { log "dr-test: FAIL  $1"; f2=$((f2+1)); }
+	for _ in $(seq 1 20); do [ "$(dsp 'select 1')" = 1 ] && break; sleep 2; done
+	echo "========== M2' distributed-read assertions (dispatched; coordinator + segment in recovery) =========="
+	r=$(dsp 'select count(*) from dr_marker;')
+	[ "$r" = 1 ] && okp "M2' dispatch: 'select count(*) from dr_marker' = 1 (aggregated from the segment)" \
+				 || nop "M2' dispatch count = '$r'"
+	r=$(dsp 'select gp_segment_id from dr_marker;')
+	[ "$r" = 0 ] && okp "M2' dispatch: row served by gp_segment_id=0 (real dispatch to the DR segment)" \
+				 || nop "M2' dispatch gp_segment_id = '$r'"
+	r=$(dsp 'select (select count(*) from dr_marker);')
+	[ "$r" = 1 ] && okp "M2' dispatch: InitPlan-bearing read works (no gxid, no DTX backstop)" \
+				 || nop "M2' dispatch InitPlan read = '$r'"
+	r=$(dsp "insert into dr_marker values (2, 'must be refused');")
+	echo "$r" | grep -qiE "read-only|disaster-recovery replica" \
+		&& okp "M2' dispatch: INSERT still refused ($(echo "$r" | grep -iE 'ERROR' | head -1))" \
+		|| nop "M2' dispatch INSERT not refused -> $r"
+	echo "===================================================================================================="
+	if [ "$f2" -eq 0 ]; then
+		log "================ M2' DISTRIBUTED-READ TEST: PASS ($p2/$((p2+f2))) ================"
+	else
+		log "================ M2' DISTRIBUTED-READ TEST: FAIL ($f2 of $((p2+f2)) failed) ================"
+	fi
+fi
+
 exec sleep infinity

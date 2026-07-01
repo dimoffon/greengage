@@ -406,6 +406,17 @@ notifyCommittedDtxTransaction(void)
 void
 setupDtxTransaction(void)
 {
+	/*
+	 * Greengage DR: a standby reader dispatches read-only queries with NO
+	 * distributed transaction (no gxid).  Several dispatch paths call this
+	 * directly -- notably InitPlan dispatch via cdbdisp_query.c, which is why the
+	 * executor-level guard is not sufficient -- so make it a no-op for the
+	 * standby reader.  Without this the InitPlan dispatch reaches
+	 * currentDtxActivate and the M2 backstop refuses it.
+	 */
+	if (DistributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
+		return;
+
 	if (!IsTransactionState())
 		elog(ERROR, "DTM transaction is not active");
 
