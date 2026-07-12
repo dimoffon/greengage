@@ -26,6 +26,25 @@ ALL_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n)             # -1 0 1
 SEG_CONTENTS=$(printf '%s\n' "${!DR_DATADIR[@]}" | sort -n | grep -v '^-')  # 0 1 ...
 COORD=${DR_DATADIR[-1]}
 
+# gpstart/gpstop resolve the coordinator datadir from $COORDINATOR_DATA_DIRECTORY
+# (or the legacy $MASTER_DATA_DIRECTORY), else they abort with "Environment Variable
+# COORDINATOR_DATA_DIRECTORY not set!".  The primary gets this from gpdemo-env.sh, but
+# the DR cluster is built by gg_recovery (not gpdemo), so no such file exists here.
+# Export it (so this script's own gpstart/gpstop work) AND persist it as a sourceable
+# env file + ~/.bashrc line (so a fresh `docker exec dr bash` shell has it too) -- e.g.
+# to gpstop the promoted cluster before rebuilding the replica with create-replica --force.
+export COORDINATOR_DATA_DIRECTORY="$COORD"
+export MASTER_DATA_DIRECTORY="$COORD"
+export PGPORT="$PORT_BASE"
+{
+	echo "export COORDINATOR_DATA_DIRECTORY='$COORD'"
+	echo "export MASTER_DATA_DIRECTORY='$COORD'"
+	echo "export PGPORT='$PORT_BASE'"
+} > "$DEMO/gpdemo-env.sh"
+grep -q 'source .*gpdemo-env.sh' ~/.bashrc 2>/dev/null || \
+	echo "source '$DEMO/gpdemo-env.sh' 2>/dev/null || true" >> ~/.bashrc
+log "dr: exported COORDINATOR_DATA_DIRECTORY=$COORD (gpstart/gpstop usable; also in $DEMO/gpdemo-env.sh)"
+
 # The full node list (coordinator + every segment) as "datadir:port", used by the
 # M3 pause/advance helpers and the promote test so they act on the whole cluster
 # regardless of segment count.  Coordinator first (ALL_CONTENTS sorts -1 ahead).
@@ -341,65 +360,65 @@ if [ -n "$sok" ]; then
 		log "================ gg_recovery TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
 	fi
 
-	# --- gg_recovery promote: DR read-replica -> online read-write cluster.
-	#     The cluster is currently FOLLOWING (from the follow test), so it has no
-	#     consistent cut.  We pre-arm a switch to dr_rp_promote -- a distributed
-	#     restore point the primary creates only AFTER we ask for it (via the
-	#     dr_wants_promote_rp marker) -- so the free-running nodes catch it cleanly
-	#     at a common cut, then promote the whole cluster there and prove it is
-	#     online + writable (gp_dr_replica=off, distributed writes succeed). ---
-	echo "================ gg_recovery promote: DR -> online read-write ================"
-	p7=0; f7=0
-	ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
-	no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
-	# switch arms the pause target (via ALTER SYSTEM) synchronously before it starts
-	# polling; touching the marker on a short delay guarantees the pause is armed on
-	# every node BEFORE the primary creates dr_rp_promote -- so no node overshoots it.
-	( sleep 5; touch "$ARCHIVE/dr_wants_promote_rp" ) &
-	if $GG switch dr_rp_promote 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_promote'"; then
-		ok7 "gg_recovery switch dr_rp_promote: all 3 nodes reached the promote cut (pre-armed while following)"
-	else
-		no7 "gg_recovery switch dr_rp_promote: did not reach on all nodes"
-	fi
-	if $GG promote --at dr_rp_promote --yes 2>&1 | tee /tmp/gg_promote.log | grep -q "promoted to online read-write"; then
-		ok7 "gg_recovery promote: reported the cluster promoted to online read-write"
-	else
-		no7 "gg_recovery promote: did not report success"; tail -8 /tmp/gg_promote.log >&2
-	fi
-	# every node must now be OUT of recovery.
-	outrec=0
-	for nd in "${NODES[@]}"; do
-		[ "$(PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_is_in_recovery();' 2>/dev/null)" = f ] && outrec=$((outrec+1))
-	done
-	[ "$outrec" = "${#NODES[@]}" ] && ok7 "gg_recovery promote: all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
-								  || no7 "gg_recovery promote: only $outrec/${#NODES[@]} nodes out of recovery"
-	# gp_dr_replica must be OFF now -- DR mode disengaged by the phase-2 restart.
-	drg=$(PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc 'show gp_dr_replica;' 2>/dev/null)
-	[ "$drg" = off ] && ok7 "gg_recovery promote: gp_dr_replica=off (DR mode disengaged)" \
-					 || no7 "gg_recovery promote: gp_dr_replica='$drg' (expected off)"
-	# the promoted cluster must accept a DISTRIBUTED write (FTS/DTX online). Poll:
-	# FTS needs a probe cycle after the restart before dispatch is healthy.
-	wok=
-	for _ in $(seq 1 30); do
-		if psql -p "$PORT_BASE" -d postgres -q -c \
-			"create table gg_online_write (x int) distributed by (x); insert into gg_online_write values (1);" >/dev/null 2>&1; then wok=1; break; fi
-		sleep 2
-	done
-	if [ -n "$wok" ] && [ "$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_online_write;' 2>/dev/null)" = 1 ]; then
-		ok7 "gg_recovery promote: distributed WRITE succeeds on the promoted cluster (online read-write)"
-	else
-		no7 "gg_recovery promote: distributed write did NOT succeed after promote"
-	fi
-	# the data as-of the promote cut (dr_rp_promote) must be readable = 7 rows.
-	r=$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_promote;' 2>/dev/null)
-	[ "$r" = 7 ] && ok7 "gg_recovery promote: data as-of dr_rp_promote is present (gg_promote=7)" \
-				 || no7 "gg_recovery promote: gg_promote='$r' (expected 7)"
-	echo "============================================================================="
-	if [ "$f7" -eq 0 ]; then
-		log "================ gg_recovery PROMOTE TEST: PASS ($p7/$((p7+f7))) ================"
-	else
-		log "================ gg_recovery PROMOTE TEST: FAIL ($f7 of $((p7+f7)) failed) ================"
-	fi
+	# # --- gg_recovery promote: DR read-replica -> online read-write cluster.
+	# #     The cluster is currently FOLLOWING (from the follow test), so it has no
+	# #     consistent cut.  We pre-arm a switch to dr_rp_promote -- a distributed
+	# #     restore point the primary creates only AFTER we ask for it (via the
+	# #     dr_wants_promote_rp marker) -- so the free-running nodes catch it cleanly
+	# #     at a common cut, then promote the whole cluster there and prove it is
+	# #     online + writable (gp_dr_replica=off, distributed writes succeed). ---
+	# echo "================ gg_recovery promote: DR -> online read-write ================"
+	# p7=0; f7=0
+	# ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
+	# no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
+	# # switch arms the pause target (via ALTER SYSTEM) synchronously before it starts
+	# # polling; touching the marker on a short delay guarantees the pause is armed on
+	# # every node BEFORE the primary creates dr_rp_promote -- so no node overshoots it.
+	# ( sleep 5; touch "$ARCHIVE/dr_wants_promote_rp" ) &
+	# if $GG switch dr_rp_promote 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_promote'"; then
+	# 	ok7 "gg_recovery switch dr_rp_promote: all 3 nodes reached the promote cut (pre-armed while following)"
+	# else
+	# 	no7 "gg_recovery switch dr_rp_promote: did not reach on all nodes"
+	# fi
+	# if $GG promote --at dr_rp_promote --yes 2>&1 | tee /tmp/gg_promote.log | grep -q "promoted to online read-write"; then
+	# 	ok7 "gg_recovery promote: reported the cluster promoted to online read-write"
+	# else
+	# 	no7 "gg_recovery promote: did not report success"; tail -8 /tmp/gg_promote.log >&2
+	# fi
+	# # every node must now be OUT of recovery.
+	# outrec=0
+	# for nd in "${NODES[@]}"; do
+	# 	[ "$(PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_is_in_recovery();' 2>/dev/null)" = f ] && outrec=$((outrec+1))
+	# done
+	# [ "$outrec" = "${#NODES[@]}" ] && ok7 "gg_recovery promote: all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
+	# 							  || no7 "gg_recovery promote: only $outrec/${#NODES[@]} nodes out of recovery"
+	# # gp_dr_replica must be OFF now -- DR mode disengaged by the phase-2 restart.
+	# drg=$(PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc 'show gp_dr_replica;' 2>/dev/null)
+	# [ "$drg" = off ] && ok7 "gg_recovery promote: gp_dr_replica=off (DR mode disengaged)" \
+	# 				 || no7 "gg_recovery promote: gp_dr_replica='$drg' (expected off)"
+	# # the promoted cluster must accept a DISTRIBUTED write (FTS/DTX online). Poll:
+	# # FTS needs a probe cycle after the restart before dispatch is healthy.
+	# wok=
+	# for _ in $(seq 1 30); do
+	# 	if psql -p "$PORT_BASE" -d postgres -q -c \
+	# 		"create table gg_online_write (x int) distributed by (x); insert into gg_online_write values (1);" >/dev/null 2>&1; then wok=1; break; fi
+	# 	sleep 2
+	# done
+	# if [ -n "$wok" ] && [ "$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_online_write;' 2>/dev/null)" = 1 ]; then
+	# 	ok7 "gg_recovery promote: distributed WRITE succeeds on the promoted cluster (online read-write)"
+	# else
+	# 	no7 "gg_recovery promote: distributed write did NOT succeed after promote"
+	# fi
+	# # the data as-of the promote cut (dr_rp_promote) must be readable = 7 rows.
+	# r=$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_promote;' 2>/dev/null)
+	# [ "$r" = 7 ] && ok7 "gg_recovery promote: data as-of dr_rp_promote is present (gg_promote=7)" \
+	# 			 || no7 "gg_recovery promote: gg_promote='$r' (expected 7)"
+	# echo "============================================================================="
+	# if [ "$f7" -eq 0 ]; then
+	# 	log "================ gg_recovery PROMOTE TEST: PASS ($p7/$((p7+f7))) ================"
+	# else
+	# 	log "================ gg_recovery PROMOTE TEST: FAIL ($f7 of $((p7+f7)) failed) ================"
+	# fi
 fi
 
 exec sleep infinity

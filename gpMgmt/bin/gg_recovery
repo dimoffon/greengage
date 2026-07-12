@@ -429,6 +429,53 @@ def _archive_dir(wal_archive, content):
     return os.path.join(wal_archive, "seg%d" % content)
 
 
+def _read_postmaster_pid(datadir):
+    """First line of datadir/postmaster.pid as int, or None if absent/garbage."""
+    try:
+        with open(os.path.join(datadir, "postmaster.pid")) as f:
+            return int(f.readline().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid):
+    """True iff process pid currently exists (EPERM counts as alive)."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_node(datadir):
+    """Stop any postmaster running in datadir so it can be safely overwritten.
+
+    Used by create-replica --force to rebuild a DR cluster that is currently up
+    -- typically one that has just been 'promote'd to online read-write, whose
+    live postmaster (and its postmaster.pid) would otherwise block the rebuild.
+    Returns True once no live postmaster holds the datadir; False if one remains.
+    """
+    pidfile = os.path.join(datadir, "postmaster.pid")
+    if not os.path.exists(pidfile):
+        return True
+    print("  --force: stopping the node running in %s before rebuild" % datadir)
+    _run(["pg_ctl", "-D", datadir, "-m", "fast", "-w", "stop"])
+    if not os.path.exists(pidfile):
+        return True
+    # pg_ctl left the pidfile: either the stop failed or it was already stale.
+    if _pid_alive(_read_postmaster_pid(datadir)):
+        return False
+    try:
+        os.remove(pidfile)   # stale pidfile from a crashed/killed node
+    except OSError:
+        pass
+    return True
+
+
 def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=None,
                        pause_at=None, scratch_seed=False, no_start=False, force=False):
     rows = _parse_topology(topology)
@@ -448,12 +495,23 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
           % (len(rows), basebackup_dir))
 
     # --- 1. safety / idempotence ---
+    #     Without --force we refuse on a running node (postmaster.pid) or any
+    #     non-empty datadir.  With --force we first STOP any node running here --
+    #     e.g. a DR cluster just 'promote'd to online read-write -- so its live
+    #     postmaster (and postmaster.pid) can be rebuilt instead of blocking us.
     for r in rows:
         dd = r["datadir"]
-        if os.path.exists(os.path.join(dd, "postmaster.pid")):
-            sys.exit("gg_recovery create-replica: %s has a postmaster.pid (running?); refusing." % dd)
-        if os.path.exists(dd) and os.listdir(dd) and not force:
-            sys.exit("gg_recovery create-replica: %s is non-empty; use --force to overwrite." % dd)
+        has_pid = os.path.exists(os.path.join(dd, "postmaster.pid"))
+        if not force:
+            if has_pid:
+                sys.exit("gg_recovery create-replica: %s has a postmaster.pid (running?); "
+                         "stop the cluster or pass --force to stop+overwrite it." % dd)
+            if os.path.exists(dd) and os.listdir(dd):
+                sys.exit("gg_recovery create-replica: %s is non-empty; use --force to overwrite." % dd)
+            continue
+        if has_pid and not _stop_node(dd):
+            sys.exit("gg_recovery create-replica: a live postmaster still holds %s after "
+                     "'pg_ctl stop'; refusing to overwrite it." % dd)
 
     # --- 2. restore each instance's base backup ---
     for r in rows:
@@ -531,6 +589,11 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         open(os.path.join(dd, "dr_replica.signal"), "w").close()
         open(os.path.join(dd, "standby.signal"), "w").close()
     print("  armed DR mode (gp_dr_replica + restore_command + dr_replica.signal + standby.signal)")
+    # gpstart/gpstop resolve the coordinator datadir from $COORDINATOR_DATA_DIRECTORY
+    # (or the legacy $MASTER_DATA_DIRECTORY); the DR cluster is not built by gpdemo, so
+    # nothing exports it -- tell the operator how to manage this cluster with them.
+    print("  to manage this cluster with gpstart/gpstop, set:")
+    print("    export COORDINATOR_DATA_DIRECTORY=%s" % cdd)
 
     if no_start:
         print("gg_recovery create-replica: DONE (armed, not started; --no-start).")
