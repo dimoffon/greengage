@@ -197,6 +197,10 @@ if [ -n "$sok" ]; then
 	# Returns 0 even when the statement errors (INSERT is expected to be refused),
 	# so the command substitution does not trip `set -e`; the output is captured.
 	dsp() { psql -p "$PORT_BASE" -d postgres -v ON_ERROR_STOP=0 -qtAc "$1" 2>&1 || true; }
+	# Multi-statement variant.  `psql -c` prints only the LAST statement's result,
+	# so a script whose interesting value is not last (e.g. one wrapped in
+	# begin/commit) has to go through stdin instead.
+	dsps() { psql -p "$PORT_BASE" -d postgres -v ON_ERROR_STOP=0 -qtA 2>&1 <<<"$1" || true; }
 	p2=0; f2=0
 	okp() { log "dr-test: PASS  $1"; p2=$((p2+1)); }
 	nop() { log "dr-test: FAIL  $1"; f2=$((f2+1)); }
@@ -390,8 +394,14 @@ if [ -n "$sok" ]; then
 	touch "$ARCHIVE/dr_wants_promote_rp"
 	for _ in $(seq 1 300); do [ -f "$ARCHIVE/promote_rp_ready" ] && break; sleep 2; done
 
-	r=$(dsp "select gp_dr_switch('dr_rp_promote', 300);")
-	[ "$r" = t ] && ok7 "gp_dr_switch('dr_rp_promote') returned true (whole cluster advanced from the coordinator)" \
+	# Inside an explicit transaction block on purpose: the segment leg used to be a
+	# dispatched `ALTER SYSTEM`, which PreventInTransactionBlock rejects whenever the
+	# QE runs it inside the dispatched transaction.  It is a dispatched function call
+	# now, which is never subject to that check -- assert the usage stays legal.
+	r=$(dsps "begin;
+select gp_dr_switch('dr_rp_promote', 300);
+commit;")
+	echo "$r" | grep -qx t && ok7 "gp_dr_switch('dr_rp_promote') returned true inside a transaction block (whole cluster advanced from the coordinator)" \
 				 || no7 "gp_dr_switch returned '$r' (expected t)"
 	r=$(dsp "select consistent_restore_point from gp_stat_dr_replica_summary;")
 	[ "$r" = dr_rp_promote ] && ok7 "summary consistent_restore_point = dr_rp_promote after gp_dr_switch" \

@@ -335,20 +335,21 @@ dr_dispatch(const char *cmd)
 }
 
 /*
- * Set the pause target everywhere.
+ * Write the pause target into postgresql.auto.conf on THIS node.
  *
- * Locally this bypasses ProcessUtility and calls AlterSystemSetConfigFile()
- * directly, for the transaction-block reason above.  (Note that a top-level
- * ALTER SYSTEM on a coordinator already fans out to the segments by itself;
- * from in here we have to dispatch it ourselves.)
+ * Calls AlterSystemSetConfigFile() directly instead of executing an ALTER SYSTEM
+ * statement, because standard_ProcessUtility() gates AlterSystemStmt behind
+ * PreventInTransactionBlock() and every caller here is already inside one:
+ * gp_dr_switch() runs inside a SELECT, and on a segment the dispatched statement
+ * may be executing inside the dispatched transaction.  The underlying action is
+ * identical -- it writes the file and nothing else.
  */
 static void
-dr_set_pause_target(const char *target)
+dr_write_pause_target(const char *target)
 {
 	A_Const    *con = makeNode(A_Const);
 	VariableSetStmt *vset = makeNode(VariableSetStmt);
 	AlterSystemStmt *stmt = makeNode(AlterSystemStmt);
-	char	   *cmd;
 
 	con->val.type = T_String;
 	con->val.val.str = pstrdup(target);
@@ -360,12 +361,29 @@ dr_set_pause_target(const char *target)
 	vset->is_local = false;
 	stmt->setstmt = vset;
 
-	cmd = psprintf("ALTER SYSTEM SET gp_pause_on_restore_point_replay = %s",
+	AlterSystemSetConfigFile(stmt);
+}
+
+/* Set the pause target on every primary segment and on this node. */
+static void
+dr_set_pause_target(const char *target)
+{
+	char	   *cmd;
+
+	/*
+	 * Dispatch gp_dr_switch() itself: on a segment it is the per-node primitive
+	 * (see the Gp_role check at the top of it) and returns immediately.  A
+	 * function call, not `ALTER SYSTEM ...`, because the utility statement is
+	 * rejected by PreventInTransactionBlock whenever the QE happens to run it
+	 * inside the dispatched transaction -- which depends on gang and DTX state,
+	 * so it worked in some deployments and failed in others.
+	 */
+	cmd = psprintf("SELECT pg_catalog.gp_dr_switch(%s, 0)",
 				   quote_literal_cstr(target));
 	dr_dispatch(cmd);
 	pfree(cmd);
 
-	AlterSystemSetConfigFile(stmt);
+	dr_write_pause_target(target);
 }
 
 /* Reload config, then resume replay, on every node.  Order matters. */
@@ -455,6 +473,21 @@ gp_dr_switch(PG_FUNCTION_ARGS)
 	char	   *target = text_to_cstring(PG_GETARG_TEXT_P(0));
 	int			timeout = PG_GETARG_INT32(1);
 	int			waited;
+
+	/*
+	 * On a segment, this is the per-node primitive the coordinator dispatched:
+	 * arm the pause target and return.  The coordinator drives the rest -- the
+	 * reload, the resume and the wait are its job, not ours.
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE)
+	{
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to call gp_dr_switch()")));
+		dr_write_pause_target(target);
+		PG_RETURN_BOOL(true);
+	}
 
 	dr_control_precheck("gp_dr_switch");
 	if (target[0] == '\0')
