@@ -21,6 +21,7 @@
 
 #include "miscadmin.h"
 
+#include "access/dr_redo_filter.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
@@ -693,6 +694,25 @@ smgr_redo(XLogReaderState *record)
 		xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(record);
 		SMgrRelation reln;
 		Relation	rel;
+
+		/*
+		 * On a DR replica, never apply production's truncation of a protected
+		 * cluster-topology catalog: this node's copy of it holds the frozen
+		 * DR-local rows and its own page count, so production's truncation
+		 * point does not apply.  This record names its relation in the payload
+		 * rather than in a block reference, so the main redo filter in xlog.c
+		 * cannot catch it; see DRRedoShouldFilterRelFileNode().  Returning here
+		 * -- before smgrcreate() and the minRecoveryPoint XLogFlush() below,
+		 * both of which only exist to make the truncation crash-safe -- leaves
+		 * no trace of the record at all.  As with any filtered record the
+		 * replay LSN still advances; that bookkeeping is the record reader's.
+		 */
+		if (DRRedoShouldFilterRelFileNode(&xlrec->rnode))
+		{
+			elog(LOG, "disaster-recovery replica: skipped truncation of protected topology catalog (relfilenode %u) to %u block(s)",
+				 xlrec->rnode.relNode, xlrec->blkno);
+			return;
+		}
 
 		/*
 		 * AO-specific implementation of SMGR is not needed because truncate

@@ -1,0 +1,60 @@
+# Greengage 7 DR -- V-20 regression fixture (dense topology catalog).
+#
+# Reproduces the case the default fixture cannot: a production
+# gp_segment_configuration dense enough that the DR's frozen seed lands its rows
+# on a trailing block, so production's later VACUUM truncation has something of
+# the DR's to discard.  See scripts/dense-primary-entrypoint.sh for the mechanism
+# and doc/architecture/greengage-dr-test-scenarios.md (V-20 / V-21).
+#
+# Uses a prebuilt image rather than building one, so the same fixture can be run
+# against a guarded and an unguarded build to compare:
+#
+#   # unguarded build -- expect "TOPOLOGY DESTROYED"
+#   DR_IMAGE=greengage-dr-test:latest \
+#     docker-compose -p dense -f src/test/dr/docker-compose.dense.yml up -d
+#
+#   # guarded build -- expect "TOPOLOGY SURVIVED"
+#   DR_IMAGE=greengage-dr-test:v20fix \
+#     docker-compose -p dense -f src/test/dr/docker-compose.dense.yml up -d
+#
+#   docker-compose -p dense -f src/test/dr/docker-compose.dense.yml logs -f dr
+#   docker-compose -p dense -f src/test/dr/docker-compose.dense.yml down -v
+#
+# Build the base image first with the default fixture:
+#   docker-compose -f src/test/dr/docker-compose.yml build
+version: "3.8"
+
+x-gpdb: &gpdb
+  image: ${DR_IMAGE:-greengage-dr-test:latest}
+  privileged: true
+  init: true
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile: 65535
+  volumes:
+    - wal_archive:/archive
+    - ./scripts:/dr/scripts:ro
+
+services:
+  primary:
+    <<: *gpdb
+    hostname: primary
+    environment:
+      # Filler rows inserted+deleted in one transaction to fill the catalog's
+      # pages.  5000 narrow rows is ~11 pages at Greengage's 32 KB block size --
+      # comfortably past the >=3 the fixture asserts.
+      FILLER_ROWS: "5000"
+    command: ["/dr/scripts/dense-primary-entrypoint.sh"]
+
+  dr:
+    <<: *gpdb
+    hostname: dr
+    depends_on:
+      - primary
+    environment:
+      DR_SEED: "1"
+    command: ["/dr/scripts/dense-dr-entrypoint.sh"]
+
+volumes:
+  wal_archive:

@@ -48,4 +48,11 @@ extern bool DRRelfilenodeIsProtected(const RelFileNode *rnode);
  */
 extern bool DRRedoShouldFilter(XLogReaderState *record);
 
+/*
+ * Same decision for a relation named in a record's *payload* rather than in a
+ * block reference, which DRRedoShouldFilter() cannot see.  Used by smgr_redo()
+ * for XLOG_SMGR_TRUNCATE.
+ */
+extern bool DRRedoShouldFilterRelFileNode(const RelFileNode *rnode);
+
 #endif							/* DR_REDO_FILTER_H */

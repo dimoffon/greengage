@@ -183,6 +183,40 @@ DRRelfilenodeIsProtected(const RelFileNode *rnode)
 }
 
 /*
+ * DRRedoShouldFilterRelFileNode
+ *		Should redo of an operation on this relation be skipped on a DR replica?
+ *
+ * DRRedoShouldFilter() decides from a record's registered block references, so
+ * it cannot see a relation named only in the record's *payload*.  The case that
+ * matters is XLOG_SMGR_TRUNCATE: it carries its RelFileNode in xl_smgr_truncate
+ * and registers no buffers, so DRRedoShouldFilter() reports "apply" for it (a
+ * record with no block references is always applied -- correctly, since that is
+ * also the shape of a commit record).  Without this guard, production truncating
+ * a protected catalog would truncate the DR's *own* file, which holds the
+ * frozen-seeded DR-local topology and legitimately has a different page count.
+ *
+ * Skipping -- rather than halting, as DRRejectForbiddenRemap() does -- is
+ * deliberate.  An ignored truncation has no lasting consequence: this node keeps
+ * its own pages, the protected set still resolves to the same filenode, and
+ * replay continues correctly.  A remap is materially different, because it
+ * repoints the catalog at a filenode the protected set no longer covers, so the
+ * filter would silently stop protecting it from then on; that is unrecoverable
+ * and therefore fatal.  Halting here instead would take every DR node down on a
+ * routine production autovacuum, for an event that is harmless once ignored.
+ */
+bool
+DRRedoShouldFilterRelFileNode(const RelFileNode *rnode)
+{
+	if (!IsDRReplicaMode())
+		return false;
+
+	if (!dr_protected_resolved)
+		DRResolveProtectedRelfilenodes();
+
+	return DRRelfilenodeIsProtected(rnode);
+}
+
+/*
  * DRRedoShouldFilter
  *		Should this WAL record's redo be skipped on a DR replica?
  *

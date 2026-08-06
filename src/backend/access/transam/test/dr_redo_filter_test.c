@@ -203,6 +203,63 @@ test_dr_mode_no_blocks_applies(void **state)
 	assert_false(DRRedoShouldFilter(&rec));
 }
 
+/* ---- DRRedoShouldFilterRelFileNode(): payload-named relations (XLOG_SMGR_TRUNCATE) ---- */
+
+/* DR mode + a protected relation: skip the truncation. */
+static void
+test_dr_mode_filters_protected_rnode(void **state)
+{
+	Oid			set[] = {16384};
+	RelFileNode rnode = {.spcNode = GLOBALTABLESPACE_OID,
+		.dbNode = InvalidOid,.relNode = 16384};
+
+	set_protected(set, 1);
+	will_return(IsDRReplicaMode, true);
+	assert_true(DRRedoShouldFilterRelFileNode(&rnode));
+}
+
+/* DR mode but an ordinary relation: truncate normally. */
+static void
+test_dr_mode_applies_nonprotected_rnode(void **state)
+{
+	Oid			set[] = {16384};
+	RelFileNode rnode = {.spcNode = GLOBALTABLESPACE_OID,
+		.dbNode = InvalidOid,.relNode = 99999};
+
+	set_protected(set, 1);
+	will_return(IsDRReplicaMode, true);
+	assert_false(DRRedoShouldFilterRelFileNode(&rnode));
+}
+
+/*
+ * A relation that merely collides on filenode but is not shared (it lives in a
+ * database, outside the global tablespace) must be truncated normally.
+ */
+static void
+test_dr_mode_nonshared_rnode_applies(void **state)
+{
+	Oid			set[] = {16384};
+	RelFileNode rnode = {.spcNode = DEFAULTTABLESPACE_OID,
+		.dbNode = 12345,.relNode = 16384};
+
+	set_protected(set, 1);
+	will_return(IsDRReplicaMode, true);
+	assert_false(DRRedoShouldFilterRelFileNode(&rnode));
+}
+
+/* Not a DR replica: never filter, even for a protected relation. */
+static void
+test_not_dr_mode_never_filters_rnode(void **state)
+{
+	Oid			set[] = {16384};
+	RelFileNode rnode = {.spcNode = GLOBALTABLESPACE_OID,
+		.dbNode = InvalidOid,.relNode = 16384};
+
+	set_protected(set, 1);
+	will_return(IsDRReplicaMode, false);
+	assert_false(DRRedoShouldFilterRelFileNode(&rnode));
+}
+
 /* ---- DRRejectForbiddenRemap(): the M1.4 safety net (RelationMapOidToFilenode + ereport mocked) ---- */
 
 /* A protected catalog whose filenode is changing must halt replay (FATAL). */
@@ -260,6 +317,10 @@ main(int argc, char *argv[])
 		unit_test(test_dr_mode_applies_nonprotected_record),
 		unit_test(test_dr_mode_mixed_blocks_applies),
 		unit_test(test_dr_mode_no_blocks_applies),
+		unit_test(test_dr_mode_filters_protected_rnode),
+		unit_test(test_dr_mode_applies_nonprotected_rnode),
+		unit_test(test_dr_mode_nonshared_rnode_applies),
+		unit_test(test_not_dr_mode_never_filters_rnode),
 		unit_test(test_remap_protected_changed_fatals),
 		unit_test(test_remap_protected_unchanged_ok),
 		unit_test(test_remap_nonprotected_ignored)
