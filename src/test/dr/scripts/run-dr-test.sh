@@ -1,7 +1,7 @@
 #!/bin/bash
 # run-dr-test.sh -- the M1 assertion: production changed gp_segment_configuration
 # (seg0 port +1000) AFTER the base backup; the DR replica must NOT pick that up,
-# because the apply-time redo filter (gp_dr_replica) skips production's WAL for
+# because the apply-time redo filter (hot standby in recovery) skips production's WAL for
 # the protected topology catalogs.  If frozen-seeded, the DR coordinator's
 # hostname should also be the DR-local 'dr'.
 set -uo pipefail

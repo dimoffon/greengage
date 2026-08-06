@@ -15,7 +15,7 @@ x-gpdb: &gpdb
   build:
     context: ../../..
     dockerfile: src/test/dr/Dockerfile
-  image: greengage-dr-test:latest
+  image: ${DR_IMAGE:-greengage-dr-test:latest}
   privileged: true            # sysctls + shared memory for the cluster
   init: true                  # reap the many child processes Greengage spawns
   sysctls:

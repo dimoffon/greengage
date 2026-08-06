@@ -64,40 +64,13 @@
  * corruption.  To minimize the risk of failed updates, the map file should
  * be kept to no more than one standard-size disk sector (ie 512 bytes),
  * and we use overwrite-in-place rather than playing renaming games.
- * The struct layout below is designed to occupy exactly 512 bytes, which
- * might make filesystem updates a bit more efficient.
+ * The struct layout (RelMapFile, in relmapper.h so that frontend tools can
+ * read the file too) is designed to occupy exactly 1024 bytes in Greengage.
  *
  * Entries in the mappings[] array are in no particular order.  We could
  * speed searching by insisting on OID order, but it really shouldn't be
  * worth the trouble given the intended size of the mapping sets.
  */
-#define RELMAPPER_FILENAME		"pg_filenode.map"
-
-#define RELMAPPER_FILEMAGIC		0x592717	/* version ID value */
-
-/*
- * In Postgres, MAX_MAPPINGS is 62, but GPDB has exceeded this number due to
- * additional GPDB specific shared relations. Increased to 126 to occupy
- * exactly 1 kilobyte.
- *
- * New math: 126 * 8 + 16 = 1024
- */
-#define MAX_MAPPINGS			126		/* 62 * 8 + 16 = 512 */
-
-typedef struct RelMapping
-{
-	Oid			mapoid;			/* OID of a catalog */
-	Oid			mapfilenode;	/* its filenode number */
-} RelMapping;
-
-typedef struct RelMapFile
-{
-	int32		magic;			/* always RELMAPPER_FILEMAGIC */
-	int32		num_mappings;	/* number of valid RelMapping entries */
-	RelMapping	mappings[MAX_MAPPINGS];
-	pg_crc32c	crc;			/* CRC of all above */
-	int32		pad;			/* to make the struct size be 512 exactly */
-} RelMapFile;
 
 /*
  * State for serializing local and shared relmappings for parallel workers

@@ -12,8 +12,8 @@ volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
               shared docker volume  wal_archive  ->  /archive  (in both containers)
  ┌─ primary ───────────────┐                         ┌─ dr ──────────────────────────┐
  │ demo cluster            │   archive_command  cp    │ restored from primary's base  │
- │ (coordinator + 1 seg)   │ ───────────────────────▶ │ backup; gp_dr_replica=on +    │
- │ archive_mode=on         │   /archive/wal/seg%c/    │ dr_replica.signal; frozen-seed│
+ │ (coordinator + 1 seg)   │ ───────────────────────▶ │ backup; hot_standby=on;       │
+ │ archive_mode=on         │   /archive/wal/seg%c/    │ frozen-seeded topology;       │
  │ base-backups itself ───▶│   /archive/basebackup/   │ restore_command  cp  ◀────────│
  │ then changes topology   │                          │ continuous recovery           │
  └─────────────────────────┘                          └───────────────────────────────┘
@@ -48,10 +48,11 @@ a while; subsequent runs reuse the image.
 2. The **dr** container restores the coordinator's base backup; **frozen-seeds
    DR-local topology** (`gpseed_dr_topology`, `DR_SEED=1`) while preserving the
    recovery-start state (save/restore `backup_label` + `pg_control`, the M4 fix);
-   arms `gp_dr_replica` + `dr_replica.signal` + `standby.signal` +
+   arms `hot_standby` + `standby.signal` +
    `restore_command`; and starts the coordinator as a **live, continuous
-   hot-standby**. It does *not* set `hot_standby` — DR mode auto-enables it in
-   the postmaster (M2). It then waits to replay past the recorded change LSN.
+   hot-standby**. `hot_standby = on` *is* what puts a node in DR mode — there is
+   no separate GUC or marker file. It then waits to replay past the recorded
+   change LSN.
 3. **Assertions** (against the live coordinator, utility mode):
    - **M1** — `gp_segment_configuration` does **not** show production's change.
    - **M4 seed** — seg0 has the DR-local hostname `dr` (genuine topology
@@ -71,6 +72,33 @@ the M1.3 protected-set resolution (the shared relmap isn't loaded during redo)
 and the M2 `IsDRReplicaMode()` flag (set only in the startup process, invisible
 to the backends where the enforcement runs).
 
+## V-20 regression fixture (dense topology catalog)
+
+`docker-compose.dense.yml` is a second, opt-in fixture for scenario **V-20**: production's
+`VACUUM` truncating trailing pages of a protected topology catalog must not truncate the
+DR's copy of it. The default fixture cannot show this — with 3 segment rows in a 32 KB page
+the DR's seed has ample room on block 0, so production's truncation has nothing of the DR's
+to discard. The dense fixture fills the catalog with filler rows that are inserted **and
+deleted in one transaction** (dead on arrival, never visible to FTS, but still occupying
+their pages), base-backs up in that state, and vacuums only after the DR is built.
+
+It runs against a prebuilt image so the same fixture can be pointed at a guarded and an
+unguarded build:
+
+```bash
+docker-compose -f src/test/dr/docker-compose.yml build        # base image, once
+
+DR_IMAGE=greengage-dr-test:latest \
+  docker-compose -p dense -f src/test/dr/docker-compose.dense.yml up -d
+docker-compose -p dense -f src/test/dr/docker-compose.dense.yml logs -f dr
+docker-compose -p dense -f src/test/dr/docker-compose.dense.yml down -v
+```
+
+The DR container prints a `V-20 VERDICT:` line — `TOPOLOGY SURVIVED` on a build with the
+`smgr_redo` guard, `TOPOLOGY DESTROYED` without it. It **fails closed**: if the catalog is
+not dense enough and the seed's rows land on block 0, the precondition check aborts instead
+of reporting a pass, so an inconclusive run can never look green.
+
 ## Files
 
 | File | Purpose |
@@ -81,6 +109,9 @@ to the backends where the enforcement runs).
 | `scripts/primary-entrypoint.sh` | Build cluster, archive, base-backup, change topology, record change LSN. |
 | `scripts/dr-entrypoint.sh` | Restore, arm DR mode, start the coordinator as a live hot-standby, run the M1+M2 assertions. |
 | `scripts/run-dr-test.sh` | Earlier standalone M1 assertion (superseded; assertions now inline in `dr-entrypoint.sh`). |
+| `docker-compose.dense.yml` | V-20 regression fixture (dense topology catalog); uses a prebuilt image via `$DR_IMAGE`. |
+| `scripts/dense-primary-entrypoint.sh` | Densify `gp_segment_configuration`, base-backup in that state, then vacuum to trigger the truncation. |
+| `scripts/dense-dr-entrypoint.sh` | Build the replica, assert it is exposed (live rows on a trailing block), replay past the truncation, report the verdict. |
 
 ## Notes / status
 

@@ -401,7 +401,6 @@ extern SessionBackupState get_backup_status(void);
 /* File path names (all relative to $PGDATA) */
 #define RECOVERY_SIGNAL_FILE	"recovery.signal"
 #define STANDBY_SIGNAL_FILE		"standby.signal"
-#define DR_REPLICA_SIGNAL_FILE	"dr_replica.signal"
 #define BACKUP_LABEL_FILE		"backup_label"
 #define BACKUP_LABEL_OLD		"backup_label.old"
 

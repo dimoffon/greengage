@@ -1079,28 +1079,6 @@ PostmasterMain(int argc, char *argv[])
 	ChangeToDataDir();
 
 	/*
-	 * Greengage disaster-recovery replica: a DR node serves read-only queries
-	 * while permanently in archive recovery, which the postmaster only permits
-	 * when hot standby is enabled.  Turn it on automatically when DR mode is
-	 * configured -- gp_dr_replica plus the dr_replica.signal marker, the same
-	 * condition as IsDRReplicaMode() -- so operators (and the create utility)
-	 * need not also remember to set hot_standby.  We stat the marker directly
-	 * rather than call IsDRReplicaMode(): dr_replica_signal_file_found is set
-	 * later, in the startup child, and is not visible here in the postmaster.
-	 */
-	if (gp_dr_replica && !EnableHotStandby)
-	{
-		struct stat dr_stat_buf;
-
-		if (stat(DR_REPLICA_SIGNAL_FILE, &dr_stat_buf) == 0)
-		{
-			EnableHotStandby = true;
-			ereport(LOG,
-					(errmsg("disaster-recovery replica mode: enabling hot_standby so the coordinator can serve read-only queries")));
-		}
-	}
-
-	/*
      * CDB: Decouple NBuffers from MaxBackends.  The entry db doesn't benefit
      * from buffers in excess of the global catalog size; this is typically
      * small and unrelated to the number of clients.  Segment dbs need enough

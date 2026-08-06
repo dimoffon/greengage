@@ -3,8 +3,8 @@
 # (restore base backups + frozen-seed DR-local topology + arm DR mode + start every
 # node in continuous archive recovery), then run the milestone regression suite:
 # M1 (redo filter) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
-# M5 (observability), the gg_recovery switch/follow/stats utility test, and finally
-# the gg_recovery promote test (DR -> online read-write).
+# M5 (observability), the gg_recovery switch/pause/stats utility test, and finally
+# the SQL recovery-control test (gp_dr_switch / gp_dr_promote -> online read-write).
 set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
@@ -58,12 +58,27 @@ for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2
 #     create-replica restores each instance's base backup, frozen-seeds the
 #     DR-local topology into the coordinator (hostname 'dr'), gates on the WAL
 #     archive being complete enough to reach consistency, arms DR mode
-#     (gp_dr_replica + restore_command + dr_replica.signal + standby.signal) on
+#     (hot_standby + restore_command + standby.signal) on
 #     every node with the M3 pause target dr_rp1, and starts each in archive
 #     recovery.  This exercises the SAME code path an operator would run, instead
 #     of open-coding the restore/seed/arm/start inline. ---
 GG="python3 $SRC/gpMgmt/bin/gg_recovery"
 export PGPORT="$PORT_BASE" PGDATABASE=postgres
+
+# --- auxiliary-tooling gate: gg_walfilter black-box tests (against the
+#     installed binary; no cluster needed).  The in-backend redo filter is
+#     what protects the DR topology, but the shipped filtering tool must
+#     still pass its own suite before we bless the build. ---
+log "dr: running the gg_walfilter tests (black-box, installed binary) ..."
+if GG_WALFILTER="$(command -v gg_walfilter)" \
+	python3 "$SRC/src/test/dr/test_gg_walfilter.py" >/tmp/walfilter-test.log 2>&1; then
+	tail -2 /tmp/walfilter-test.log | sed 's/^/    walfilter-test: /'
+	log "dr: gg_walfilter tests PASSED"
+else
+	tail -20 /tmp/walfilter-test.log | sed 's/^/    walfilter-test: /'
+	die "gg_walfilter tests FAILED; refusing to build the DR cluster"
+fi
+
 log "dr: building the DR replica via 'gg_recovery create-replica' (M4) ..."
 set +e
 $GG create-replica \
@@ -325,9 +340,11 @@ if [ -n "$sok" ]; then
 		log "================ M5 OBSERVABILITY TEST: FAIL ($f5 of $((p5+f5)) failed) ================"
 	fi
 
-	# --- gg_recovery: the DR recovery-control utility (switch / follow / stats).
+	# --- gg_recovery: the DR recovery-control utility (switch / pause / stats).
 	#     The cluster is paused at dr_rp_straddle_done; drive it forward to
-	#     dr_rp_switch, then into continuous (follow) mode. ---
+	#     dr_rp_switch.  There is no 'follow' mode: a replica only ever serves
+	#     while paused at a restore point, which is the one cut with a
+	#     cross-node guarantee. ---
 	echo "================ gg_recovery: DR recovery-control utility ================"
 	p6=0; f6=0
 	ok6() { log "dr-test: PASS  $1"; p6=$((p6+1)); }
@@ -346,12 +363,10 @@ if [ -n "$sok" ]; then
 	r=$(dsp "select count(*) from gg_switch;")
 	[ "$r" = 5 ] && ok6 "gg_recovery switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \
 				 || no6 "gg_recovery switch: gg_switch = '$r' (expected 5)"
-	$GG follow >/dev/null 2>&1
-	sleep 4
-	if $GG stats 2>&1 | grep -q "consistent serve point: none"; then
-		ok6 "gg_recovery follow: continuous mode -- stats reports no consistent serve point"
+	if $GG stats 2>&1 | grep -q "consistent serve point: dr_rp_switch"; then
+		ok6 "gg_recovery stats: consistent serve point moved to dr_rp_switch"
 	else
-		no6 "gg_recovery follow: stats still reports a consistent serve point"
+		no6 "gg_recovery stats: did not report dr_rp_switch after the switch"
 	fi
 	echo "========================================================================="
 	if [ "$f6" -eq 0 ]; then
@@ -360,65 +375,77 @@ if [ -n "$sok" ]; then
 		log "================ gg_recovery TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
 	fi
 
-	# # --- gg_recovery promote: DR read-replica -> online read-write cluster.
-	# #     The cluster is currently FOLLOWING (from the follow test), so it has no
-	# #     consistent cut.  We pre-arm a switch to dr_rp_promote -- a distributed
-	# #     restore point the primary creates only AFTER we ask for it (via the
-	# #     dr_wants_promote_rp marker) -- so the free-running nodes catch it cleanly
-	# #     at a common cut, then promote the whole cluster there and prove it is
-	# #     online + writable (gp_dr_replica=off, distributed writes succeed). ---
-	# echo "================ gg_recovery promote: DR -> online read-write ================"
-	# p7=0; f7=0
-	# ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
-	# no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
-	# # switch arms the pause target (via ALTER SYSTEM) synchronously before it starts
-	# # polling; touching the marker on a short delay guarantees the pause is armed on
-	# # every node BEFORE the primary creates dr_rp_promote -- so no node overshoots it.
-	# ( sleep 5; touch "$ARCHIVE/dr_wants_promote_rp" ) &
-	# if $GG switch dr_rp_promote 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_promote'"; then
-	# 	ok7 "gg_recovery switch dr_rp_promote: all 3 nodes reached the promote cut (pre-armed while following)"
-	# else
-	# 	no7 "gg_recovery switch dr_rp_promote: did not reach on all nodes"
-	# fi
-	# if $GG promote --at dr_rp_promote --yes 2>&1 | tee /tmp/gg_promote.log | grep -q "promoted to online read-write"; then
-	# 	ok7 "gg_recovery promote: reported the cluster promoted to online read-write"
-	# else
-	# 	no7 "gg_recovery promote: did not report success"; tail -8 /tmp/gg_promote.log >&2
-	# fi
-	# # every node must now be OUT of recovery.
-	# outrec=0
-	# for nd in "${NODES[@]}"; do
-	# 	[ "$(PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_is_in_recovery();' 2>/dev/null)" = f ] && outrec=$((outrec+1))
-	# done
-	# [ "$outrec" = "${#NODES[@]}" ] && ok7 "gg_recovery promote: all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
-	# 							  || no7 "gg_recovery promote: only $outrec/${#NODES[@]} nodes out of recovery"
-	# # gp_dr_replica must be OFF now -- DR mode disengaged by the phase-2 restart.
-	# drg=$(PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc 'show gp_dr_replica;' 2>/dev/null)
-	# [ "$drg" = off ] && ok7 "gg_recovery promote: gp_dr_replica=off (DR mode disengaged)" \
-	# 				 || no7 "gg_recovery promote: gp_dr_replica='$drg' (expected off)"
-	# # the promoted cluster must accept a DISTRIBUTED write (FTS/DTX online). Poll:
-	# # FTS needs a probe cycle after the restart before dispatch is healthy.
-	# wok=
-	# for _ in $(seq 1 30); do
-	# 	if psql -p "$PORT_BASE" -d postgres -q -c \
-	# 		"create table gg_online_write (x int) distributed by (x); insert into gg_online_write values (1);" >/dev/null 2>&1; then wok=1; break; fi
-	# 	sleep 2
-	# done
-	# if [ -n "$wok" ] && [ "$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_online_write;' 2>/dev/null)" = 1 ]; then
-	# 	ok7 "gg_recovery promote: distributed WRITE succeeds on the promoted cluster (online read-write)"
-	# else
-	# 	no7 "gg_recovery promote: distributed write did NOT succeed after promote"
-	# fi
-	# # the data as-of the promote cut (dr_rp_promote) must be readable = 7 rows.
-	# r=$(psql -p "$PORT_BASE" -d postgres -Atc 'select count(*) from gg_promote;' 2>/dev/null)
-	# [ "$r" = 7 ] && ok7 "gg_recovery promote: data as-of dr_rp_promote is present (gg_promote=7)" \
-	# 			 || no7 "gg_recovery promote: gg_promote='$r' (expected 7)"
-	# echo "============================================================================="
-	# if [ "$f7" -eq 0 ]; then
-	# 	log "================ gg_recovery PROMOTE TEST: PASS ($p7/$((p7+f7))) ================"
-	# else
-	# 	log "================ gg_recovery PROMOTE TEST: FAIL ($f7 of $((p7+f7)) failed) ================"
-	# fi
+	# --- SQL recovery control: gp_dr_switch() / gp_dr_promote().
+	#     The same cluster-wide steps gg_recovery performs, but dispatched from
+	#     the coordinator, so a client that can only reach the coordinator can
+	#     drive recovery.  Both run here against the live DR: switch advances the
+	#     whole cluster to a fresh restore point, then promote cuts it there.
+	#     Promote is last because it is irreversible. ---
+	echo "================ SQL recovery control: gp_dr_switch / gp_dr_promote ================"
+	p7=0; f7=0
+	ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
+	no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
+
+	# ask production for a fresh restore point beyond dr_rp_switch, and wait for it
+	touch "$ARCHIVE/dr_wants_promote_rp"
+	for _ in $(seq 1 300); do [ -f "$ARCHIVE/promote_rp_ready" ] && break; sleep 2; done
+
+	r=$(dsp "select gp_dr_switch('dr_rp_promote', 300);")
+	[ "$r" = t ] && ok7 "gp_dr_switch('dr_rp_promote') returned true (whole cluster advanced from the coordinator)" \
+				 || no7 "gp_dr_switch returned '$r' (expected t)"
+	r=$(dsp "select consistent_restore_point from gp_stat_dr_replica_summary;")
+	[ "$r" = dr_rp_promote ] && ok7 "summary consistent_restore_point = dr_rp_promote after gp_dr_switch" \
+						  || no7 "summary consistent_restore_point = '$r' (expected dr_rp_promote)"
+	r=$(dsp "select count(*) from gg_promote;")
+	[ "$r" = 7 ] && ok7 "data as-of dr_rp_promote is visible (gg_promote=7)" \
+				 || no7 "gg_promote = '$r' (expected 7)"
+
+	# promote refuses when asked for a point the cluster is not at
+	r=$(dsp "select gp_dr_promote('not_this_one', 60);")
+	echo "$r" | grep -qi "not \"not_this_one\"\|paused at restore point" \
+		&& ok7 "gp_dr_promote refuses a mismatched --at ($(echo "$r" | grep -i ERROR | head -1))" \
+		|| no7 "gp_dr_promote did not refuse a mismatched restore point -> $r"
+
+	r=$(dsp "select gp_dr_promote(null, 300);")
+	[ "$r" = t ] && ok7 "gp_dr_promote() returned true (cluster promoted at dr_rp_promote)" \
+				 || no7 "gp_dr_promote returned '$r' (expected t)"
+
+	# every node must now be OUT of recovery -- and DR mode lifts with it, no restart.
+	# Poll: promotion is asynchronous per node, and the coordinator additionally
+	# runs distributed-transaction recovery before it accepts connections again.
+	outrec=0
+	for _ in $(seq 1 60); do
+		outrec=0
+		for nd in "${NODES[@]}"; do
+			[ "$(PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_is_in_recovery();' 2>/dev/null)" = f ] && outrec=$((outrec+1))
+		done
+		[ "$outrec" = "${#NODES[@]}" ] && break
+		sleep 2
+	done
+	[ "$outrec" = "${#NODES[@]}" ] && ok7 "all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
+								  || no7 "only $outrec/${#NODES[@]} nodes out of recovery"
+	for _ in $(seq 1 30); do r=$(dsp "select dr_replica from gp_stat_dr_replica where gp_segment_id = -1;"); [ "$r" = f ] && break; sleep 2; done
+	[ "$r" = f ] && ok7 "dr_replica=f without any restart (mode is keyed on recovery, not a GUC)" \
+				 || no7 "dr_replica = '$r' after promotion (expected f)"
+
+	# the promoted cluster must accept a DISTRIBUTED write; FTS needs a probe cycle first.
+	wok=
+	for _ in $(seq 1 30); do
+		if psql -p "$PORT_BASE" -d postgres -q -c \
+			"create table gg_online_write (x int) distributed by (x); insert into gg_online_write values (1);" >/dev/null 2>&1; then wok=1; break; fi
+		sleep 2
+	done
+	if [ -n "$wok" ] && [ "$(dsp 'select count(*) from gg_online_write;')" = 1 ]; then
+		ok7 "distributed WRITE succeeds on the promoted cluster (online read-write)"
+	else
+		no7 "distributed write did NOT succeed after promote"
+	fi
+	echo "==================================================================================="
+	if [ "$f7" -eq 0 ]; then
+		log "================ SQL RECOVERY-CONTROL TEST: PASS ($p7/$((p7+f7))) ================"
+	else
+		log "================ SQL RECOVERY-CONTROL TEST: FAIL ($f7 of $((p7+f7)) failed) ================"
+	fi
 fi
 
 exec sleep infinity

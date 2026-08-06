@@ -549,17 +549,6 @@ IndexCheckType gp_indexcheck_insert = INDEX_CHECK_NONE;
 struct config_bool ConfigureNamesBool_gp[] =
 {
 	{
-		{"gp_dr_replica", PGC_POSTMASTER, CUSTOM_OPTIONS,
-			gettext_noop("Marks this node as a read-only disaster-recovery (DR) replica."),
-			gettext_noop("When on, the node runs in DR mode: read-only enforcement plus the apply-time topology redo filter. Disabled on promotion."),
-			GUC_NOT_IN_SAMPLE
-		},
-		&gp_dr_replica,
-		false,
-		NULL, NULL, NULL
-	},
-
-	{
 		{"maintenance_mode", PGC_POSTMASTER, CUSTOM_OPTIONS,
 			gettext_noop("Maintenance Mode"),
 			NULL,

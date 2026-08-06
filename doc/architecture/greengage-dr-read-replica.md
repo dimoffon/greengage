@@ -77,7 +77,7 @@ The implementation is organized as milestones; this document is structured aroun
 | M3 | Consistent reads (restore-point-gated, as-of-N snapshot) | §4.5, §5 |
 | M4 | Build a DR replica (`gg_recovery create-replica`) | §6.1 |
 | M5 | Observability (`gp_stat_dr_replica`, `pg_last_paused_restore_point`) | §4.6 |
-| M6 | Promotion (`gg_recovery promote`) | §6.3 |
+| M6 | Promotion (`gg_recovery promote`, `gp_dr_promote()`) | §6.3, §6.4 |
 
 ---
 
@@ -97,7 +97,7 @@ The implementation is organized as milestones; this document is structured aroun
      TwophaseCommitLock; every                                      │ • pause replay at restore point N │
      node writes XLOG_RESTORE_POINT                                 └───────────────┬───────────────────┘
                                                                      gg_recovery drives the whole cluster
-                                                                     as one: switch / follow / pause /
+                                                                     as one: switch / pause /       
                                                                      stats / promote / create-replica
 ```
 
@@ -109,9 +109,11 @@ The implementation is organized as milestones; this document is structured aroun
 - **DR-local topology**, protected from replayed WAL by the apply-time redo filter (§4.2).
 - **Read-only** end-to-end (§4.3), enforced with a DR-specific error, but still able to
   **dispatch distributed reads** to segments in recovery (§4.4).
-- **Restore-point-gated consistency** (§4.5): the cluster pauses replay at a distributed
-  restore point *N* and serves an **as-of-N** distributed snapshot — a transactionally
-  consistent cut, not a `min(replay_lsn)` approximation.
+- **Restore-point-gated consistency** (§4.5): the cluster recovers **up to** a distributed
+  restore point *N*, pauses there, and serves an **as-of-N** distributed snapshot — a
+  transactionally consistent cut, not a `min(replay_lsn)` approximation. This is the *only*
+  serving state; there is no free-running mode, because no other cut has a cross-node
+  guarantee to offer.
 - **Promote in place** to an online read-write cluster (§6.3).
 
 ### 2.2 Component inventory — DR-new vs. reused
@@ -121,10 +123,11 @@ Being explicit about provenance matters for maintenance:
 **DR-new code** (2026 commits on `7.x-dr`):
 
 - `IsDRReplicaMode()` + the M1 topology redo filter (`dr_redo_filter.c`).
-- M2 read-only enforcement + `hot_standby` auto-enable.
+- M2 read-only enforcement.
 - The `DTX_CONTEXT_QD_STANDBY_READER` distributed-transaction context.
 - The M3 as-of-N distributed snapshot builder `CreateDRStandbyDistributedSnapshot()`.
 - The M5 served-restore-point accessor + `gp_stat_dr_replica` views.
+- The `gp_dr_switch()` / `gp_dr_promote()` recovery-control functions (§6.4).
 - The `gg_recovery` / `gpseed_dr_topology` utilities.
 
 **Reused upstream Greengage hot-standby dispatch** (commit `35e95b9c`, 2023, *"Enable hot
@@ -156,33 +159,45 @@ static snapshot and the upstream dispatch suffices — see §5.5.)
 
 ## 4. How it is implemented
 
-### 4.1 The DR-mode gate
+### 4.1 The DR-mode gate — hot standby *is* DR mode
 
 Everything keys off one predicate:
 
 ```c
-bool IsDRReplicaMode(void);   /* src/backend/access/transam/xlog.c:5597-5623 */
+bool
+IsDRReplicaMode(void)          /* src/backend/access/transam/xlog.c */
+{
+    return EnableHotStandby && RecoveryInProgress();
+}
 ```
 
-It returns true **iff both**:
+There is **no separate DR mode**. Enabling `hot_standby` on a node in recovery gives it the
+whole DR behaviour: the apply-time topology redo filter (§4.2), read-only enforcement
+(§4.3), and the standby distributed-read path (§4.4). Earlier revisions carried a
+`gp_dr_replica` GUC plus a `dr_replica.signal` marker alongside `hot_standby`; both are
+gone.
 
-1. the **`gp_dr_replica`** GUC is on — a `PGC_POSTMASTER` boolean, default `false`
-   (`guc_gp.c:551-559`; variable `cdbvars.c:337`; name registered in
-   `unsync_guc_name.h:147`); and
-2. the **`dr_replica.signal`** marker file exists in the data directory
-   (`DR_REPLICA_SIGNAL_FILE`, `xlog.h:404`).
+**Why fold rather than add a mode.** Stock hot standby has little practical use in
+Greengage on its own — the only standbys in a cluster are mirrors and the standby
+coordinator, and querying those loads the very hosts they exist to protect, while an FTS
+failover onto a mirror strands the sessions reading it. Rather than carry a second,
+near-identical mode beside it, `hot_standby` is repurposed to mean the thing that *is*
+useful: a queryable, read-only, topology-independent replica.
 
-Requiring **both** is deliberate: promotion removes the marker, so DR mode disengages even
-if the GUC value lingers in a config file until the next restart. The marker is detected at
-startup in `readRecoverySignalFile()` (`xlog.c:5490`, sets the flag at `xlog.c:5554-5561`)
-alongside `standby.signal`; because a backend forks from the postmaster and never runs
-recovery itself, `IsDRReplicaMode()` lazily `stat()`s and caches the marker on first use in
-a backend.
+Three consequences are worth stating explicitly:
 
-**`hot_standby` is auto-enabled.** So the operator never has to set it, the postmaster
-forces `EnableHotStandby = true` when `gp_dr_replica` is set and the marker is present
-(`postmaster.c:1091-1101`). It `stat()`s the marker directly there because the startup
-child's flag is not yet visible in the postmaster.
+- **It follows recovery, not configuration.** The predicate goes false the moment recovery
+  ends, so promotion disengages DR behaviour by itself — no restart, no GUC to unset, no
+  marker to delete. This is what removed the old two-phase promote (§6.3).
+- **It is visible everywhere without plumbing.** `EnableHotStandby` is a `PGC_POSTMASTER`
+  GUC, so the startup process (which runs the redo filter) and every backend (which runs the
+  read-only enforcement) see the same value. The old design needed a lazily-`stat()`ed,
+  per-backend cache of the marker file precisely because a backend never runs recovery.
+- **`hot_standby` defaults to `off`**, so ordinary mirrors and the standby coordinator are
+  unaffected. **Do not turn it on for them.** The topology filter would freeze their
+  `gp_segment_configuration`, and a later FTS failover (or `gpactivatestandby`) would promote
+  a node describing a stale cluster. `hot_standby = on` means *"this node is a separate DR
+  cluster"*.
 
 ### 4.2 M1 — Topology independence
 
@@ -194,10 +209,20 @@ production's WAL.
 In the redo loop, before dispatching a record to its resource-manager `rm_redo`:
 
 ```c
-/* src/backend/access/transam/xlog.c:7727-7728 */
+/* src/backend/access/transam/xlog.c:7730-7742 */
 if (!DRRedoShouldFilter(xlogreader))
+{
     RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+
+    if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+        checkXLogConsistency(xlogreader);
+}
 ```
+
+The consistency check (`wal_consistency_checking` on production sets
+`XLR_CHECK_CONSISTENCY` on records) is skipped **together with** redo: a filtered
+record's pages were deliberately left untouched, so comparing them against
+production's page images would spuriously `FATAL`.
 
 `DRRedoShouldFilter()` (`src/backend/access/transam/dr_redo_filter.c:195-225`):
 
@@ -253,16 +278,75 @@ Because those pages are frozen **and** the redo filter blocks production's recor
 overwriting them, the DR-local topology persists through replay. The frozen tuples are
 what make the DR cluster genuinely describe itself.
 
-#### 4.2.3 Protecting against topology-catalog rewrites
+#### 4.2.3 Records that name a relation in the payload, not in a block tag
 
-If production ever `VACUUM FULL` / `CLUSTER` / `REINDEX` / `TRUNCATE`s a protected catalog,
-its relfilenode changes and a shared relmap update is WAL-logged. There is **no
-preemptive block on the production side**. Instead the DR replica **halts reactively**:
-`relmap_redo()` (`relmapper.c:1032-1048`) calls `DRRejectForbiddenRemap()`
-(`dr_redo_filter.c:138-158`), which `ereport(FATAL)`s if an incoming mapping would change a
-protected catalog's relfilenode — halting the postmaster *before* any on-disk write, so the
-replay LSN does not advance past the offending record. The fix is to re-create that DR node
-from a fresh base backup. (This is a documented contract limitation, §9.)
+`DRRedoShouldFilter()` decides from a record's *block references*, so a record that names its
+relation only in its payload is invisible to it — and is always applied, since that is also
+the shape of a commit record. Two such record types touch the protected catalogs, and each
+gets its own guard.
+
+**Relfilenode rewrites → halt.** If production ever `VACUUM FULL` / `CLUSTER` / `REINDEX` /
+`TRUNCATE`s a protected catalog, its relfilenode changes and a shared relmap update is
+WAL-logged. There is **no preemptive block on the production side**. Instead the DR replica
+**halts reactively**: `relmap_redo()` (`relmapper.c:1032-1048`) calls
+`DRRejectForbiddenRemap()` (`dr_redo_filter.c:138-158`), which `ereport(FATAL)`s if an
+incoming mapping would change a protected catalog's relfilenode — halting the postmaster
+*before* any on-disk write, so the replay LSN does not advance past the offending record.
+The fix is to re-create that DR node from a fresh base backup. (This is a documented
+contract limitation, §9.)
+
+**Heap truncation → skip.** A plain `VACUUM` that frees trailing pages of a protected
+catalog emits `XLOG_SMGR_TRUNCATE`, which carries its `RelFileNode` in `xl_smgr_truncate`
+and registers no buffers. Applied blindly it would truncate the DR's *own* file — the one
+holding the frozen-seeded DR-local rows, whose page count legitimately differs from
+production's, because the seed's re-inserted rows can land on a block production has since
+freed. `smgr_redo()` therefore consults `DRRedoShouldFilterRelFileNode()`
+(`dr_redo_filter.c:186-217`, call site `storage.c:698-715`) and **skips the truncation**,
+logging it at `LOG`.
+
+The asymmetry is deliberate. An ignored truncation has no lasting consequence: the node
+keeps its own pages, the protected set still resolves to the same filenode, and replay
+continues correctly. A remap is different — it repoints the catalog at a filenode the
+protected set no longer covers, so the filter would silently stop protecting it from then
+on. Unrecoverable divergence earns a `FATAL`; a harmless one does not, and halting every DR
+node on a routine production autovacuum would be a far worse failure than the one being
+prevented.
+
+#### 4.2.4 Auxiliary tooling: `gg_walfilter` (src/bin)
+
+`gg_walfilter` (`src/bin/gg_walfilter/`, a C frontend program installed into
+`$GPHOME/bin`) is a **record-level WAL filter for archived segments**: it rewrites
+selected records into same-length `XLOG_NOOP` records (the walbouncer technique) with
+the CRC recomputed, so framing, LSNs and xid tracking stay intact while the record's
+redo becomes a no-op. It is **not part of the default DR data path** — the in-backend
+redo filter above is the engine invariant that protects the topology — but it ships
+with the server for:
+
+- **offline inspection** — `gg_walfilter inspect <segment>` reports, per record, what
+  a rule set would filter and why (`--gp-dr-topology` selects the DR preset);
+- **offline filtering** — `gg_walfilter filter` neutralizes matching records in local
+  segment files (generic rules: `--exclude-relfilenode`, `--exclude-database`,
+  `--exclude-tablespace`, `--protect-mapped-oid`), e.g. for partial replicas or
+  redacted WAL hand-offs;
+- **opt-in restore-path filtering** — `gg_walfilter restore` is a full
+  `restore_command` entry point (fetch → filter → atomically install, with
+  boundary-continuation state and deterministic archive lookback), for deployments
+  that want filtering *outside* the engine.
+
+Its filter decision is intentionally identical to the engine's, and tracks **both** of the
+engine's rules (§4.2.3): rewrite iff the record has ≥1 block reference and every one matches
+a rule (`DRRedoShouldFilter()`), **or** it is an `XLOG_SMGR_TRUNCATE` whose payload
+`RelFileNode` matches (`DRRedoShouldFilterRelFileNode()`, `wf_truncate_target()` /
+`wf_truncate_matches()` in `filter.c`). Keeping the two in step is the point of the tool:
+`inspect` is only useful if it predicts what a DR node will actually do with the WAL. Where
+the tool cannot resolve a truncate's target from the segment in hand — the record's leading
+bytes land past the segment end — it fails closed under the DR preset rather than let an
+unidentified truncation through, the same posture it takes for a boundary-spanning relmap
+update.
+
+History: an earlier revision of this branch used `gg_walfilter` (then a Python script) *as*
+the default topology-protection mechanism via `restore_command` (ADR-0002); ADR-0003 restored
+the in-backend filter as the default and kept the tool, ported to C, as tooling.
 
 ### 4.3 M2 — Read-only enforcement
 
@@ -568,14 +652,23 @@ What it does, in order (`cmd_create_replica`):
    aside, run `gpseed_dr_topology` (§4.2.2), then **restore** the saved recovery-start state
    so recovery resumes from the backup checkpoint, and **re-fetch** any backup-tail WAL
    segment from the archive over `pg_wal` (so the seed's WAL can never win over the archive).
-5. **Arm DR mode** on every node: empty `postgresql.auto.conf`; append `gp_dr_replica = on`,
+5. **Arm the replica** on every node: empty `postgresql.auto.conf`; append `hot_standby = on`,
    `restore_command`, `recovery_target_timeline = 'current'`, and (if `--pause-at`) the
-   pause GUC; create `dr_replica.signal` + `standby.signal`.
+   pause GUC; create `standby.signal`. `hot_standby = on` is the whole switch — there is no
+   separate DR GUC or marker file (§4.1).
 6. **Start** each node in archive recovery (`pg_ctl`, coordinator in `gp_role=dispatch`,
    segments in `gp_role=execute`) and poll until all accept read connections.
+7. **Post-build topology check** (`_check_seeded_topology()`): read the coordinator's
+   `gp_segment_configuration` back and require it to describe *this* cluster — one row per
+   topology entry, matching `dbid`/`content`/`port`/`hostname`. A silent seed failure would
+   leave the replica describing production, so a mismatch **fails the build** rather than
+   surfacing later as confusing symptoms. The check also reports the catalog's heap size and
+   the block its live rows landed on: above block 0 means this node's topology depends on the
+   §4.2.3 truncation guard, which is worth knowing at a glance. Only the coordinator is
+   checked, because only the coordinator is seeded.
 
-At the end the DR cluster is live in recovery, refusing writes, and (with `--pause-at`)
-paused at a consistent restore point ready to serve as-of-N reads.
+At the end the DR cluster is live in recovery, refusing writes, verified to describe itself,
+and (with `--pause-at`) paused at a consistent restore point ready to serve as-of-N reads.
 
 ### 6.2 Start / drive replication
 
@@ -586,15 +679,17 @@ controls *how far* the cluster replays and whether it exposes a consistent cut:
 # Advance the whole cluster to a new consistent restore point and pause there:
 gg_recovery switch rp_hourly_42        # → every node paused at rp_hourly_42 (as-of-N cut)
 
-# Continuous mode (freshest reads, NO cross-node consistent cut):
-gg_recovery follow                     # clear the pause target, free-run to end-of-WAL
-
 # Immediately halt replay on every node at wherever it is (NOT a consistent cut):
 gg_recovery pause
 
 # Inspect:
 gg_recovery stats
 ```
+
+There is deliberately **no free-running mode**. A replica only ever serves while paused at a
+restore point: that is the one cut taken under `TwophaseCommitLock`, and therefore the only
+one where the segments agree. Reads taken while replay advances have no cross-node guarantee
+to offer, so the mode was removed rather than shipped with a caveat.
 
 `switch <rp>` is the workhorse: it re-points the pause target on every node
 (`ALTER SYSTEM` + reload), resumes replay, and waits until **all** nodes are paused at
@@ -621,15 +716,50 @@ gg_recovery promote --at rp_failover_point  # promote there; --yes to skip the p
   **segments first, then the coordinator**, polling each out of recovery. This rides the
   `reachedContinuousRecoveryTarget` → `RECOVERY_TARGET_ACTION_PROMOTE` hook, so recovery ends
   exactly after N.
-- **Phase 2 — disengage DR mode.** `gp_dr_replica` is `PGC_POSTMASTER`, so it (and the
-  cached `dr_replica.signal`) only lift on restart: `ALTER SYSTEM SET gp_dr_replica = off`,
-  stop each node, remove `dr_replica.signal` + `standby.signal`, and restart **segments
-  first, then the coordinator** (so the coordinator's freshly-started FTS probes live
-  segments). `--no-restart` stops after phase 1 for demo/inspection (nodes out of recovery
-  but still DR-read-only until restart).
+- **There is no phase 2.** DR behaviour is keyed on "in recovery with hot standby"
+  (§4.1), so it disengages the instant recovery ends. The old design needed a second phase —
+  stop every node, clear the markers, `ALTER SYSTEM SET gp_dr_replica = off`, restart — purely
+  because that GUC was `PGC_POSTMASTER`. Removing the mode removed the restart with it.
 
 After promotion `IsDRReplicaMode()` is false, writes succeed, and FTS/DTX run normally.
 Promotion is **irreversible** (recovery only moves forward).
+
+The same cut can be taken from SQL with `gp_dr_promote()` (§6.4), which is what a client
+that can reach only the coordinator would use.
+
+### 6.4 Driving recovery from SQL
+
+Everything above is also available as SQL, dispatched cluster-wide from the coordinator, so
+a client that can reach only the coordinator can drive a DR replica without shell access to
+each host:
+
+| Function | Purpose |
+|---|---|
+| `gp_dr_switch(restore_point text, timeout_seconds int)` → `bool` | Re-point every node's pause target at `restore_point`, resume replay, and wait until all of them are paused there. Returns `true` at the consistent cut, `false` on timeout (the arming has still been applied — keep watching `gp_stat_dr_replica_summary`). |
+| `gp_dr_promote(at_restore_point text, timeout_seconds int)` → `bool` | Promote the whole cluster at its current consistent restore point. Refuses unless every node is paused at one point, equal to `at_restore_point` when given. Irreversible. |
+
+Status has no function of its own: `gp_stat_dr_replica` and `gp_stat_dr_replica_summary`
+(§4.6) already report it cluster-wide, and duplicating them as a function would only create
+a second thing to keep in step.
+
+```sql
+SELECT gp_dr_switch('rp_hourly_43', 300);   -- advance the cluster, wait for the cut
+SELECT * FROM gp_stat_dr_replica_summary;   -- confirm consistent_restore_point
+SELECT gp_dr_promote(NULL, 300);            -- promote here
+```
+
+Both are superuser-only, must run on the coordinator in dispatch mode, and refuse outright
+on a cluster that is not in recovery. Each applies its step to every primary segment with
+`CdbDispatchCommand()` and to the coordinator through SPI, so the two legs take the same
+path a client would. The steps themselves are the same ones `gg_recovery` performs —
+`ALTER SYSTEM` on the pause GUC, `pg_reload_conf()`, `pg_wal_replay_resume()`, and for
+promotion `pg_promote(false)` — and they are legal in recovery because none of them writes
+WAL: `ALTER SYSTEM` writes `postgresql.auto.conf` and the rest touch shared memory only.
+
+Ordering matters in both, and is the reason these are functions rather than a documented
+recipe: `switch` must re-point *before* resuming, or a node free-runs past the target to the
+end of the WAL; `promote` must reach the segments before the coordinator, so the
+coordinator's FTS finds them live when it starts probing.
 
 ---
 
@@ -643,8 +773,7 @@ recovery, treating the whole cluster (coordinator + every primary segment) as on
 Run it **on the DR coordinator host**. The coordinator is reached through the standard
 libpq environment (`PGPORT`, default 7000; `PGDATABASE`, default `postgres`); the node list
 and each segment's port come from the DR's own `gp_segment_configuration` (`role='p'`). All
-connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`/`follow`/
-`stats` keep working even when there is no consistent serve point.
+connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`/`stats` keep working even when there is no consistent serve point.
 
 > **PoC scope:** every node is reached by its **local socket** on this host (single-host
 > demo). A multi-host deployment needs per-segment `pg_hba`/ssh or one invocation per host;
@@ -656,7 +785,6 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 |---------|---------|
 | `switch <restore_point>` | Stop-and-go: re-point every node to `<restore_point>`, resume, and wait until **all** are paused there (a consistent as-of-N cut). |
 | `pause` | Immediately pause replay on every node at its current point. **Not** a consistent cut. |
-| `follow` | Continuous recovery: clear the pause target everywhere and free-run to end-of-WAL. Freshest reads, no consistent cut. |
 | `stats` | Per-node recovery statistics + a cluster summary (mode, consistent serve point, RPO). |
 | `promote [--at <rp>] [--no-restart] [--yes] [--timeout <s>]` | Promote the DR cluster to online read-write at a single consistent restore point. Irreversible. |
 | `create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir> [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]` | Build the whole DR replica from per-instance base backups (§6.1). |
@@ -678,8 +806,6 @@ $ gg_recovery stats
 # Advance the whole cluster to the next hourly restore point (consistent cut):
 $ gg_recovery switch rp_hourly_43
 
-# Switch heavy reporting off a stable older point, run continuous otherwise:
-$ gg_recovery follow
 
 # Planned switchover:
 $ gg_recovery switch  rp_failover
@@ -752,8 +878,7 @@ $ gg_recovery create-replica \
   only `switch <rp>` (all nodes at the same restore point) is safe to serve consistent
   reads or to promote from.
 - **`switch`/`promote` only move forward.** You cannot switch back to an earlier restore
-  point; once `follow` has drained past a point, re-`switch`ing to it will time out. Reach a
-  fresh consistent cut with a restore point that is still ahead.
+  point. Reach a fresh consistent cut with a restore point that is still ahead.
 
 **Topology filter**
 
@@ -761,6 +886,11 @@ $ gg_recovery create-replica \
   halts the DR.** It is caught reactively as a `FATAL` in `relmap_redo`
   (`DRRejectForbiddenRemap`), *not* blocked on production. Recovery is to re-base-backup +
   re-seed that DR node. Treat these catalogs as immutable while a DR replica is attached.
+- **Plain `VACUUM` truncation of a protected catalog is skipped, not fatal** (§4.2.3). The
+  DR's copy of these catalogs legitimately has a different page count from production's,
+  because the seed's re-inserted rows may sit on a block production later frees; applying
+  production's truncation would discard them. This was a real defect — the guard in
+  `smgr_redo` was added after the payload-vs-block-tag gap was found; see scenario V-20.
 - **The filter reduces WAL *apply*, not WAL *volume*.** Topology records are tiny; the
   filter does not save bandwidth. Bandwidth is a `wal_compression` / relay concern.
 - **Frozen-seed footprint (bounded, self-healing).** `VACUUM FREEZE` of
@@ -812,10 +942,9 @@ $ gg_recovery create-replica \
 
 | Area | Location |
 |------|----------|
-| DR mode gate | `IsDRReplicaMode()` `xlog.c:5597-5623`; decl `xlog.h:319`; marker `DR_REPLICA_SIGNAL_FILE` `xlog.h:404`; startup detect `xlog.c:5490,5554-5561` |
-| `gp_dr_replica` GUC | `guc_gp.c:551-559` (`PGC_POSTMASTER`); var `cdbvars.c:337`; name `unsync_guc_name.h:147` |
-| hot_standby auto-enable | `postmaster.c:1091-1101` |
-| Redo filter | `dr_redo_filter.c` (`DRRedoShouldFilter` :195-225, protected OIDs :43-52, resolve :71-104, match :164-183, remap-reject :138-158); dispatch `xlog.c:7727-7728`; header `dr_redo_filter.h:32-49`; remap redo `relmapper.c:1032-1048` |
+| DR mode gate | `IsDRReplicaMode()` = `EnableHotStandby && RecoveryInProgress()`, `xlog.c`; decl `xlog.h` |
+| Redo filter | `dr_redo_filter.c` (`DRRedoShouldFilter` :229-259, protected OIDs :43-52, resolve :71-104, match :164-183, remap-reject :138-158, `DRRedoShouldFilterRelFileNode` :207-217); dispatch + consistency-check skip `xlog.c:7730-7742`; header `dr_redo_filter.h:32-56`; remap redo `relmapper.c:1032-1048`; smgr truncate guard `storage.c:698-715` |
+| WAL-filter tool (auxiliary) | `src/bin/gg_walfilter/` (`gg_walfilter.c` CLI, `segment.c` walker/decoder, `filter.c` rules + NOOP rewrite + lookback, `state.c` boundary state, `fetch.c` fetch/install); tests `src/test/dr/test_gg_walfilter.py` (black-box) |
 | Frozen seed | `gpMgmt/bin/gpseed_dr_topology` |
 | Read-only enforcement | `execMain.c:1651-1660`; DTM backstop `cdbtm.c:281-284` |
 | FTS/autovac (structural) | `postmaster.c:6545-6578` (bgworker), `postmaster.c:2132-2134` (autovac) |
@@ -827,13 +956,14 @@ $ gg_recovery create-replica \
 | Served-N accessor | `pausedRestorePointName` `xlog.c:773` (capture :6005-6008, clear :6246); `GetPausedRestorePointName()` `xlog.c:6390-6396`; `pg_last_paused_restore_point()` `xlogfuncs.c:606-615` (OID 7016) |
 | Views | `system_views.sql:1542-1573` (`gp_stat_dr_replica`, `gp_stat_dr_replica_summary`, `pg_catalog`) |
 | Distributed barrier | `gp_create_restore_point()` `xlogfuncs_gp.c:35` (barrier :89-100) |
+| SQL recovery control | `gp_dr_switch()` / `gp_dr_promote()` + helpers `xlogfuncs_gp.c`; catalog `pg_proc.dat` OIDs 7017/7018 |
 | Utility | `gpMgmt/bin/gg_recovery` |
 
 ### 10.2 GUCs
 
 | GUC | Context | Default | Role |
 |-----|---------|---------|------|
-| `gp_dr_replica` | `PGC_POSTMASTER` | `false` | Marks a DR replica; drives read-only enforcement + redo filter. Set off on promotion. |
+| `hot_standby` | `PGC_POSTMASTER` | `false` | On a node in recovery, makes it a DR replica: read-only enforcement, topology redo filter, standby distributed read. Disengages with recovery. |
 | `gp_pause_on_restore_point_replay` | `PGC_SUSET` | `''` | Pause replay when the named restore point is replayed; re-point + resume to advance. |
 
 ### 10.3 Catalog / function objects
@@ -842,13 +972,24 @@ $ gg_recovery create-replica \
 - `gp_stat_dr_replica` (view, `pg_catalog`) — per-node recovery state.
 - `gp_stat_dr_replica_summary` (view, `pg_catalog`) — cluster rollup incl.
   `consistent_restore_point`, `rpo_seconds`.
+- `gp_dr_switch(text, int4)` → `bool` (OID 7017) — advance the cluster to a restore point.
+- `gp_dr_promote(text, int4)` → `bool` (OID 7018) — promote at the current cut.
 
 ### 10.4 Test fixture
 
 `src/test/dr/` — a two-container fixture (production + DR sharing an `/archive` volume) that
 builds the DR via `gg_recovery create-replica` and exercises M1/M2/M2′/M3/M5 plus
-`gg_recovery` `switch`/`follow`/`stats`/`promote` end-to-end
+`gg_recovery` `switch`/`pause`/`stats` plus the SQL control functions end-to-end
 (`docker-compose -f src/test/dr/docker-compose.yml up --build`).
+
+`src/test/dr/docker-compose.dense.yml` — a second, opt-in fixture for the §4.2.3 truncation
+guard: it densifies production's `gp_segment_configuration` before the base backup so the
+DR's seed lands its rows on a trailing block, then vacuums production to emit the truncation.
+Run against a guarded and an unguarded build it reports `TOPOLOGY SURVIVED` vs.
+`TOPOLOGY DESTROYED`. See `src/test/dr/README.md`.
+
+Scenario catalogue: [`greengage-dr-test-scenarios.md`](greengage-dr-test-scenarios.md) —
+what to test, what is already automated, and the expected behaviour of each corner case.
 
 ### 10.5 Related design notes (repo root)
 

@@ -699,7 +699,6 @@ extern int	gp_autostats_mode;
 extern int	gp_autostats_mode_in_functions;
 
 /* Disaster Recovery (DR) read-replica mode */
-extern bool gp_dr_replica;
 extern int	gp_autostats_on_change_threshold;
 extern bool	gp_autostats_allow_nonowner;
 extern bool	log_autostats;

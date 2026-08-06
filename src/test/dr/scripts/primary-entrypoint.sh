@@ -166,10 +166,10 @@ log "primary: gg_recovery target dr_rp_switch (gg_switch=5) created + archived"
 
 # --- gg_recovery promote target: a FINAL distributed restore point dr_rp_promote,
 #     created only AFTER the DR has armed its pause for it (marker
-#     $ARCHIVE/dr_wants_promote_rp).  The DR is FOLLOWING continuously by then, so
-#     creating dr_rp_promote after the pause is armed lets the DR catch it at a
-#     clean cross-node cut instead of overshooting -- giving the promote test a
-#     fresh consistent restore point to promote the whole cluster at. ---
+#     $ARCHIVE/dr_wants_promote_rp).  The DR is paused at dr_rp_switch by then and
+#     asks for this point before advancing to it, so it always lands on a clean
+#     cross-node cut -- giving the promote test a fresh consistent restore point
+#     to promote the whole cluster at. ---
 log "primary: waiting for the DR to request the promote restore point ..."
 for _ in $(seq 1 600); do [ -f "$ARCHIVE/dr_wants_promote_rp" ] && break; sleep 2; done
 psql -p "$PORT_BASE" -d postgres -q -c \

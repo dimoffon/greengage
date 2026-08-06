@@ -305,8 +305,6 @@ bool		InArchiveRecovery = false;
 
 static bool standby_signal_file_found = false;
 static bool recovery_signal_file_found = false;
-static bool dr_replica_signal_file_found = false;
-static bool dr_replica_signal_file_checked = false;
 
 /* Was the last xlog file restored from archive, or local? */
 static bool restoredFromArchive = false;
@@ -5544,21 +5542,6 @@ readRecoverySignalFile(void)
 		recovery_signal_file_found = true;
 	}
 
-	/*
-	 * Greengage DR: an independent marker that this node is a read-only
-	 * disaster-recovery replica.  It does not influence the standby-vs-recovery
-	 * decision below; it only records that DR mode was requested at startup.
-	 * The apply-time topology redo filter and read-only enforcement key off
-	 * gp_dr_replica together with this marker, which is removed on promotion.
-	 */
-	if (stat(DR_REPLICA_SIGNAL_FILE, &stat_buf) == 0)
-	{
-		dr_replica_signal_file_found = true;
-		ereport(LOG,
-				(errmsg("disaster-recovery replica marker file \"%s\" found",
-						DR_REPLICA_SIGNAL_FILE)));
-	}
-	dr_replica_signal_file_checked = true;
 
 	StandbyModeRequested = false;
 	ArchiveRecoveryRequested = false;
@@ -5588,38 +5571,32 @@ readRecoverySignalFile(void)
 /*
  * Greengage DR: is this node running as a read-only disaster-recovery replica?
  *
- * True when the gp_dr_replica GUC is on AND the dr_replica.signal marker was
- * present at startup.  Requiring both is deliberate: the create utility sets
- * them together, and promotion removes the marker so DR mode disengages even
- * if the GUC lingers in postgresql.auto.conf.  Callers that only care during
- * WAL replay should additionally check RecoveryInProgress().
+ * True on a node that is in recovery with hot standby enabled.
+ *
+ * Hot standby *is* the disaster-recovery replica mode: rather than carry a
+ * second mode alongside it, enabling hot standby gives a node the whole DR
+ * behaviour -- the apply-time topology redo filter (dr_redo_filter.c), read-only
+ * enforcement, and the standby distributed-read path.  Stock hot standby on its
+ * own has little practical use in Greengage (querying a mirror loads the
+ * production host it is meant to protect, and a failover to that mirror strands
+ * the session), so the mode is repurposed rather than duplicated.
+ *
+ * Consequences worth knowing:
+ *
+ *   * It follows recovery, not configuration.  The moment recovery ends the
+ *     predicate goes false, so promotion disengages DR behaviour immediately --
+ *     no restart, and nothing to unset.
+ *
+ *   * hot_standby defaults to off, so ordinary mirrors and the standby
+ *     coordinator are unaffected.  Do NOT turn it on for them: the topology
+ *     filter would freeze their gp_segment_configuration, and an FTS failover
+ *     (or gpactivatestandby) would then promote a node describing a stale
+ *     cluster.  hot_standby = on means "this node is a separate DR cluster".
  */
 bool
 IsDRReplicaMode(void)
 {
-	if (!gp_dr_replica)
-		return false;
-
-	/*
-	 * The dr_replica.signal marker is detected eagerly in the startup process
-	 * (readRecoverySignalFile), but a backend forks from the postmaster and
-	 * never runs recovery, so its copy of dr_replica_signal_file_found would
-	 * stay false and the read-only enforcement guards (which run in backends)
-	 * would be silent no-ops.  Determine the marker here on first use and cache
-	 * it; it lives in the data directory, which is every backend's working
-	 * directory, and is stable for the life of the process (promotion, which
-	 * removes it, restarts the cluster).
-	 */
-	if (!dr_replica_signal_file_checked)
-	{
-		struct stat stat_buf;
-
-		dr_replica_signal_file_found =
-			(stat(DR_REPLICA_SIGNAL_FILE, &stat_buf) == 0);
-		dr_replica_signal_file_checked = true;
-	}
-
-	return dr_replica_signal_file_found;
+	return EnableHotStandby && RecoveryInProgress();
 }
 
 static void
@@ -7722,19 +7699,24 @@ StartupXLOG(void)
 				 * Now apply the WAL record itself.  On a Greengage DR replica,
 				 * skip records that modify only protected topology catalogs so
 				 * production's WAL does not overwrite the DR-local rows; the
-				 * replay LSN still advances via the record reader.
+				 * replay LSN still advances via the record reader.  The
+				 * consistency check must be skipped together with redo: a
+				 * filtered record's pages were deliberately left untouched,
+				 * so comparing them against production's images would fail.
 				 */
 				if (!DRRedoShouldFilter(xlogreader))
+				{
 					RmgrTable[record->xl_rmid].rm_redo(xlogreader);
 
-				/*
-				 * After redo, check whether the backup pages associated with
-				 * the WAL record are consistent with the existing pages. This
-				 * check is done only if consistency check is enabled for this
-				 * record.
-				 */
-				if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
-					checkXLogConsistency(xlogreader);
+					/*
+					 * After redo, check whether the backup pages associated
+					 * with the WAL record are consistent with the existing
+					 * pages. This check is done only if consistency check is
+					 * enabled for this record.
+					 */
+					if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+						checkXLogConsistency(xlogreader);
+				}
 
 				/* Pop the error context stack */
 				error_context_stack = errcallback.previous;

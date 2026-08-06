@@ -26,6 +26,11 @@
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
+#include "miscadmin.h"
+#include "access/xlog.h"
+#include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
+#include "utils/guc.h"
 #include "utils/faultinjector.h"
 
 /*
@@ -291,4 +296,279 @@ gp_switch_wal(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
+}
+
+/* ---------------------------------------------------------------------------
+ * DR recovery control
+ *
+ * A DR replica recovers *up to a distributed restore point* and serves reads
+ * there; advancing means re-pointing every node at the next restore point and
+ * letting replay run to it.  Driving that from outside the cluster needs a
+ * connection to every node, which is why it lived in the gg_recovery utility.
+ * These functions do it from the coordinator instead: each dispatches to every
+ * primary segment and applies the same step locally, so one SQL call moves the
+ * whole cluster.
+ *
+ * Status is read from the gp_stat_dr_replica / gp_stat_dr_replica_summary views;
+ * there is deliberately no gp_dr_stats() function duplicating them.
+ * ---------------------------------------------------------------------------
+ */
+
+/*
+ * Apply one recovery-control step to every primary segment and to this node.
+ *
+ * The remote leg is a dispatched SQL command; the local leg calls the same
+ * builtin directly.  Direct calls rather than SPI are deliberate: these run
+ * inside a SELECT, so SPI would execute them inside a transaction block, and
+ * ALTER SYSTEM refuses that (PreventInTransactionBlock in standard_ProcessUtility).
+ * None of these steps writes WAL -- ALTER SYSTEM writes postgresql.auto.conf and
+ * the replay-control builtins touch shared memory -- which is what makes them
+ * legal on a node in recovery.
+ */
+static void
+dr_dispatch(const char *cmd)
+{
+	CdbPgResults results = {NULL, 0};
+
+	CdbDispatchCommand((char *) cmd, DF_CANCEL_ON_ERROR, &results);
+	cdbdisp_clearCdbPgResults(&results);
+}
+
+/*
+ * Set the pause target everywhere.
+ *
+ * Locally this bypasses ProcessUtility and calls AlterSystemSetConfigFile()
+ * directly, for the transaction-block reason above.  (Note that a top-level
+ * ALTER SYSTEM on a coordinator already fans out to the segments by itself;
+ * from in here we have to dispatch it ourselves.)
+ */
+static void
+dr_set_pause_target(const char *target)
+{
+	A_Const    *con = makeNode(A_Const);
+	VariableSetStmt *vset = makeNode(VariableSetStmt);
+	AlterSystemStmt *stmt = makeNode(AlterSystemStmt);
+	char	   *cmd;
+
+	con->val.type = T_String;
+	con->val.val.str = pstrdup(target);
+	con->location = -1;
+
+	vset->kind = VAR_SET_VALUE;
+	vset->name = pstrdup("gp_pause_on_restore_point_replay");
+	vset->args = list_make1(con);
+	vset->is_local = false;
+	stmt->setstmt = vset;
+
+	cmd = psprintf("ALTER SYSTEM SET gp_pause_on_restore_point_replay = %s",
+				   quote_literal_cstr(target));
+	dr_dispatch(cmd);
+	pfree(cmd);
+
+	AlterSystemSetConfigFile(stmt);
+}
+
+/* Reload config, then resume replay, on every node.  Order matters. */
+static void
+dr_reload_and_resume(void)
+{
+	dr_dispatch("SELECT pg_catalog.pg_reload_conf()");
+	DirectFunctionCall1(pg_reload_conf, (Datum) 0);
+
+	dr_dispatch("SELECT pg_catalog.pg_wal_replay_resume() WHERE pg_catalog.pg_is_in_recovery()");
+	if (RecoveryInProgress())
+		DirectFunctionCall1(pg_wal_replay_resume, (Datum) 0);
+}
+
+/*
+ * Is every node paused at restore point `target`?
+ *
+ * The per-node answer is the restore point actually *reached* (from the replayed
+ * WAL record), not the configured pause target, so a node that has not got there
+ * yet reports its previous point rather than the one we asked for.
+ */
+static bool
+dr_all_paused_at(const char *target)
+{
+	CdbPgResults results = {NULL, 0};
+	char		local[MAXFNAMELEN];
+	bool		all = true;
+	int			i;
+
+	GetPausedRestorePointName(local, sizeof(local));
+	if (local[0] == '\0' || strcmp(local, target) != 0)
+		return false;
+
+	CdbDispatchCommand("SELECT coalesce(pg_catalog.pg_last_paused_restore_point(), '')",
+					   DF_CANCEL_ON_ERROR, &results);
+	for (i = 0; i < results.numResults; i++)
+	{
+		struct pg_result *pgresult = results.pg_results[i];
+
+		if (PQresultStatus(pgresult) != PGRES_TUPLES_OK || PQntuples(pgresult) != 1 ||
+			strcmp(PQgetvalue(pgresult, 0, 0), target) != 0)
+		{
+			all = false;
+			break;
+		}
+	}
+	cdbdisp_clearCdbPgResults(&results);
+	return all;
+}
+
+/* Refuse anything that is not a DR coordinator driving its own cluster. */
+static void
+dr_control_precheck(const char *fname)
+{
+	if (!IS_QUERY_DISPATCHER() || Gp_role != GP_ROLE_DISPATCH)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s() must be called on the coordinator in dispatch mode", fname)));
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s() requires a cluster in recovery", fname),
+				 errdetail("This cluster is not a DR replica; it is online read-write.")));
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to call %s()", fname)));
+}
+
+/*
+ * gp_dr_switch(restore_point, timeout_seconds) -> bool
+ *
+ * Stop-and-go: re-point every node's pause target at `restore_point`, resume
+ * replay, and wait until all of them are paused there -- a consistent serve
+ * point.  Recovery only moves forward, so `restore_point` must be one that
+ * production has created (or will create) ahead of the current position;
+ * arming it before production creates it is fine and is how you catch a point
+ * cleanly instead of overshooting it.
+ *
+ * Returns true once every node is paused there, false on timeout (the arming
+ * has still been applied, so the caller can keep waiting on
+ * gp_stat_dr_replica_summary.consistent_restore_point).
+ */
+Datum
+gp_dr_switch(PG_FUNCTION_ARGS)
+{
+	char	   *target = text_to_cstring(PG_GETARG_TEXT_P(0));
+	int			timeout = PG_GETARG_INT32(1);
+	int			waited;
+
+	dr_control_precheck("gp_dr_switch");
+	if (target[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("restore point name cannot be empty")));
+
+	/*
+	 * Order matters: re-point before resuming.  Resuming first would let a node
+	 * free-run past the target to the end of the WAL.
+	 */
+	dr_set_pause_target(target);
+	dr_reload_and_resume();
+
+	for (waited = 0; waited < timeout; waited++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (dr_all_paused_at(target))
+			PG_RETURN_BOOL(true);
+		pg_usleep(1000000L);
+	}
+	ereport(WARNING,
+			(errmsg("timed out after %d seconds waiting for the cluster to reach restore point \"%s\"",
+					timeout, target),
+			 errhint("The pause target is armed on every node; watch gp_stat_dr_replica_summary.consistent_restore_point.")));
+	PG_RETURN_BOOL(false);
+}
+
+/*
+ * gp_dr_promote(at_restore_point, timeout_seconds) -> bool
+ *
+ * Promote the whole DR cluster to an online read-write cluster, cutting every
+ * node at the same restore point.  Irreversible: recovery only moves forward.
+ *
+ * Segments are promoted before the coordinator so that when the coordinator's
+ * FTS starts probing, the segments it probes are already live.
+ *
+ * Unlike the utility's older two-phase promote there is no restart: DR
+ * behaviour is now keyed on "in recovery with hot standby" (IsDRReplicaMode),
+ * so it lifts by itself the moment recovery ends.
+ */
+Datum
+gp_dr_promote(PG_FUNCTION_ARGS)
+{
+	char	   *at = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
+	int			timeout = PG_GETARG_INT32(1);
+	char		local[MAXFNAMELEN];
+	int			waited;
+
+	dr_control_precheck("gp_dr_promote");
+
+	/*
+	 * Precondition: one consistent cut.  Promoting from anywhere else -- an
+	 * immediate pause, or mid-replay -- gives a cluster whose segments stopped
+	 * at unrelated points, which is not a restorable image.
+	 */
+	GetPausedRestorePointName(local, sizeof(local));
+	if (local[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the cluster is not paused at a restore point"),
+				 errhint("Use gp_dr_switch() to reach a consistent restore point first.")));
+	if (at != NULL && strcmp(at, local) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("the cluster is paused at restore point \"%s\", not \"%s\"",
+						local, at)));
+	if (!dr_all_paused_at(local))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("not every node is paused at restore point \"%s\"", local),
+				 errhint("Check gp_stat_dr_replica_summary.consistent_restore_point.")));
+
+	/*
+	 * Promote first, then resume: promotion only arms the trigger, and the
+	 * startup process is sitting in the restore-point pause, so it needs the
+	 * resume to notice.  Segments before the coordinator, so the coordinator's
+	 * FTS finds them live when it starts probing.  The resume is guarded on both
+	 * legs because promotion may already have ended recovery by then.
+	 */
+	dr_dispatch("SELECT pg_catalog.pg_promote(false)");
+	dr_dispatch("SELECT pg_catalog.pg_wal_replay_resume() WHERE pg_catalog.pg_is_in_recovery()");
+
+	DirectFunctionCall2(pg_promote, BoolGetDatum(false), Int32GetDatum(60));
+	if (RecoveryInProgress())
+		DirectFunctionCall1(pg_wal_replay_resume, (Datum) 0);
+
+	/*
+	 * Wait for this node to leave recovery.
+	 *
+	 * Scope of the return value, stated precisely because it is easy to assume
+	 * more: true means *this cluster* left recovery at the requested cut.  The
+	 * segments were promoted first, but asynchronously (pg_promote(false)), so
+	 * one may still be finishing when this returns.
+	 *
+	 * They deliberately are not waited on here.  A standby coordinator cannot
+	 * poll them -- the QE-side protocol check refuses a standby QD talking to a
+	 * promoted QE, and vice versa once this node is promoted -- and they cannot
+	 * be promoted synchronously either, because recoveryPausesHere() does not
+	 * watch for the promote trigger, so pg_promote(true) on a paused node would
+	 * wait for a resume only another session could send.  Polling from outside,
+	 * with a connection per node, is what gg_recovery promote does; use it when
+	 * you need the stronger guarantee.  In practice the segments are up within a
+	 * second or two, and the first distributed query will wait for FTS anyway.
+	 */
+	for (waited = 0; waited < timeout; waited++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (!RecoveryInProgress())
+			PG_RETURN_BOOL(true);
+		pg_usleep(1000000L);
+	}
+	ereport(WARNING,
+			(errmsg("timed out after %d seconds waiting for the coordinator to leave recovery",
+					timeout)));
+	PG_RETURN_BOOL(false);
 }

@@ -1539,21 +1539,26 @@ UNION ALL
 -- only.  The cross-cluster consistency signal is "every node paused at the SAME
 -- restore point" (consistent_restore_point), not LSN closeness.
 ------------------------------------------------------------------
+-- NB: is_paused guards pg_is_wal_replay_paused() with a scalar subquery rather
+-- than the obvious CASE.  Both branches of this view are correct in isolation,
+-- but the UNION ALL of an entry-DB row with a gp_dist_random() row defeats the
+-- CASE short-circuit, and the function ERRORs outside recovery -- so the whole
+-- view failed on a promoted cluster, exactly when an operator wants to read it.
 CREATE VIEW gp_stat_dr_replica AS
   SELECT -1 AS gp_segment_id, 'coordinator'::text AS role,
-         current_setting('gp_dr_replica')::bool AS dr_replica,
+         (current_setting('hot_standby')::bool AND pg_is_in_recovery()) AS dr_replica,
          pg_is_in_recovery() AS in_recovery,
          pg_last_wal_replay_lsn() AS replay_lsn,
          pg_last_xact_replay_timestamp() AS replay_time,
-         CASE WHEN pg_is_in_recovery() THEN pg_is_wal_replay_paused() ELSE false END AS is_paused,
+         coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false) AS is_paused,
          pg_last_paused_restore_point() AS restore_point
 UNION ALL
   SELECT gp_segment_id, 'segment'::text,
-         current_setting('gp_dr_replica')::bool,
+         (current_setting('hot_standby')::bool AND pg_is_in_recovery()),
          pg_is_in_recovery(),
          pg_last_wal_replay_lsn(),
          pg_last_xact_replay_timestamp(),
-         CASE WHEN pg_is_in_recovery() THEN pg_is_wal_replay_paused() ELSE false END,
+         coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false),
          pg_last_paused_restore_point()
     FROM gp_dist_random('gp_id') ORDER BY 1;
 

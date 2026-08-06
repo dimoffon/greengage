@@ -144,7 +144,6 @@
 		"gp_dispatch_keepalives_idle",
 		"gp_dispatch_keepalives_interval",
 		"gp_distinct_grouping_sets_threshold",
-		"gp_dr_replica",
 		"gp_dtx_recovery_interval",
 		"gp_dtx_recovery_prepared_period",
 		"gp_dynamic_partition_pruning",
