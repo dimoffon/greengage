@@ -84,6 +84,105 @@ The alternative considered and rejected for now was widening the barrier — tak
 straddle-free by construction and let the masking go. It was rejected because it lengthens a
 lock hold on production's commit path to simplify the replica.
 
+#### D3.1 — Worked example: why shared memory is still needed
+
+Take the transaction that makes the problem concrete, because it writes on **both** sides:
+
+```sql
+BEGIN;
+  CREATE TABLE t (id int) DISTRIBUTED BY (id);   -- catalog: coordinator AND segments
+  INSERT INTO t SELECT generate_series(1, 100);  -- data: segments only
+COMMIT;
+```
+
+**On production**, the commit is two-staged, and the restore-point barrier does *not* cover
+the whole of it. `gp_create_restore_point('N')` holds `TwophaseCommitLock` EXCLUSIVE
+(`xlogfuncs_gp.c`), while `doNotifyingCommitPrepared()` takes it SHARED — but only *after*
+the coordinator has already written its distributed commit record (`cdbtm.c`):
+
+```
+  QD (coordinator)                     QE0            QE1        WAL each node writes
+  ───────────────────────────────────────────────────────────────────────────────────
+   │                                    │              │
+   ├── PREPARE ────────────────────────▶│              │         QE0: XACT_PREPARE
+   ├── PREPARE ───────────────────────────────────────▶│         QE1: XACT_PREPARE
+   │                                    │              │
+   ├─ insertedDistributedCommitted()    │              │         QD : XACT_DISTRIBUTED_COMMIT
+   │    · QD's LOCAL xact commits ....................................  (pg_class row for t)
+   │    · gxid → shmCommittedGxidArray  │              │
+   │                                    │              │
+  ═══ restore point N can land HERE ═══════════════════════════   QD + every QE:
+       gp_create_restore_point('N')                                    XLOG_RESTORE_POINT
+       TwophaseCommitLock EXCLUSIVE                              ← the only straddle window
+   │                                    │              │
+   ├─ LWLockAcquire(TwophaseCommitLock, SHARED)        │         ← barrier starts only now
+   ├── COMMIT PREPARED ────────────────▶│              │         QE0: XACT_COMMIT_PREPARED
+   ├── COMMIT PREPARED ───────────────────────────────▶│         QE1: XACT_COMMIT_PREPARED
+   ├─ doInsertForgetCommitted() ..................................  QD : XACT_DISTRIBUTED_FORGET
+   └─ LWLockRelease(TwophaseCommitLock)
+```
+
+Because the SHARED acquire brackets only the broadcast and the forget, a restore point is
+all-or-nothing **for the segments** — every QE has committed *T*, or none has. It says
+nothing about the coordinator, which committed earlier and outside the barrier.
+
+**On the DR**, recovered up to exactly that restore point:
+
+| node | replayed | state of *T* |
+|---|---|---|
+| coordinator | `XACT_DISTRIBUTED_COMMIT` | local xact **committed** → `t` is in `pg_class` |
+| segment c0 | `XACT_PREPARE` only | **prepared**, not committed → `t` absent, rows invisible |
+| segment c1 | `XACT_PREPARE` only | **prepared**, not committed → `t` absent, rows invisible |
+
+This asymmetry is not a bug in redo; it is faithful replay of what production actually
+wrote. `xact_redo_distributed_commit()` (`xact.c`) does two things, and the second is the
+one that matters here:
+
+```c
+if (TransactionIdIsValid(xid))
+    xact_redo_commit(parsed, xid, lsn, origin_id);   /* the QD's own catalog change */
+
+redoDistributedCommitRecord(parsed->distribXid);      /* gxid → shmCommittedGxidArray */
+```
+
+and `xact_redo_distributed_forget()` removes the gxid again. So on a replica the array holds
+precisely *"distributed transactions whose coordinator commit has been replayed but whose
+forget has not"* — the in-doubt set, maintained for free by redo. That is the shared-memory
+state the review proposed to stop keeping.
+
+Note the `TransactionIdIsValid(xid)` guard: a QD-read-only distributed transaction (a plain
+`INSERT`, whose data lives only on segments) has no local xid on the coordinator, so nothing
+becomes visible there and the straddle is invisible. It is exactly the mixed transaction —
+one that writes coordinator catalog *and* segment data — that exposes it. That is why the
+existing straddle test in `src/test/dr` passes either way: `dr_straddle` is a plain
+distributed `INSERT`.
+
+**Without the masking**, a query at *N* sees the coordinator's half of a transaction and none
+of the segments':
+
+```
+  SELECT * FROM t;
+    coordinator: t exists in pg_class, plan built, dispatch to segments
+    segments   : ERROR: relation "t" does not exist        ← torn read
+```
+
+**With the masking**, `CreateDRStandbyDistributedSnapshot()` reads that same array and places
+every gxid in it into the snapshot's **in-progress (invisible)** set. *T* is therefore
+invisible on the coordinator too, and the cut is one where *T* simply has not happened yet —
+consistent, and matching what the segments show:
+
+```
+  SELECT * FROM t;
+    ERROR: relation "t" does not exist    ← consistent: T is in-doubt everywhere
+```
+
+Advance one restore point past *T*'s forget and it appears everywhere at once.
+
+So the shared-memory array is not an optimisation or a leftover: it is the only record on the
+replica of *which distributed transactions the coordinator has committed ahead of its
+segments*, and dropping it would make restore-point reads torn for any transaction that
+writes on both sides — DDL above all.
+
 ### D4 — Cluster-wide recovery control in SQL
 
 `gp_dr_switch(restore_point, timeout)` and `gp_dr_promote(at_restore_point, timeout)`

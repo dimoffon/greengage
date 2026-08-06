@@ -564,6 +564,13 @@ segments; the coordinator side is handled by the snapshot builder below.
 3. **Publish.** `ds->xmin = ds->xminAllDistributedSnapshots = xmin`, `ds->xmax = xmax`,
    `ds->count`, and a fresh `distribSnapshotId` (`procarray.c:2193-2197`).
 
+**Where the array comes from on a replica.** Nothing maintains it specially for DR: redo
+does. `xact_redo_distributed_commit()` (`xact.c`) commits the coordinator's own local xact
+(when its xid is valid) *and* calls `redoDistributedCommitRecord()` to add the gxid;
+`xact_redo_distributed_forget()` removes it again. So on a replica the array holds exactly
+*"distributed transactions whose coordinator commit has been replayed but whose forget has
+not"* — the in-doubt set, for free.
+
 **The semantic inversion.** On a live primary, `shmCommittedGxidArray` holds
 distributed-committed transactions — *visible*. On the DR standby they are placed in the
 **in-progress (invisible) set**. That is exactly the straddle compensation: a transaction
@@ -571,6 +578,10 @@ that is committed on the coordinator but possibly prepared-only on the segments 
 as **in-doubt ⇒ invisible** everywhere, so the cross-node read is consistent. A transaction
 that has been fully *forgotten* (past its 2PC completion) is absent from the array ⇒
 visible. The array's shared-memory backing is wired at `cdbtm.c:1149-1150`.
+
+For a worked example of why this is load-bearing — a `CREATE TABLE` + `INSERT` transaction
+straddling a restore point, with the production-side sequence diagram — see
+[ADR-0004 §D3.1](adr/0004-hot-standby-is-dr-mode.md#d31--worked-example-why-shared-memory-is-still-needed).
 
 ### 5.4 End-to-end: a distributed read on the paused DR
 
