@@ -39,6 +39,7 @@
  */
 #include "postgres.h"
 
+#include "access/dr_served_snapshot.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -298,6 +299,26 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	Assert(queryDesc->plannedstmt->intoPolicy == NULL ||
 		GpPolicyIsPartitioned(queryDesc->plannedstmt->intoPolicy) ||
 		GpPolicyIsReplicated(queryDesc->plannedstmt->intoPolicy));
+
+	/*
+	 * Greengage DR: a replica answers from the image frozen at a restore point,
+	 * and refuses to answer at all until it has one.  A node still catching up
+	 * to its first restore point has only free-running replay state to offer,
+	 * which carries no cross-node guarantee -- serving it is the failure this
+	 * whole mechanism exists to prevent.
+	 *
+	 * The check sits here rather than in GetSnapshotData() so that connecting,
+	 * and the utility statements that arm a restore point, keep working: those
+	 * need a snapshot, and a replica nobody can connect to cannot be repaired.
+	 * Every node checks for itself, so a dispatched slice is refused on the
+	 * segment that lacks a point even if the coordinator has one.
+	 */
+	if (IsDRReplicaMode() && !DRServedSnapshotIsPublished())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this disaster-recovery replica has no restore point to serve from"),
+				 errdetail("Reads are answered as of a distributed restore point; this node has not replayed to one yet."),
+				 errhint("Arm a restore point that production has created with gp_pause_on_restore_point_replay, or watch gg_stat_dr_replica for the point each node has reached.")));
 
 	/* GPDB hook for collecting query info */
 	if (query_info_collect_hook)

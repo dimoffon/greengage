@@ -338,6 +338,23 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *buf)
 	elog(DEBUG1, "vm_get_status %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
 
+	/*
+	 * Greengage DR: report nothing all-visible on a disaster-recovery replica.
+	 *
+	 * An all-visible page lets index-only and bitmap scans return tuples without
+	 * consulting the heap at all, so no snapshot -- however carefully frozen --
+	 * is applied to them.  A DR replica serves an image frozen at a restore point
+	 * while replay runs ahead of it, and production's XLOG_HEAP2_VISIBLE records
+	 * replay during that window, marking pages all-visible that contain rows the
+	 * frozen image must not show.  Forcing the heap check is the only thing that
+	 * closes that path; the cost is losing the index-only fast path on a replica.
+	 *
+	 * Safe for every other caller: vacuum is the only other consumer and never
+	 * runs here (a DR node stays in PM_HOT_STANDBY, so no autovacuum launcher).
+	 */
+	if (IsDRReplicaMode())
+		return 0;
+
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*buf))
 	{

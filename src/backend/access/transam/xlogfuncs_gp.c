@@ -28,6 +28,7 @@
 #include "cdb/cdbvars.h"
 #include "miscadmin.h"
 #include "access/xlog.h"
+#include "access/dr_served_snapshot.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "utils/guc.h"
@@ -364,9 +365,14 @@ dr_write_pause_target(const char *target)
 	AlterSystemSetConfigFile(stmt);
 }
 
-/* Set the pause target on every primary segment and on this node. */
+/*
+ * Run the per-node switch primitive everywhere, this node included: arm `target`
+ * as the pause target, and publish the image frozen at `target` if this node has
+ * one.  Both halves are idempotent, which is why the coordinator can call this
+ * twice -- once to arm, once to publish after every node has arrived.
+ */
 static void
-dr_set_pause_target(const char *target)
+dr_node_switch(const char *target)
 {
 	char	   *cmd;
 
@@ -386,24 +392,50 @@ dr_set_pause_target(const char *target)
 	dr_write_pause_target(target);
 }
 
-/* Reload config, then resume replay, on every node.  Order matters. */
+/*
+ * Reload config, then resume replay, on every node.  Order matters: resuming
+ * before the new pause target is loaded lets a node free-run to end-of-WAL.
+ *
+ * A node that is ALREADY stopped at `target` is left alone.  Resuming it would
+ * send it past a restore point it has reached, with nothing ahead to stop at --
+ * and the wait loop would then never see it paused.  Nodes do get there ahead of
+ * a switch: one that restarted replays to its armed target on its own, and an
+ * operator can drive a node by hand.
+ */
 static void
-dr_reload_and_resume(void)
+dr_reload_and_resume(const char *target)
 {
+	char	   *cmd;
+	char		local[MAXFNAMELEN];
+
 	dr_dispatch("SELECT pg_catalog.pg_reload_conf()");
 	DirectFunctionCall1(pg_reload_conf, (Datum) 0);
 
-	dr_dispatch("SELECT pg_catalog.pg_wal_replay_resume() WHERE pg_catalog.pg_is_in_recovery()");
-	if (RecoveryInProgress())
+	cmd = psprintf("SELECT pg_catalog.pg_wal_replay_resume() "
+				   "WHERE pg_catalog.pg_is_in_recovery() "
+				   "  AND coalesce(pg_catalog.pg_last_paused_restore_point(), '') <> %s",
+				   quote_literal_cstr(target));
+	dr_dispatch(cmd);
+	pfree(cmd);
+
+	GetPausedRestorePointName(local, sizeof(local));
+	if (RecoveryInProgress() && strcmp(local, target) != 0)
 		DirectFunctionCall1(pg_wal_replay_resume, (Datum) 0);
 }
 
 /*
- * Is every node paused at restore point `target`?
+ * Is every node stopped at restore point `target`?
  *
  * The per-node answer is the restore point actually *reached* (from the replayed
  * WAL record), not the configured pause target, so a node that has not got there
  * yet reports its previous point rather than the one we asked for.
+ *
+ * The paused test is belt and braces.  SetRecoveryPause(false) clears the reached
+ * name, so a resumed node reports '' and the name comparison alone would already
+ * exclude it -- but "stopped, and stopped there" is the question actually being
+ * asked, and asking it directly is what keeps this correct if that clearing ever
+ * changes.  The per-node query returns no row at all unless that node is stopped,
+ * which the row count check below reads as "not there yet".
  */
 static bool
 dr_all_paused_at(const char *target)
@@ -413,11 +445,16 @@ dr_all_paused_at(const char *target)
 	bool		all = true;
 	int			i;
 
+	if (!RecoveryInProgress() || !RecoveryIsPaused())
+		return false;
+
 	GetPausedRestorePointName(local, sizeof(local));
 	if (local[0] == '\0' || strcmp(local, target) != 0)
 		return false;
 
-	CdbDispatchCommand("SELECT coalesce(pg_catalog.pg_last_paused_restore_point(), '')",
+	CdbDispatchCommand("SELECT coalesce(pg_catalog.pg_last_paused_restore_point(), '') "
+					   "WHERE coalesce((SELECT pg_catalog.pg_is_wal_replay_paused() "
+					   "                WHERE pg_catalog.pg_is_in_recovery()), false)",
 					   DF_CANCEL_ON_ERROR, &results);
 	for (i = 0; i < results.numResults; i++)
 	{
@@ -465,6 +502,10 @@ dr_control_precheck(const char *fname)
  *
  * Blocks until every node is paused there, then returns true.  There is no
  * timeout argument: see the wait loop below.  Cancel it like any other query.
+ *
+ * Calling it with the point the cluster is already stopped at is well defined
+ * and cheap: it re-publishes the served image without resuming replay.  That is
+ * what a node needs after a restart, since the image lives in shared memory.
  */
 Datum
 gg_dr_switch(PG_FUNCTION_ARGS)
@@ -483,6 +524,16 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to call gg_dr_switch()")));
 		dr_write_pause_target(target);
+
+		/*
+		 * The coordinator dispatches this twice: once to arm the target, and
+		 * again after every node has actually paused there.  On the first pass
+		 * this node has no frozen image for `target` yet and the publish is a
+		 * no-op; on the second it flips the image live.  That ordering is the
+		 * whole point -- publishing when this node alone arrives would serve
+		 * the new point while a lagging segment is still short of it.
+		 */
+		DRServedSnapshotPublish(target);
 		PG_RETURN_BOOL(true);
 	}
 
@@ -493,11 +544,27 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 				 errmsg("restore point name cannot be empty")));
 
 	/*
+	 * Already stopped there?  Then this is a re-publish, not a switch: arm,
+	 * publish, done -- no reload, no resume, no round trip.  (dr_reload_and_resume
+	 * would leave these nodes alone anyway; this just says so up front.)
+	 *
+	 * Reaching this on purpose is how a restarted node gets its served image
+	 * back: the frozen image lives in shared memory, which the postmaster does
+	 * not outlive, while the pause target is on disk and survives.
+	 */
+	if (dr_all_paused_at(target))
+	{
+		dr_node_switch(target);
+		DRServedSnapshotPublish(target);
+		PG_RETURN_BOOL(true);
+	}
+
+	/*
 	 * Order matters: re-point before resuming.  Resuming first would let a node
 	 * free-run past the target to the end of the WAL.
 	 */
-	dr_set_pause_target(target);
-	dr_reload_and_resume();
+	dr_node_switch(target);
+	dr_reload_and_resume(target);
 
 	/*
 	 * Wait until every node is paused there.  No timeout: how long this takes is
@@ -510,7 +577,16 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (dr_all_paused_at(target))
+		{
+			/*
+			 * Every node has the image frozen at `target`; only now is it safe
+			 * to start serving it.  Segments first, then this node, so no node
+			 * is serving the new point while another is still serving the old.
+			 */
+			dr_node_switch(target);
+			DRServedSnapshotPublish(target);
 			PG_RETURN_BOOL(true);
+		}
 		pg_usleep(1000000L);
 	}
 }

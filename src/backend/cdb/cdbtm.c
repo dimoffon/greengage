@@ -1762,6 +1762,7 @@ setupQEDtxContext(DtxContextInfo *dtxContextInfo)
 	bool		needDtx;
 	bool		explicitBegin;
 	bool		haveDistributedSnapshot;
+	bool		isDispatchedQuery;
 	bool		isEntryDbSingleton = false;
 	bool		isReaderQE = false;
 	bool		isWriterQE = false;
@@ -1780,6 +1781,18 @@ setupQEDtxContext(DtxContextInfo *dtxContextInfo)
 
 	haveDistributedSnapshot = dtxContextInfo->haveDistributedSnapshot;
 	isSharedLocalSnapshotSlotPresent = (SharedLocalSnapshotSlot != NULL);
+
+	/*
+	 * The context selection below uses haveDistributedSnapshot only to tell a
+	 * dispatched query apart from a standalone utility-mode session.  On a
+	 * disaster-recovery replica the coordinator builds no distributed snapshot
+	 * -- every node serves the local image it froze at the restore point, which
+	 * is already a coherent cross-node cut (see dr_served_snapshot.h) -- so ask
+	 * the question directly there.  Without this a reader gang would stay in
+	 * DTX_CONTEXT_LOCAL_ONLY and never sync with its writer's shared snapshot,
+	 * and the writer would never publish one.
+	 */
+	isDispatchedQuery = haveDistributedSnapshot || IS_STANDBY_QE();
 
 	if (DEBUG5 >= log_min_messages || Debug_print_full_dtm)
 	{
@@ -1880,7 +1893,7 @@ setupQEDtxContext(DtxContextInfo *dtxContextInfo)
 	switch (DistributedTransactionContext)
 	{
 		case DTX_CONTEXT_LOCAL_ONLY:
-			if (isEntryDbSingleton && haveDistributedSnapshot)
+			if (isEntryDbSingleton && isDispatchedQuery)
 			{
 				/*
 				 * Later, in GetSnapshotData, we will adopt the QD's
@@ -1889,7 +1902,7 @@ setupQEDtxContext(DtxContextInfo *dtxContextInfo)
 
 				setDistributedTransactionContext(DTX_CONTEXT_QE_ENTRY_DB_SINGLETON);
 			}
-			else if (isReaderQE && haveDistributedSnapshot)
+			else if (isReaderQE && isDispatchedQuery)
 			{
 				/*
 				 * Later, in GetSnapshotData, we will adopt the QE Writer's
@@ -1925,7 +1938,7 @@ setupQEDtxContext(DtxContextInfo *dtxContextInfo)
 				else
 					setDistributedTransactionContext(DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER);
 			}
-			else if (haveDistributedSnapshot)
+			else if (isDispatchedQuery)
 			{
 				if (IsTransactionOrTransactionBlock())
 				{

@@ -67,6 +67,18 @@ a while; subsequent runs reuse the image.
    The DR coordinator is left **running**, so you can connect and read it:
    `… exec dr env PGOPTIONS='-c gp_role=utility' psql -p 7000 postgres`.
 
+4. **M3 skew** — the regression test for the mid-advance torn read (scenario C-12,
+   [ADR-0005](../../../doc/architecture/adr/0005-dr-served-restore-point-snapshot.md)).
+   Rather than racing a real advance, it *holds* the dangerous state still: the
+   **segments** are driven to `dr_rp2` by hand while the **coordinator** stays at
+   `dr_rp1`, so `dr_m3`'s second row is replayed and locally committed on a segment
+   throughout. A read must still return the `dr_rp1` answer (`1`, not `2`), because
+   every node answers from the image it froze at the point the cluster published —
+   not from wherever its replay has got to. It also forces an index-only scan over
+   `dr_ios`, whose post-`dr_rp1` pages production VACUUMed (so the segments have
+   replayed `XLOG_HEAP2_VISIBLE` for them): that is the one path a frozen snapshot
+   cannot cover by itself, and it must still give the `dr_rp1` answer.
+
 This end-to-end test is what caught two silent-no-op bugs that unit tests missed:
 the M1.3 protected-set resolution (the shared relmap isn't loaded during redo)
 and the M2 `IsDRReplicaMode()` flag (set only in the startup process, invisible

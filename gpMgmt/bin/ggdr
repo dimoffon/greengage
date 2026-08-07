@@ -22,18 +22,21 @@ reach only the coordinator can drive recovery without this tool:
 Subcommands
 -----------
   switch <restore_point>
-        Stop-and-go: make every node pause at restore point <restore_point>.
-        Re-points the pause target on the coordinator and every primary segment,
-        reloads config, resumes replay, and waits until ALL nodes are paused at
-        <restore_point> -- i.e. a consistent, safe-to-serve cut.
-        <restore_point> must be AHEAD of where the cluster is now (recovery only
-        moves forward); arming it before production creates it is fine.
+        Stop-and-go: make every node pause at restore point <restore_point>, then
+        start serving it.  A thin wrapper around gg_dr_switch() on the coordinator
+        -- see there for why the serving step has to be cluster-wide.  Reads keep
+        answering as of the PREVIOUS point for the whole advance, and flip to the
+        new one together.  <restore_point> must be AHEAD of where the cluster is
+        now (recovery only moves forward); arming it before production creates it
+        is fine.  Calling it with the point the cluster is already stopped at is
+        a no-op re-publish, not a runaway.
 
   pause
-        Immediately pause replay on every node at its current point.  Unlike
-        switch, this is NOT a cross-node consistent cut (each node halts wherever
-        it happens to be), so it is for inspection, not for serving.  Resume with
-        'switch <rp>'.
+        Immediately pause replay on every node at its current point.  This is NOT
+        a cross-node consistent cut (each node halts wherever it happens to be),
+        so it is for inspection: it stops the WAL from moving, it does not change
+        what reads see.  Reads go on answering as of the last restore point the
+        cluster switched to.  Resume with 'switch <rp>'.
 
   stat
         Print per-node recovery statistics and a cluster summary: in recovery?
@@ -158,45 +161,47 @@ def node_state(content, address, port):
     }
 
 
-def _repoint_and_resume(nodes, target):
-    """ALTER SYSTEM the pause target + reload + resume, on every node.
+def _psql_dispatch(sql, timeout=None):
+    """Run SQL on the coordinator in DISPATCH mode; return (rc, stdout, stderr).
 
-    Each statement is issued as its OWN psql command: ALTER SYSTEM must run
-    outside a transaction block, and psql batches ;-separated statements into one
-    implicit transaction (which would abort the ALTER SYSTEM and skip the resume).
+    Everything else in this tool talks to each node in utility mode, on purpose:
+    per-node inspection has to keep working when the cluster has no consistent
+    serve point.  A switch is the exception -- it is a cluster-wide operation and
+    must run where the cluster is driven from.
+
+    timeout=None on purpose: how long a switch takes is a property of how much
+    WAL lies between here and the target.  Ctrl-C kills psql, which cancels the
+    query, which is how gg_dr_switch() is meant to be interrupted.
     """
-    quoted = target.replace("'", "''")
-    for content, address, port in nodes:
-        host, p = _conn(content, address, port)
-        rc1, _, e1 = _psql(p, "alter system set gp_pause_on_restore_point_replay = '%s';" % quoted, host=host)
-        _psql(p, "select pg_reload_conf();", host=host)
-        _rc, _o, e3 = _psql(p, "select pg_wal_replay_resume();", host=host)
-        notes = []
-        if e1:
-            notes.append(e1.splitlines()[0])
-        # "recovery is not paused" is expected/benign when a node is already advancing
-        if e3 and "not paused" not in e3.lower() and "not in progress" not in e3.lower():
-            notes.append(e3.splitlines()[0])
-        suffix = ("  [warn: %s]" % "; ".join(notes)) if notes else ""
-        print("  %-13s (port %d): re-pointed + resumed%s" % (_label(content), port, suffix))
+    cmd = ["psql", "-p", str(COORD_PORT), "-d", DB, "-v", "ON_ERROR_STOP=1", "-qtAc", sql]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return 1, "", str(e)
 
 
 def cmd_switch(restore_point):
     nodes = get_nodes()
     print("ggdr switch: re-pointing %d node(s) to restore point '%s'"
           % (len(nodes), restore_point))
-    _repoint_and_resume(nodes, restore_point)
-    print("ggdr switch: waiting for every node to reach '%s' ..." % restore_point)
-    deadline = time.time() + 300
-    states = []
-    while time.time() < deadline:
-        states = [node_state(*n) for n in nodes]
-        if all(s["ok"] and s["paused"] and s["restore_point"] == restore_point for s in states):
-            print("ggdr switch: DONE -- all %d node(s) paused at '%s' "
-                  "(consistent serve point)" % (len(nodes), restore_point))
-            return 0
-        time.sleep(2)
-    print("ggdr switch: TIMEOUT -- not all nodes reached '%s':" % restore_point)
+    # Driven through gg_dr_switch() rather than node by node.  Re-pointing each
+    # node directly would still get them all paused at the right place, but the
+    # step that makes them START SERVING that place is cluster-wide: a node may
+    # only publish its frozen image once EVERY node has arrived, and only the
+    # coordinator knows when that is.  Done per node, the fast ones would serve
+    # the new point while the slow ones still served the old one.
+    print("ggdr switch: waiting for every node to reach '%s' "
+          "(no timeout -- Ctrl-C cancels) ..." % restore_point)
+    quoted = restore_point.replace("'", "''")
+    rc, out, err = _psql_dispatch("select pg_catalog.gg_dr_switch('%s');" % quoted)
+    if rc == 0 and out in ("t", "true"):
+        print("ggdr switch: DONE -- all %d node(s) paused at '%s' "
+              "(consistent serve point)" % (len(nodes), restore_point))
+        return 0
+    print("ggdr switch: FAILED -- %s"
+          % (err.splitlines()[0] if err else "gg_dr_switch() did not report success"))
+    states = [node_state(*n) for n in nodes]
     for s in states:
         if s["ok"]:
             print("  %-13s: paused=%s at '%s'"
@@ -220,8 +225,9 @@ def cmd_pause():
         print("  %-13s (port %d): paused%s" % (_label(content), port, note))
     print("ggdr pause: replay halted.")
     print("  NOTE: an IMMEDIATE pause halts each node wherever it is, which is NOT a")
-    print("        cross-node consistent cut.  For a consistent, safe-to-serve point use")
-    print("        'switch <rp>'.  Resume with 'switch <rp>'.")
+    print("        cross-node consistent cut -- but it does not make one visible either:")
+    print("        reads keep answering as of the last restore point 'switch' published.")
+    print("        To move the served point, use 'switch <rp>'.")
     return 0
 
 
@@ -618,10 +624,26 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
             f.write("hot_standby = on\n")
             f.write("restore_command = '%s'\n" % restore_command)
             f.write("recovery_target_timeline = 'current'\n")
+            # Reads are served from the image frozen at the restore point, so a
+            # reader's xmin sits well behind replay and conflicts are the norm,
+            # not the exception. The 30s default would add 30s to every advance
+            # that hits one; 0 cancels the reader at once, which is the agreed
+            # policy (the right answer or none). Note -1 is not the opposite
+            # extreme but a trap: it blocks the startup process inside redo, so
+            # replay stops altogether.
+            f.write("max_standby_archive_delay = 0\n")
+            f.write("max_standby_streaming_delay = 0\n")
             if pause_at:
                 f.write("gp_pause_on_restore_point_replay = '%s'\n" % pause_at)
         open(os.path.join(dd, "standby.signal"), "w").close()
     print("  armed DR mode (hot_standby + restore_command + standby.signal)")
+    if not pause_at:
+        # A replica serves from the image it freezes at a restore point. With no
+        # pause target it replays to the end of the archive without ever stopping
+        # at one, so it never has anything to serve and every query is refused.
+        print("  WARNING: no --pause-at, so this replica will not stop at a restore point")
+        print("           and will refuse reads until one is armed. Set")
+        print("           gp_pause_on_restore_point_replay on every node and reload.")
     # gpstart/gpstop resolve the coordinator datadir from $COORDINATOR_DATA_DIRECTORY
     # (or the legacy $MASTER_DATA_DIRECTORY); the DR cluster is not built by gpdemo, so
     # nothing exports it -- tell the operator how to manage this cluster with them.

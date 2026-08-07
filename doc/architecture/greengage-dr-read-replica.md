@@ -110,10 +110,11 @@ The implementation is organized as milestones; this document is structured aroun
 - **Read-only** end-to-end (§4.3), enforced with a DR-specific error, but still able to
   **dispatch distributed reads** to segments in recovery (§4.4).
 - **Restore-point-gated consistency** (§4.5): the cluster recovers **up to** a distributed
-  restore point *N*, pauses there, and serves an **as-of-N** distributed snapshot — a
-  transactionally consistent cut, not a `min(replay_lsn)` approximation. This is the *only*
-  serving state; there is no free-running mode, because no other cut has a cross-node
-  guarantee to offer.
+  restore point *N*, pauses there, and every node **freezes its local MVCC snapshot** at
+  that point and answers every read from it — a transactionally consistent cut, not a
+  `min(replay_lsn)` approximation, and one that survives the cluster advancing towards
+  *N+1* underneath the reader. This is the *only* serving state; there is no free-running
+  mode, because no other cut has a cross-node guarantee to offer.
 - **Promote in place** to an online read-write cluster (§6.3).
 
 ### 2.2 Component inventory — DR-new vs. reused
@@ -125,7 +126,7 @@ Being explicit about provenance matters for maintenance:
 - `IsDRReplicaMode()` + the M1 topology redo filter (`dr_redo_filter.c`).
 - M2 read-only enforcement.
 - The `DTX_CONTEXT_QD_STANDBY_READER` distributed-transaction context.
-- The M3 as-of-N distributed snapshot builder `CreateDRStandbyDistributedSnapshot()`.
+- The M3 served restore-point snapshot (`dr_served_snapshot.c`, ADR-0005).
 - The M5 served-restore-point accessor + `gg_stat_dr_replica` views.
 - The `gg_dr_switch()` / `gg_dr_promote()` recovery-control functions (§6.4).
 - The `ggdr` / `ggseed_dr_topology` utilities.
@@ -151,7 +152,7 @@ static snapshot and the upstream dispatch suffices — see §5.5.)
 |---|----------|-----------|
 | 1 | **Archive / continuous-restore transport** (PITR), not streaming replication | No replication slot ⇒ no production WAL pinning (PG12 lacks `max_slot_wal_keep_size`); one faithful archive is reusable for production PITR *and* N DR replicas; WAN-latency tolerant. |
 | 2 | **Topology independence via an apply-time redo filter + frozen-tuple seed**, not a WAL rewriter | You cannot delete bytes from physical WAL (LSN = byte offset; `xl_prev` chain; page `pd_lsn` interlock). Rewriting records in place would corrupt the canonical archive or force a second copy. Filtering at *apply* time keeps `pg_wal` byte-identical to production. |
-| 3 | **Stop-and-go consistency** (pause at restore point *N*, serve, advance to *N+1*), reusing the shipped `gp_pause_on_restore_point_replay` GUC | Greengage already ships the pause primitive. Stop-and-go gives a clean static as-of-N image, minimal MVCC masking, and **zero recovery-conflict exposure during serve windows** (replay is stopped). Conflicts are confined to advance bursts. |
+| 3 | **Stop-and-go consistency** (pause at restore point *N*, serve, advance to *N+1*), reusing the shipped `gp_pause_on_restore_point_replay` GUC | Greengage already ships the pause primitive. It gives a clean as-of-N image with **zero recovery-conflict exposure during serve windows** (replay is stopped); conflicts are confined to advance bursts. Each node also *freezes* that image (ADR-0005), so the window holds while the cluster advances rather than only while it sits still. |
 | 4 | **Reuse upstream hot-standby dispatch**; add only the no-gxid standby-reader context | Minimizes new core surface; the risky gang/snapshot machinery already exists and is tested. |
 | 5 | **Whole-cluster failover only** for the PoC (mirrorless DR) | Keeps the novel cross-cluster work in focus; DR-local mirrors + DR-local FTS are deferred. |
 
@@ -458,30 +459,57 @@ the barrier.
 Each DR node is configured with `gp_pause_on_restore_point_replay = 'N'`
 (`guc_gp.c:4727-4736`, `PGC_SUSET`). When the redo loop replays the matching restore-point
 record, `pauseRecoveryOnRestorePoint()` (`xlog.c:5976`, called at `xlog.c:7811-7812`) pauses
-replay (`SetRecoveryPause(true)` + `recoveryPausesHere()`, `xlog.c:6205`). The node keeps
-serving reads while paused. To **advance** to *N+1*: set the GUC to the next restore point
-and `SIGHUP` (the paused startup process re-reads config via `HandleStartupProcInterrupts()`
-→ `ProcessConfigFile`, `startup.c:159-168`), then `pg_wal_replay_resume()`. Order matters —
-re-point *before* resume, or the node free-runs to end-of-WAL.
+replay (`SetRecoveryPause(true)` + `recoveryPausesHere()`). Just before it pauses, the node
+also **freezes the snapshot** it will serve (§4.5.3). The node keeps serving reads while
+paused. To **advance** to *N+1*, use `gg_dr_switch('N+1')`: it re-points the pause GUC on
+every node, reloads, resumes, waits for all of them to arrive, and only then publishes the
+new frozen image cluster-wide. Order matters — re-point *before* resume, or the node
+free-runs to end-of-WAL.
 
 A clean cross-node cut is reached when **every** node is paused at the **same** restore
 point. That is exactly the "consistent serve point" `ggdr` computes (§7).
 
-#### 4.5.3 The as-of-N distributed snapshot
+#### 4.5.3 The snapshot frozen at N
 
-When a standby-reader coordinator builds a snapshot, `GetSnapshotData()` routes to the
-DR-specific builder (`procarray.c:2570-2577`):
+See **ADR-0005** for the decision and its alternatives; the mechanism is:
 
-```c
-if (distributedTransactionContext == DTX_CONTEXT_QD_STANDBY_READER)
-    CreateDRStandbyDistributedSnapshot(ds);
-else
-    CreateDistributedSnapshot(ds);
-```
+- **Capture.** `pauseRecoveryOnRestorePoint()` calls `DRCaptureServedSnapshot(rp)`
+  (`procarray.c`), which takes `ProcArrayLock` SHARED and records
+  `xmax = latestCompletedXid + 1` plus the complete running set from
+  `KnownAssignedXidsGetAndSetXmin()` — an ordinary hot-standby recovery snapshot, taken at
+  the instant replay stops. It lands in the `pending` slot of `dr_served_snapshot.c`,
+  tagged with the restore-point name.
+- **Publish.** `gg_dr_switch()` flips `served ← pending` on every node once *all* of them
+  report being paused at that name. A node that arrived early keeps serving the previous
+  point until then; that is what makes an advance atomic from a reader's point of view.
+- **Serve.** `GetSnapshotData()`'s recovery branch fills from `served` instead of scanning
+  `KnownAssignedXids` live, and publishes `MyPgXact->xmin` from it — which is what turns
+  recovery conflicts into the safety net (§4.5.4).
 
-`CreateDRStandbyDistributedSnapshot()` (`procarray.c:2166`) reconstructs the distributed
-snapshot **from replayed state** — it cannot mint a live one during recovery. See §5 for
-the full flow.
+There is deliberately **no distributed snapshot** on a DR read. A restore point already
+supplies the cross-node order a distributed snapshot exists to provide, and the per-node
+frozen images agree by construction. `haveDistribSnapshot` stays false, which also keeps
+segments off the gxid-based visibility rules and off the sticky
+`HEAP_X*_DISTRIBUTED_SNAPSHOT_IGNORE` hint bits (ADR-0005 D5).
+
+Because the coordinator no longer dispatches a distributed snapshot, `setupQEDtxContext()`
+(`cdbtm.c`) can no longer use "has a distributed snapshot" as its proxy for "is a
+dispatched query"; on a standby QE it asks `IS_STANDBY_QE()` directly. Without that, reader
+gangs stay in `DTX_CONTEXT_LOCAL_ONLY` and never sync with their writer's shared snapshot.
+
+#### 4.5.4 What a frozen image cannot cover by itself
+
+- **The visibility map.** `VM_ALL_VISIBLE` lets index-only and bitmap scans skip the heap
+  entirely, so no snapshot is applied to those tuples. Production's `XLOG_HEAP2_VISIBLE`
+  records replay during an advance. `visibilitymap_get_status()` therefore returns 0 in DR
+  mode — the index-only fast path is given up on a replica.
+- **Removed rows.** Replay can vacuum away a row the frozen image still needs. The frozen
+  `xmin` is published, so `ResolveRecoveryConflictWithSnapshot()` cancels that reader. The
+  policy is the right answer or none; `max_standby_archive_delay = 0` is set at build time
+  so a conflict does not add 30 s to the advance.
+- **Nothing frozen yet.** A node that has not replayed to any restore point refuses queries
+  at `ExecutorStart()` rather than answering from free-running state. The refusal is in the
+  executor, not in `GetSnapshotData()`, so connecting and `ALTER SYSTEM` keep working.
 
 ### 4.6 M5 — Observability
 
@@ -530,10 +558,17 @@ A Greengage read has two visibility components:
 
 - **Local (per node):** ordinary PostgreSQL MVCC. On the DR, each node is a stock
   hot-standby backend — visibility comes from the node's recovery snapshot
-  (`KnownAssignedXids`). Nothing DR-specific here.
+  (`KnownAssignedXids`).
 - **Distributed (cluster-wide):** a `DistributedSnapshot` that maps each tuple's creating
   `gxid` to visible / invisible so all segments agree. On production this is minted live
-  from `nextGxid`; on the DR it must be **reconstructed from replayed state**.
+  from `nextGxid`.
+
+**On a DR replica only the first one is used.** The distributed dimension exists because a
+live cluster has no global order across nodes; a distributed restore point *is* that order,
+taken under `TwophaseCommitLock` EXCLUSIVE. What the replica must do instead is stop each
+node's local snapshot from drifting once replay moves on — which is what §5.3 does. See
+ADR-0005 for why the alternative (reconstructing a distributed snapshot from replayed
+state) was implemented, reviewed, and rejected.
 
 ### 5.2 The straddle — why a barrier is required
 
@@ -548,40 +583,45 @@ an arbitrary LSN cut a distributed transaction *T* can be:
 That is the **straddle**. A naive cross-segment `min(replay_lsn)` cut would expose *T* on
 the coordinator but not the segments — a torn, non-atomic read. The `TwophaseCommitLock`
 barrier of a **distributed restore point** is the only cut guaranteed straddle-free at the
-segments; the coordinator side is handled by the snapshot builder below.
+segments.
 
-### 5.3 `CreateDRStandbyDistributedSnapshot()` — step by step
+On the segments *T* needs no special handling: it is prepared-only there, so its local xid
+is still in `KnownAssignedXids` and the ordinary recovery snapshot already reads it as
+in-progress. The coordinator side is genuinely asymmetric — its own local xact is committed
+— and stays so; see [ADR-0005 D5.1](adr/0005-dr-served-restore-point-snapshot.md) for why
+the in-doubt masking that was supposed to cover it never did, and what the residual
+exposure actually is.
 
-`src/backend/storage/ipc/procarray.c:2166`, called under `ProcArrayLock`:
+### 5.3 The served restore-point snapshot — step by step
 
-1. **Upper bound.** `xmax = ShmemVariableCache->nextGxid` (`procarray.c:2177`). On the DR,
-   `nextGxid` is advanced during redo by `XLOG_NEXTGXID` records, so it is a safe upper
-   bound of "all gxids that could exist as of the replayed position." `xmin` is seeded to
-   `xmax` and lowered below.
-2. **In-doubt / invisible set.** Loop `i` over `[0, *shmNumCommittedGxacts)`; for each
-   `gxid = shmCommittedGxidArray[i]` that is valid and `< xmax`, lower `xmin` to it and
-   **add it to `ds->inProgressXidArray`** (`procarray.c:2180-2189`).
-3. **Publish.** `ds->xmin = ds->xminAllDistributedSnapshots = xmin`, `ds->xmax = xmax`,
-   `ds->count`, and a fresh `distribSnapshotId` (`procarray.c:2193-2197`).
+`src/backend/access/transam/dr_served_snapshot.c`, plus `DRCaptureServedSnapshot()` in
+`procarray.c` (the capture has to live there, next to `KnownAssignedXids`).
 
-**Where the array comes from on a replica.** Nothing maintains it specially for DR: redo
-does. `xact_redo_distributed_commit()` (`xact.c`) commits the coordinator's own local xact
-(when its xid is valid) *and* calls `redoDistributedCommitRecord()` to add the gxid;
-`xact_redo_distributed_forget()` removes it again. So on a replica the array holds exactly
-*"distributed transactions whose coordinator commit has been replayed but whose forget has
-not"* — the in-doubt set, for free.
+1. **Capture, on arrival.** `pauseRecoveryOnRestorePoint()` (`xlog.c`) has just applied the
+   restore-point record and is about to stop replay. It calls
+   `DRCaptureServedSnapshot(rp)`, which takes `ProcArrayLock` SHARED and records
+   `xmax = ShmemVariableCache->latestCompletedXid + 1`, the running set from
+   `KnownAssignedXidsGetAndSetXmin()` (which includes prepared transactions), and
+   `suboverflowed`. Because replay is stopping at that instant, this *is* the restore
+   point's image.
+2. **Hold as `pending`.** The image is tagged with the restore-point name and parked. It is
+   not served yet: the nodes do not arrive together, and serving *N+1* on the first arrival
+   while a segment is still short of it is the same torn read, one restore point later.
+3. **Publish when all have arrived.** `gg_dr_switch(N+1)` polls `dr_all_paused_at()` — every
+   node stopped, and stopped *at that name* — then dispatches the per-node publish, which
+   flips `served ← pending` iff `pending.rpName` matches. A cancelled or crashed switch
+   leaves `served` at *N*: stale, never wrong.
+4. **Serve.** `GetSnapshotData()`'s recovery branch fills `xmin`/`xmax`/`subxip`/
+   `suboverflowed` from `served` instead of scanning live, and sets `MyPgXact->xmin` from it
+   — which enlists `ResolveRecoveryConflictWithSnapshot()` as the safety net for free.
 
-**The semantic inversion.** On a live primary, `shmCommittedGxidArray` holds
-distributed-committed transactions — *visible*. On the DR standby they are placed in the
-**in-progress (invisible) set**. That is exactly the straddle compensation: a transaction
-that is committed on the coordinator but possibly prepared-only on the segments is treated
-as **in-doubt ⇒ invisible** everywhere, so the cross-node read is consistent. A transaction
-that has been fully *forgotten* (past its 2PC completion) is absent from the array ⇒
-visible. The array's shared-memory backing is wired at `cdbtm.c:1149-1150`.
+**Reader gangs need no extra work.** They copy from the writer's `SharedLocalSnapshotSlot`,
+and the writer's snapshot is the frozen one, so a whole gang is coherent by construction.
 
-For a worked example of why this is load-bearing — a `CREATE TABLE` + `INSERT` transaction
-straddling a restore point, with the production-side sequence diagram — see
-[ADR-0004 §D3.1](adr/0004-hot-standby-is-dr-mode.md#d31--worked-example-why-shared-memory-is-still-needed).
+**Restart.** The image lives in shared memory, which the postmaster does not outlive. A
+restarted node publishes on its own the first time it reaches a restore point
+(`DRServedSnapshotPublishIfNothingServed()`); until then `ExecutorStart()` refuses queries.
+See ADR-0005 D3 for the one window this leaves open.
 
 ### 5.4 End-to-end: a distributed read on the paused DR
 
@@ -592,29 +632,35 @@ client ──SELECT──▶ DR coordinator (in recovery, hot_standby, paused at
   │
   ├─ setupRegularDtxContext → DTX_CONTEXT_QD_STANDBY_READER   (no gxid, no WAL, §4.4)
   │
-  ├─ GetSnapshotData → CreateDRStandbyDistributedSnapshot(ds)  (as-of-N, §5.3)
-  │        local snapshot = this node's hot-standby recovery snapshot
+  ├─ GetSnapshotData → filled from the image frozen at N (§5.3); no distributed snapshot
+  │
+  ├─ ExecutorStart: is anything published?  if not → ERROR (nothing consistent to serve)
   │
   ├─ plan (read-only) → build gang on the DR segments (mirror selection, is_hs_dispatch)
   │
   └─ dispatch ▶ each DR segment QE (also in recovery):
-         • DTX context info carries the as-of-N distributed snapshot, no gxid
+         • DTX context info carries no distributed snapshot and no gxid; the QE context is
+           chosen from IS_STANDBY_QE() instead (§4.5.3)
          • writer-gang gxid check exempted via IS_STANDBY_QE()  (§4.4)
-         • local visibility = segment's own hot-standby snapshot; distributed = ds
+         • visibility = that segment's OWN image frozen at N
          • rows ▶ coordinator ▶ client
 ```
 
-### 5.5 Why stop-and-go makes this coherent without a snapshot leader
+### 5.5 Why this is coherent without a snapshot leader
 
 The hardest part of feeding a writer-less reader gang a coherent snapshot is *coherence
 under concurrent replay* — two slices on one segment could otherwise capture different local
-snapshots as replay advances between them. **Under stop-and-go this problem collapses:**
-while the cluster is paused at *N*, **replay is stopped**, so the local recovery snapshot is
-**static** for the whole serve window. Every slice and every cursor reader on a segment sees
-the same unchanging image, and the distributed dimension is the fixed as-of-N `ds`. This is
-why the feature reuses the upstream hot-standby dispatch path directly and did **not** need
-to build the bespoke "snapshot-leader" machinery from the SR-2 design note. (The trade-off:
-a query that *spans* an advance can hit standard hot-standby recovery conflicts — see §9.)
+snapshots as replay advances between them. **Freezing the image at the restore point
+collapses this problem**, and collapses it more completely than pausing alone did: while the
+cluster is paused the live snapshot happens to be static, but during an advance it is not,
+and before this change a read taken mid-advance drifted with replay (measured: a distributed
+transaction visible on one segment and absent on another for ~2.1 s). Serving the frozen
+image makes every slice, every cursor, and every fresh statement see the same unchanging
+picture from the moment *N* is published until *N+1* is, no matter what replay is doing
+underneath. This is why the feature reuses the upstream hot-standby dispatch path directly
+and did **not** need the bespoke "snapshot-leader" machinery from the SR-2 design note.
+(The trade-off: a query that *spans* an advance can hit standard hot-standby recovery
+conflicts and be cancelled — see §9.)
 
 ---
 
@@ -794,7 +840,7 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 
 | Command | Purpose |
 |---------|---------|
-| `switch <restore_point>` | Stop-and-go: re-point every node to `<restore_point>`, resume, and wait until **all** are paused there (a consistent as-of-N cut). |
+| `switch <restore_point>` | Stop-and-go: re-point every node to `<restore_point>`, resume, wait until **all** are paused there, and publish that cut for reading. A wrapper around `gg_dr_switch()`; the publish step is why it cannot be done node by node. |
 | `pause` | Immediately pause replay on every node at its current point. **Not** a consistent cut. |
 | `stat` | Per-node recovery statistics + a cluster summary (mode, consistent serve point, RPO). |
 | `promote [--at <rp>] [--no-restart] [--yes] [--timeout <s>]` | Promote the DR cluster to online read-write at a single consistent restore point. Irreversible. |
@@ -850,7 +896,7 @@ $ ggdr create-replica \
   recovery-conflict cancellation** for queries that start and finish within a serve window.
 - **Minimal new core surface.** It reuses the shipped `gp_pause_on_restore_point_replay`
   primitive and the existing hot-standby dispatch, adding only the standby-reader context,
-  the redo filter, the as-of-N snapshot builder, and enforcement/observability.
+  the redo filter, the served restore-point snapshot, and enforcement/observability.
 - **Promote in place**, cutting every node at the same restore point, with a clean
   two-phase disengage of DR mode.
 - **WAN-tolerant / geo-separable.** Nothing requires a low-latency link; hosts and layout
@@ -882,14 +928,26 @@ $ ggdr create-replica \
 **Consistency / correctness**
 
 - **The straddle is handled; `min(replay_lsn)` is not a cut.** Only a distributed restore
-  point is straddle-free at the segments; the coordinator side treats
-  `shmCommittedGxidArray` as invisible (§5). Never approximate a consistent read with raw
-  replay LSNs.
-- **`pause` is not a consistent cut.** An immediate pause halts each node wherever it is;
-  only `switch <rp>` (all nodes at the same restore point) is safe to serve consistent
-  reads or to promote from.
+  point is straddle-free at the segments, where a straddling transaction is prepared-only
+  and therefore invisible through `KnownAssignedXids` (§5.2). Never approximate a
+  consistent read with raw replay LSNs. The coordinator's own local xact *is* committed at
+  such a cut — a narrow, loud, pre-existing asymmetry: see ADR-0005 D5.1.
+- **`pause` is not a consistent cut — but it does not expose one either.** An immediate
+  pause halts each node wherever it is, so the *replay* positions no longer agree and
+  `consistent_restore_point` goes NULL. Reads go on answering as of the last point
+  `switch` published. Only `switch <rp>` moves the served point, and only it is safe to
+  promote from.
 - **`switch`/`promote` only move forward.** You cannot switch back to an earlier restore
-  point. Reach a fresh consistent cut with a restore point that is still ahead.
+  point. Reach a fresh consistent cut with a restore point that is still ahead. Calling
+  `switch` with the point the cluster is *already* stopped at is well defined and cheap: it
+  re-publishes without resuming, which is what a restarted node needs.
+- **The served image does not survive a restart, and one restart window is left open.** It
+  lives in shared memory; a restarted node re-freezes and self-publishes the first time it
+  reaches a restore point, and refuses queries until then. A node restarted *during* an
+  advance publishes the new point before its peers do — see ADR-0005 D3 for why that is
+  preferred to the alternative.
+- **Index-only and bitmap scans lose the all-visible fast path** on a replica (ADR-0005
+  D4). Correct answers, more heap fetches.
 
 **Topology filter**
 
@@ -962,7 +1020,10 @@ $ ggdr create-replica \
 | Standby-reader context | `DTX_CONTEXT_QD_STANDBY_READER` `cdbtm.h:142-149`; select `cdbtm.c:1729-1743`; skips `cdbtm.c:417,452`, `execMain.c:666`; serialize `cdbdisp_dtx.c:158-177` |
 | Standby QE exemption | `IS_STANDBY_QE()` `cdbvars.h:760`; use `xact.c:2510-2517` (and assert `xact.c:2438-2444`) |
 | Hot-standby dispatch (reused) | `cdbutil.c:1027-1051`; `is_hs_dispatch` `cdbdisp_query.c:894,1006-1008`; protocol check `postgres.c:5559-5568`; gang `cdbgang.c:699` |
-| As-of-N snapshot | `CreateDRStandbyDistributedSnapshot()` `procarray.c:2166`; wiring `procarray.c:2570-2577`; array backing `cdbtm.c:1149-1150` |
+| Served restore-point snapshot | `dr_served_snapshot.{c,h}` (pending/served slots, publish, fill); capture `DRCaptureServedSnapshot()` `procarray.c`, called from `pauseRecoveryOnRestorePoint()` `xlog.c`; serve in `GetSnapshotData()`'s recovery branch; shmem registration `ipci.c` |
+| Nothing-to-serve refusal | `standard_ExecutorStart()` `execMain.c` (`IsDRReplicaMode() && !DRServedSnapshotIsPublished()`) |
+| Visibility-map bypass closed | `visibilitymap_get_status()` `visibilitymap.c` returns 0 in DR mode |
+| QE context without a distributed snapshot | `setupQEDtxContext()` `cdbtm.c` — `isDispatchedQuery = haveDistributedSnapshot \|\| IS_STANDBY_QE()` |
 | Pause mechanism | GUC `guc_gp.c:4727-4736`; `pauseRecoveryOnRestorePoint()` `xlog.c:5976` (call `xlog.c:7811-7812`); `recoveryPausesHere()` `xlog.c:6205`; SIGHUP `startup.c:159-168` |
 | Served-N accessor | `pausedRestorePointName` `xlog.c:773` (capture :6005-6008, clear :6246); `GetPausedRestorePointName()` `xlog.c:6390-6396`; `pg_last_paused_restore_point()` `xlogfuncs.c:606-615` (OID 7016) |
 | Views | `system_views.sql:1542-1573` (`gg_stat_dr_replica`, `gg_stat_dr_replica_summary`, `pg_catalog`) |
@@ -975,7 +1036,8 @@ $ ggdr create-replica \
 | GUC | Context | Default | Role |
 |-----|---------|---------|------|
 | `hot_standby` | `PGC_POSTMASTER` | `false` | On a node in recovery, makes it a DR replica: read-only enforcement, topology redo filter, standby distributed read. Disengages with recovery. |
-| `gp_pause_on_restore_point_replay` | `PGC_SUSET` | `''` | Pause replay when the named restore point is replayed; re-point + resume to advance. |
+| `gp_pause_on_restore_point_replay` | `PGC_SUSET` | `''` | Pause replay when the named restore point is replayed; re-point + resume to advance. `gg_dr_switch()` maintains it. |
+| `max_standby_archive_delay` | `PGC_SIGHUP` | `0` on a DR node (`ggdr create-replica` writes it) | A frozen `xmin` makes recovery conflicts routine; the stock 30 s would be added to every advance that hits one. `-1` is a trap, not the other extreme — it blocks the startup process inside redo. |
 
 ### 10.3 Catalog / function objects
 

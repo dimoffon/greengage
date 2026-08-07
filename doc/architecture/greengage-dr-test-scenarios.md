@@ -99,18 +99,18 @@ that tries to allocate a `gxid`.
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **C-1** | All nodes paused at restore point `N`; read twice | Identical results. Replay is stopped, so the local recovery snapshot is static and the distributed dimension is a fixed as-of-N `DistributedSnapshot`. **Zero recovery-conflict exposure inside a serve window.** | AUTO | PASS |
-| **C-2** | Advance `N → N+1` (`ggdr switch`), re-read | Results move forward atomically to the new cut — data written on production between N and N+1 becomes visible together. | AUTO | PASS |
-| **C-3** | **The straddle.** A distributed 2PC txn *T* whose coordinator `XLOG_XACT_DISTRIBUTED_COMMIT` lands *before* the restore point but whose commit-prepared broadcast lands *after* (injected with the `dtm_broadcast_commit_prepared` fault) | At the cut, *T*'s rows are **invisible everywhere** and no error is raised. `CreateDRStandbyDistributedSnapshot()` places `shmCommittedGxidArray` entries into the **in-progress (invisible)** set — the semantic inversion that compensates for the straddle. After advancing past *T*'s forget, its rows appear. | AUTO | PASS |
-| **C-4** | `ggdr pause` (immediate pause), then read | Reads *work* but the cut is **not** cluster-consistent — each node halted wherever it was. `gg_stat_dr_replica_summary.consistent_restore_point` is `NULL`. Operators must treat this as "inspect a node", never "serve a report". | NEW | DEGRADE |
+| **C-1** | All nodes paused at restore point `N`; read twice | Identical results. Every node answers from the local MVCC image it froze when it stopped at `N` (ADR-0005), and while paused there is no replay either. **Zero recovery-conflict exposure inside a serve window.** | AUTO | PASS |
+| **C-2** | Advance `N → N+1` (`gg_dr_switch` / `ggdr switch`), re-read | Results move forward atomically to the new cut — data written on production between N and N+1 becomes visible together, on every node at the same moment, because the new image is published only after all of them have arrived. | AUTO | PASS |
+| **C-3** | **The straddle.** A distributed 2PC txn *T* whose coordinator `XLOG_XACT_DISTRIBUTED_COMMIT` lands *before* the restore point but whose commit-prepared broadcast lands *after* (injected with the `dtm_broadcast_commit_prepared` fault) | At the cut, *T*'s **rows** are invisible and no error is raised: on every segment *T* is prepared-only, so its local xid is still in `KnownAssignedXids` and the frozen image reads it as in-progress. After advancing past *T*'s forget, its rows appear. The coordinator's own local xact *is* committed at the cut, so a *T* that also wrote coordinator catalog is asymmetric — see [ADR-0005 D5.1](adr/0005-dr-served-restore-point-snapshot.md); that asymmetry pre-dates and survives this design, and fails loudly rather than silently. | AUTO | PASS |
+| **C-4** | `ggdr pause` (immediate pause), then read | Reads work and still answer as of the last **published** restore point — an immediate pause stops the WAL, it does not change what is served. `gg_stat_dr_replica_summary.consistent_restore_point` goes `NULL` because the nodes' *replay* positions no longer agree, which is the honest report of the cluster's replay state, not of the served image. | NEW | PASS |
 | **C-5** | A long analytical query spanning an **advance** (`gg_dr_switch` to the next restore point), while production has run `VACUUM` | The query can be delayed then cancelled: `canceling statement due to conflict with recovery … User query might have needed to see row versions that must be removed`. With one backend per segment, **cancelling any one segment fails the whole distributed query**. `hot_standby_feedback` cannot help — there is no streaming connection back to production. Since free-running mode was removed, this is now confined to advance bursts rather than being the steady state. | NEW | DEGRADE |
-| **C-6** | Same as C-5 with `max_standby_archive_delay = -1` | Queries survive; **replay stalls instead**, so RPO grows for as long as the query runs. Demonstrates the knob is a trade, not a fix. | NEW | DEGRADE |
+| **C-6** | Same as C-5 with `max_standby_archive_delay` raised from the built-in `0` | Queries survive longer; **replay stalls instead**, so RPO grows for as long as the query runs. Demonstrates the knob is a trade, not a fix. `-1` is not the far end of that trade but a trap: it blocks the startup process inside redo, so replay stops altogether. | NEW | DEGRADE |
 | **C-7** | Transaction open on the DR **spanning an advance**, holding a lock on a table production rewrote | **Measured — see [C-7/V-10 results](#appendix--c-7--v-10-measured-vacuum-full-under-a-live-reader).** The reader is cancelled, not fed a torn view: `canceling statement due to conflict with recovery / User was holding a relation lock for too long`. Its whole transaction aborts; after rollback the next statement sees the new cut. The reader also **delays the advance for the whole cluster** by `max_standby_archive_delay`. | **RUN** | DEGRADE (fails safe) |
 | **C-8** | `switch` to a restore point **already drained past** | Times out — recovery only moves forward. Recovery is to pick a restore point still ahead. | NEW | REFUSE |
 | **C-9** | `switch` armed for a restore point production has **not created yet** | Succeeds when the WAL arrives — nodes catch it cleanly instead of overshooting. This is the pattern the promote test uses. | AUTO | PASS |
 | **C-10** | Per-segment archive **skew**: one segment lags | The cluster cannot reach a consistent cut until the slowest segment has archived *and* replayed through its N-LSN. `stats` shows the laggard. **The slowest archiver gates everyone.** | NEW | DEGRADE |
 | **C-11** | Compare DR as-of-N against a production snapshot taken at N | Row-for-row equality on every table across every segment. The end-to-end correctness assertion the milestone tests only approximate with counts. | NEW | PASS |
-| **C-12** | **Read issued *during* an advance**, with WAL volume skewed to one segment | **Measured — [torn read reproduced](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced).** One distributed transaction observed half-committed across segments for ~2.1s: present on the light segment, absent on the heavy one still replaying. A state reachable at neither cut. Not a snapshot-builder defect — per-node replay skew, which the in-doubt masking does not address. The summary's `consistent_restore_point` is correctly NULL throughout that window, so the signal exists; nothing enforces it. | **RUN** | **GAP (by convention)** |
+| **C-12** | **Read issued *during* an advance**, with WAL volume skewed to one segment | **Was a reproduced torn read; now fixed and regression-tested.** [The original measurement](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced) caught one distributed transaction half-committed across segments for ~2.1s — a state reachable at neither cut. Every node now answers from the image frozen at the published point regardless of where its replay has got to (ADR-0005), so a mid-advance read returns the *N* image or is cancelled. The fixture holds the skewed state still instead of racing it: the segments are driven to `dr_rp2` by hand while the coordinator stays at `dr_rp1`, and the read must keep returning the `dr_rp1` answer. | AUTO | PASS |
 
 ---
 
@@ -204,7 +204,8 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **H-1** | Kill (`SIGKILL`) a DR node and restart it | Crash recovery re-applies from the last checkpoint; **the redo filter re-applies identically**, so the DR-local topology survives. Verify `gp_segment_configuration` still reads `dr` and the node returns to its pause target. | NEW | PASS |
-| **H-2** | Restart the whole DR cluster | Comes back in recovery, still read-only, `hot_standby` still on, pause target preserved (it lives in `postgresql.conf` / `postgresql.auto.conf`). | NEW | PASS |
+| **H-2** | Restart the whole DR cluster | Comes back in recovery, still read-only, `hot_standby` still on, pause target preserved (it lives in `postgresql.conf` / `postgresql.auto.conf`). The frozen image does **not** survive — it is shared memory — so each node re-freezes and self-publishes the first time it reaches a restore point again. Between start and that moment, queries are refused with *"this disaster-recovery replica has no restore point to serve from"*; connecting, `ALTER SYSTEM` and `pg_ctl reload` keep working. | NEW | PASS |
+| **H-2b** | Restart **one** node in the middle of an advance from `N` to `N+1` | The restarted node replays to `N+1`, finds nothing served, and publishes `N+1` on its own while its peers still serve `N` — a torn window that closes when the coordinator's `gg_dr_switch()` publishes `N+1` everywhere. **Left open deliberately:** every way of closing it leaves the node refusing snapshots with no way back in. See [ADR-0005 D3](adr/0005-dr-served-restore-point-snapshot.md). | NEW | **GAP (documented)** |
 | **H-3** | Start a node with `hot_standby = off` in recovery | `IsDRReplicaMode()` is false, so it is an ordinary (unqueryable) standby: no topology filter, no read-only enforcement. This is what keeps mirrors and the standby coordinator unaffected by the fold. | NEW | PASS |
 | **H-4** | **Footgun check:** set `hot_standby = on` on an in-cluster **mirror**, let production change topology, then fail over to it | The mirror's `gp_segment_configuration` is frozen by the topology filter, so after FTS promotes it the cluster describes a stale topology. This is a documented misconfiguration, not a supported mode — the scenario exists to show the damage is real and to keep the warning honest. | NEW | documented footgun |
 | **H-5** | A DR **segment** dies while the coordinator serves | The distributed query fails (no DR-local mirrors, no DR-local FTS — a DR node never leaves `PM_HOT_STANDBY`). **Mirrorless DR is a deliberate PoC scope decision**; the recovery is to rebuild that node. Demonstrate the failure is clean and diagnosable. | NEW | DEGRADE |
@@ -650,12 +651,12 @@ withhold its blessing), but it was not chased down.
 
 ---
 
-## Appendix — why a snapshot taken at rp1 does not hold across an advance
+## Appendix — why a snapshot taken at rp1 did not hold across an advance (and what fixed it)
 
 The natural expectation is that MVCC should cover this: pin a snapshot while the cluster is
-paused at `rp1`, and everything replayed afterwards should simply be too new to see. It does
-not work, and the reason is worth knowing because it is not a bug in the advance — it is what
-the snapshot on a replica actually *is*.
+paused at `rp1`, and everything replayed afterwards should simply be too new to see. It did
+not work, and the reason is worth keeping because it is not a bug in the advance — it is what
+the snapshot on a replica actually *was*. The fix is at the end of this appendix.
 
 **Measured.** One `REPEATABLE READ` transaction, spanning an advance from `mrp1` to `mrp2`:
 
@@ -698,18 +699,44 @@ stable across statements and slices. `qdSerializeDtxContextInfo()` calls
 standby-reader context is deliberately excluded (`cdbdisp_dtx.c`). Each QE therefore takes its
 own fresh local snapshot, per statement, at whatever position it has replayed to.
 
-**So the guarantee was never "the snapshot is a cut" — it is "replay is stopped".** §5.5 of the
-architecture document says as much: the snapshot-leader machinery was skipped precisely because
-*“under stop-and-go this problem collapses — replay is paused while serving, so the local
-recovery snapshot is static”*. Remove the pause and the property it was resting on goes with
-it. This is why C-12's torn read is reachable and why holding a transaction open does not help.
+**So the guarantee was never "the snapshot is a cut" — it was "replay is stopped".** The
+snapshot-leader machinery had been skipped precisely because *"under stop-and-go this problem
+collapses — replay is paused while serving, so the local recovery snapshot is static"*. Remove
+the pause and the property it was resting on went with it. That is why C-12's torn read was
+reachable, and why holding a transaction open did not help.
 
-**What would actually be needed** to serve consistently *while* replay advances — not proposed,
-just scoped honestly: a pinned local snapshot shared to the reader gang (the
-`updateSharedLocalSnapshot` path, or the SR-2 "snapshot leader" scheme that was dropped), a
-distributed `xmax` derived from replayed commits rather than the allocation watermark, and
-retention of the row versions those snapshots need against replayed vacuum. That is a
-substantially larger feature than stop-and-go, and it is the reason stop-and-go was chosen.
+---
+
+### What was done about it
+
+**ADR-0005** — each node freezes its **local** MVCC snapshot when it stops at the restore
+point, and serves that image for every read until the next point is published. The two
+reasons above are addressed by not depending on either:
+
+- *No distributed snapshot at all.* A restore point already supplies the cross-node order a
+  distributed snapshot exists to provide, so the watermark `xmax` stops mattering — it is
+  gone. The straddle it was masking is handled natively by `KnownAssignedXids`, which holds
+  a prepared transaction's local xid on the segments where its rows live.
+- *The local snapshot is pinned, in shared memory, per node.* Not by the QD publishing to
+  reader gangs — by each node freezing its own image at the same distributed cut, which the
+  restore point guarantees is the same instant on all of them. Reader gangs copy from their
+  writer's `SharedLocalSnapshotSlot` as before, so a gang is coherent by construction.
+
+**Publication is the cluster-wide step.** A node that reaches `N+1` first keeps serving `N`
+until the coordinator confirms every node has arrived — otherwise the fast node would show
+`N+1` while a slow one still showed `N`, which is C-12 one restore point later.
+
+**Retention was not added, and does not need to be.** The frozen `xmin` is published to
+`MyPgXact`, so `ResolveRecoveryConflictWithSnapshot()` cancels a reader whose image needs a
+row version replay has removed. The policy is unchanged: the right answer, or none. What
+did change is `max_standby_archive_delay = 0` at build time, because with a frozen `xmin`
+conflicts stop being exceptional and the 30 s default would be added to every advance that
+hits one.
+
+**One thing no snapshot could cover:** `VM_ALL_VISIBLE` lets index-only and bitmap scans
+skip the heap entirely, so the frozen image would never be consulted for those tuples, and
+production's `XLOG_HEAP2_VISIBLE` replays during an advance. `visibilitymap_get_status()`
+returns 0 in DR mode; the index-only fast path is given up on a replica.
 
 ---
 
@@ -724,8 +751,11 @@ otherwise look read-ish: **temp tables**, **role/privilege changes**, and **SERI
 Statistics and configuration are inherited from production and cannot be tuned locally.
 Consistency and freshness are opposed knobs: paused at a restore point you get a stable,
 conflict-free window, and that is the only serving state there is — free-running was removed
-because no other cut has a cross-node guarantee to offer. Advancing between windows inherits
-standard hot-standby cancellation. Production's routine `VACUUM`/`ANALYZE` are safe; rewriting maintenance
+because no other cut has a cross-node guarantee to offer. Every node answers from the local
+MVCC image it froze at that point, so the window holds even while the cluster is advancing to
+the next one; the new point becomes visible on all nodes at once, when the coordinator
+publishes it. Advancing between windows inherits standard hot-standby cancellation, and now
+provokes it more often, because a frozen `xmin` conflicts with replayed cleanup by design. Production's routine `VACUUM`/`ANALYZE` are safe; rewriting maintenance
 (`VACUUM FULL`, `CLUSTER`, `REINDEX`) is safe for user tables but expensive in WAL and
 lock conflicts — and **fatal for the DR if aimed at a topology catalog**. Production HA
 events that fork a timeline are the least-tested boundary and the first thing to verify.

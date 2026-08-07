@@ -121,8 +121,24 @@ log "primary: restore point 'dr_filter_test' created and archived"
 #     restore-point record to pause at. ---
 psql -p "$PORT_BASE" -d postgres -q -c \
 	"create table dr_m3 (id int) distributed by (id); insert into dr_m3 values (1);" || true
+# dr_ios backs the index-only-scan check (ADR-0005 D4).  VACUUM sets the
+# visibility map, so production ships XLOG_HEAP2_VISIBLE for every page; on the DR
+# an index-only scan would then answer straight from the index, with the frozen
+# restore-point image never consulted.  Rows land on both sides of dr_rp1 and each
+# batch is VACUUMed, so the all-visible bits for the POST-rp1 rows replay while the
+# DR is still serving rp1 -- which is the state the check reads in.
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table dr_ios (k int) distributed by (k);
+	 insert into dr_ios select generate_series(1, 200);
+	 create index dr_ios_k on dr_ios (k);" || true
+# VACUUM in its own -c: psql wraps a multi-statement -c in one implicit
+# transaction, and VACUUM cannot run inside a transaction block -- which would
+# roll the whole batch back, silently, past the `|| true`.
+psql -p "$PORT_BASE" -d postgres -q -c "vacuum (analyze) dr_ios;" || true
 psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp1');" >/dev/null 2>&1 || true
 psql -p "$PORT_BASE" -d postgres -q -c "insert into dr_m3 values (2);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "insert into dr_ios select generate_series(201, 400);" || true
+psql -p "$PORT_BASE" -d postgres -q -c "vacuum (analyze) dr_ios;" || true
 psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp2');" >/dev/null 2>&1 || true
 
 # --- M3 STRADDLE: a distributed txn T that spans BOTH segments (real 2PC) whose QD

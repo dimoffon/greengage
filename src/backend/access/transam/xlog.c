@@ -24,6 +24,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
+#include "access/dr_served_snapshot.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
 #include "access/subtrans.h"
@@ -5983,6 +5984,18 @@ pauseRecoveryOnRestorePoint(XLogReaderState *record)
 			strlcpy(XLogCtl->pausedRestorePointName,
 					recordRestorePointData->rp_name, MAXFNAMELEN);
 			SpinLockRelease(&XLogCtl->info_lck);
+
+			/*
+			 * Greengage DR: freeze this node's image here, while replay is
+			 * about to stop, so reads keep answering as-of this restore point
+			 * once the cluster starts advancing to the next one.  It is only
+			 * *pending* until the coordinator confirms every node has arrived.
+			 */
+			if (IsDRReplicaMode())
+			{
+				DRCaptureServedSnapshot(recordRestorePointData->rp_name);
+				DRServedSnapshotPublishIfNothingServed(recordRestorePointData->rp_name);
+			}
 
 			SetRecoveryPause(true);
 			recoveryPausesHere();

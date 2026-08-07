@@ -65,7 +65,15 @@ restore point. Reaching any other position is still possible (`pause`, or an adv
 flight), but is for inspection, not for serving, and `stats` reports no consistent serve
 point there.
 
-### D3 — The as-of-N distributed snapshot is **kept**
+### D3 — The as-of-N distributed snapshot is **kept** — *superseded by ADR-0005*
+
+> **Superseded.** ADR-0005 deletes `CreateDRStandbyDistributedSnapshot()` and serves the
+> local snapshot frozen at the restore point instead. The reasoning below is left as
+> written because it is where the straddle case is worked out — but its central claim is
+> wrong: the in-doubt masking never made a straddling transaction invisible **on the
+> coordinator**, because `XidInMVCCSnapshot()` gates the whole distributed block on
+> `!IS_QUERY_DISPATCHER()`. See ADR-0005 D5.1.
+
 
 The review proposed dropping `CreateDRStandbyDistributedSnapshot()` and its
 `shmCommittedGxidArray` read, on the grounds that a restore point is already consistent.

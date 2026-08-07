@@ -16,6 +16,7 @@
 
 #include <signal.h>
 
+#include "access/dr_served_snapshot.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/heapam.h"
@@ -195,6 +196,7 @@ CreateSharedMemoryAndSemaphores(int port)
 #endif
 
 		size = add_size(size, tmShmemSize());
+		size = add_size(size, DRServedSnapshotShmemSize());
 		size = add_size(size, CheckpointerShmemSize());
 		size = add_size(size, CancelBackendMsgShmemSize());
 		size = add_size(size, WorkFileShmemSize());
@@ -299,6 +301,7 @@ CreateSharedMemoryAndSemaphores(int port)
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
 		FtsShmemInit();
 	tmShmemInit();
+	DRServedSnapshotShmemInit();
 	InitBufferPool();
 
 	/*

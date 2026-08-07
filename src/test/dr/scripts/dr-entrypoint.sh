@@ -233,14 +233,13 @@ if [ -n "$sok" ]; then
 	#     dr_rp1.  Show reads are STABLE as-of dr_rp1 (dr_m3 has 1 row), then after
 	#     advancing to dr_rp2 they reflect as-of dr_rp2 (dr_m3 has 2 rows).  While
 	#     paused there is zero replay, hence zero recovery-conflict cancellation. ---
-	advance() {  # $1=from $2=to : rearm the pause GUC (SIGHUP) + resume replay on ALL nodes
-		local nd dd pp
-		for nd in "${NODES[@]}"; do
-			dd=${nd%:*}; pp=${nd##*:}
-			sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
-			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
-			PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
-		done
+	advance() {  # $1=to : move the whole cluster to a new restore point AND serve it
+		# Deliberately gg_dr_switch() and not a per-node rearm+resume.  Rearming by
+		# hand still gets every node paused at the right place, but reads would go
+		# on answering as of the OLD point forever: what makes a node start serving
+		# a new point is the publish step, and that is only safe once every node
+		# has arrived, which only the coordinator can establish.
+		psql -p "$PORT_BASE" -d postgres -Atc "select gg_dr_switch('$1');" >/dev/null 2>&1
 	}
 	all_paused() {  # true iff EVERY node (coordinator + all segments) has replay paused
 		local nd pp
@@ -263,8 +262,70 @@ if [ -n "$sok" ]; then
 		r=$(dsp 'select count(*) from dr_m3;')
 		[ "$r" = 1 ] && ok3 "M3: repeated read STABLE at dr_rp1 (=1; paused => no replay, no cancellation)" \
 					 || no3 "M3: repeated read changed = '$r'"
-		log "dr-test: M3 advancing dr_rp1 -> dr_rp2 (rearm GUC + SIGHUP + resume on both nodes) ..."
-		advance dr_rp1 dr_rp2
+
+		# --- M3 SKEW (C-12 regression): a read taken while the cluster is mid-advance
+		#     must still answer as of the point it is SERVING, not as of wherever each
+		#     node's replay happens to have got to.
+		#
+		#     Made deterministic rather than raced: drive the SEGMENTS to dr_rp2 by hand
+		#     and leave the coordinator at dr_rp1.  That is exactly the state an advance
+		#     passes through -- segments ahead, no new point published -- but it holds
+		#     still instead of lasting milliseconds.  dr_m3's second row is replayed and
+		#     locally committed on a segment throughout, so a live snapshot shows 2.  The
+		#     frozen dr_rp1 image must keep showing 1 until gg_dr_switch() publishes.
+		skew_segments_to() {  # $1=from $2=to : rearm+resume the segments only
+			local content dd pp
+			for content in $SEG_CONTENTS; do
+				dd=${DR_DATADIR[$content]}; pp=${DR_PORT[$content]}
+				sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
+				PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
+				PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
+			done
+		}
+		segs_reached() {  # $1=restore point : true iff every SEGMENT has replayed to it
+			local content pp
+			for content in $SEG_CONTENTS; do
+				pp=${DR_PORT[$content]}
+				[ "$(PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres \
+					-Atc "select coalesce(pg_last_paused_restore_point(),'');" 2>/dev/null)" = "$1" ] || return 1
+			done
+			return 0
+		}
+		log "dr-test: M3 skew: driving the SEGMENTS to dr_rp2 while the coordinator stays at dr_rp1 ..."
+		skew_segments_to dr_rp1 dr_rp2
+		for _ in $(seq 1 90); do segs_reached dr_rp2 && break; sleep 2; done
+		if segs_reached dr_rp2; then
+			ok3 "M3 skew: segments replayed to dr_rp2, coordinator still at dr_rp1 (mid-advance state, held)"
+			r=$(dsp 'select count(*) from dr_m3;')
+			[ "$r" = 1 ] && ok3 "M3 skew: mid-advance read STILL = 1 (served as-of dr_rp1, not as-of replay-now)" \
+						 || no3 "M3 skew: mid-advance read = '$r' (expected 1 -- a torn read of the advancing segments)"
+			r=$(dsp 'select count(*) from dr_m3;')
+			[ "$r" = 1 ] && ok3 "M3 skew: repeated mid-advance read STILL = 1 (stable, not drifting with replay)" \
+						 || no3 "M3 skew: repeated mid-advance read = '$r' (expected 1)"
+
+			# An index-only scan is the one path a frozen snapshot cannot reach by
+			# itself: an all-visible page lets it answer from the index and skip
+			# the heap, so no visibility check runs at all.  Production VACUUMed
+			# dr_ios on both sides of dr_rp1, so the segments (now at dr_rp2) have
+			# replayed XLOG_HEAP2_VISIBLE for the post-rp1 pages.  Forcing the plan
+			# must still give the dr_rp1 answer, and must show heap fetches -- both
+			# only hold because visibilitymap_get_status() reports nothing
+			# all-visible in DR mode (ADR-0005 D4).
+			r=$(dsp 'set enable_seqscan=off; set enable_bitmapscan=off; select count(k) from dr_ios;')
+			[ "$r" = 200 ] && ok3 "M3 skew: index-only scan mid-advance = 200 (as-of dr_rp1; the post-rp1 rows are all-visible on the segments and still not returned)" \
+						   || no3 "M3 skew: index-only scan mid-advance = '$r' (expected 200 -- the visibility-map fast path leaked replay-now rows)"
+			# `|| true` because grep -c exits 1 when the count is 0 -- which is the
+			# PASSING case here, and under `set -e` a failing command substitution
+			# aborts the script.
+			r=$(dsp 'set enable_seqscan=off; set enable_bitmapscan=off; explain (analyze, costs off, timing off, summary off) select count(k) from dr_ios;' | grep -ci 'Heap Fetches: 0$' || true)
+			[ "$r" = 0 ] && ok3 "M3 skew: no zero-heap-fetch index-only scan on the replica (visibility-map fast path disabled)" \
+						 || no3 "M3 skew: $r index-only scan node(s) reported 'Heap Fetches: 0' (the heap was skipped)"
+		else
+			no3 "M3 skew: segments did not reach dr_rp2 (skew state not established)"
+		fi
+
+		log "dr-test: M3 advancing to dr_rp2 via gg_dr_switch (publishes the new point cluster-wide) ..."
+		advance dr_rp2
 		for _ in $(seq 1 90); do [ "$(dsp 'select count(*) from dr_m3;')" = 2 ] && break; sleep 2; done
 		r=$(dsp 'select count(*) from dr_m3;')
 		[ "$r" = 2 ] && ok3 "M3: after advancing to dr_rp2, dr_m3 count = 2 (new data now visible as-of rp2)" \
@@ -277,7 +338,7 @@ if [ -n "$sok" ]; then
 		#     EXCLUDE T (in-doubt) and NOT error, so dr_straddle shows only the 10
 		#     baseline rows; after advancing past T's forget, T's 20 rows appear (30). ---
 		log "dr-test: M3 straddle: advancing dr_rp2 -> dr_rp_straddle (the straddle cut) ..."
-		advance dr_rp2 dr_rp_straddle
+		advance dr_rp_straddle
 		for _ in $(seq 1 90); do all_paused && break; sleep 2; done
 		r=$(dsp 'select count(*) from dr_straddle;')
 		if [ "$r" = 10 ]; then
@@ -286,7 +347,7 @@ if [ -n "$sok" ]; then
 			no3 "M3 straddle: at the cut dr_straddle = '$r' (expected 10; $(echo "$r" | grep -iE 'ERROR' | head -1))"
 		fi
 		log "dr-test: M3 straddle: advancing dr_rp_straddle -> dr_rp_straddle_done (past T's forget) ..."
-		advance dr_rp_straddle dr_rp_straddle_done
+		advance dr_rp_straddle_done
 		for _ in $(seq 1 90); do [ "$(dsp 'select count(*) from dr_straddle;')" = 30 ] && break; sleep 2; done
 		r=$(dsp 'select count(*) from dr_straddle;')
 		[ "$r" = 30 ] && ok3 "M3 straddle: after advancing past the forget, dr_straddle count = 30 (T now visible)" \

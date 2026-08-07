@@ -83,6 +83,8 @@ extern void KnownAssignedTransactionIdsIdleMaintenance(void);
 extern int	GetMaxSnapshotXidCount(void);
 extern int	GetMaxSnapshotSubxidCount(void);
 
+extern void DRCaptureServedSnapshot(const char *rpName);
+
 extern Snapshot GetSnapshotData(Snapshot snapshot, DtxContext distributedTransactionContext);
 
 extern bool ProcArrayInstallImportedXmin(TransactionId xmin,

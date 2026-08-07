@@ -69,14 +69,11 @@ all_paused() {
 	done
 	return 0
 }
-advance() {   # $1=from $2=to -- rearm the pause GUC (SIGHUP) + resume on ALL nodes
-	local nd dd pp
-	for nd in "${NODES[@]}"; do
-		dd=${nd%:*}; pp=${nd##*:}
-		sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
-		PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
-		PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
-	done
+advance() {   # $1=to -- move the whole cluster to a new restore point AND serve it
+	# gg_dr_switch(), not a per-node rearm+resume: the step that makes a node start
+	# serving the new point may only run once every node has arrived, so only the
+	# coordinator can drive it (ADR-0005).
+	psql -p "$PORT_BASE" -d postgres -Atc "select gg_dr_switch('$1');" >/dev/null 2>&1
 }
 
 BLKSZ=$(q "select current_setting('block_size')::int;")
@@ -120,7 +117,7 @@ for _ in $(seq 1 900); do [ -f "$ARCHIVE/dense_truncate_done" ] && break; sleep 
 source "$ARCHIVE/dense_prod_state.env"
 log "dense-dr: production truncated $PROD_PAGES_DENSE -> $PROD_PAGES_AFTER page(s); advancing the DR past it"
 
-advance dense_rp_pre dense_rp_post
+advance dense_rp_post
 for _ in $(seq 1 180); do all_paused && break; sleep 2; done
 all_paused || log "dense-dr: WARNING nodes did not all pause at dense_rp_post; reporting current state anyway"
 
