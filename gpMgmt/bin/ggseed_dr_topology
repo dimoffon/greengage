@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# gpseed_dr_topology -- frozen-tuple seed of a DR replica's cluster topology
+# ggseed_dr_topology -- frozen-tuple seed of a DR replica's cluster topology
 #                       (Greengage disaster-recovery PoC, milestone M1.5)
 #
 # A read-only DR replica's gp_segment_configuration must describe the *DR*
@@ -18,7 +18,7 @@
 # are never overwritten, and the frozen tuples stay visible without CLOG.
 #
 # Usage:
-#   gpseed_dr_topology <coordinator_datadir> <dr_topology.tsv>
+#   ggseed_dr_topology <coordinator_datadir> <dr_topology.tsv>
 #
 # dr_topology.tsv: one tab-separated line per segment instance, columns:
 #   dbid <TAB> content <TAB> role <TAB> preferred_role <TAB> mode <TAB> \

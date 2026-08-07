@@ -128,7 +128,7 @@ Being explicit about provenance matters for maintenance:
 - The M3 as-of-N distributed snapshot builder `CreateDRStandbyDistributedSnapshot()`.
 - The M5 served-restore-point accessor + `gg_stat_dr_replica` views.
 - The `gg_dr_switch()` / `gg_dr_promote()` recovery-control functions (§6.4).
-- The `ggdr` / `gpseed_dr_topology` utilities.
+- The `ggdr` / `ggseed_dr_topology` utilities.
 
 **Reused upstream Greengage hot-standby dispatch** (commit `35e95b9c`, 2023, *"Enable hot
 standby dispatch"* — predates and is independent of DR):
@@ -264,7 +264,7 @@ Two important consequences:
 #### 4.2.2 Frozen-tuple seed
 
 After a base backup is restored, `gp_segment_configuration` still holds production's rows.
-`gpseed_dr_topology` (`gpMgmt/bin/gpseed_dr_topology`) replaces them with DR-local rows
+`ggseed_dr_topology` (`gpMgmt/bin/ggseed_dr_topology`) replaces them with DR-local rows
 **before** `standby.signal` is placed:
 
 1. start the coordinator **standalone** (`postgres --single`, `allow_system_table_mods=on`);
@@ -660,7 +660,7 @@ What it does, in order (`cmd_create_replica`):
    because resuming without the archived `[REDO..backup-end]` WAL could replay the seed's
    forked WAL and permanently fork the timeline.
 4. **Frozen-topology seed** on the coordinator: save `backup_label` + `global/pg_control`
-   aside, run `gpseed_dr_topology` (§4.2.2), then **restore** the saved recovery-start state
+   aside, run `ggseed_dr_topology` (§4.2.2), then **restore** the saved recovery-start state
    so recovery resumes from the backup checkpoint, and **re-fetch** any backup-tail WAL
    segment from the archive over `pg_wal` (so the seed's WAL can never win over the archive).
 5. **Arm the replica** on every node: empty `postgresql.auto.conf`; append `hot_standby = on`,
@@ -956,7 +956,7 @@ $ ggdr create-replica \
 | DR mode gate | `IsDRReplicaMode()` = `EnableHotStandby && RecoveryInProgress()`, `xlog.c`; decl `xlog.h` |
 | Redo filter | `dr_redo_filter.c` (`DRRedoShouldFilter` :229-259, protected OIDs :43-52, resolve :71-104, match :164-183, remap-reject :138-158, `DRRedoShouldFilterRelFileNode` :207-217); dispatch + consistency-check skip `xlog.c:7730-7742`; header `dr_redo_filter.h:32-56`; remap redo `relmapper.c:1032-1048`; smgr truncate guard `storage.c:698-715` |
 | WAL-filter tool (auxiliary) | `src/bin/gg_walfilter/` (`gg_walfilter.c` CLI, `segment.c` walker/decoder, `filter.c` rules + NOOP rewrite + lookback, `state.c` boundary state, `fetch.c` fetch/install); tests `src/test/dr/test_gg_walfilter.py` (black-box) |
-| Frozen seed | `gpMgmt/bin/gpseed_dr_topology` |
+| Frozen seed | `gpMgmt/bin/ggseed_dr_topology` |
 | Read-only enforcement | `execMain.c:1651-1660`; DTM backstop `cdbtm.c:281-284` |
 | FTS/autovac (structural) | `postmaster.c:6545-6578` (bgworker), `postmaster.c:2132-2134` (autovac) |
 | Standby-reader context | `DTX_CONTEXT_QD_STANDBY_READER` `cdbtm.h:142-149`; select `cdbtm.c:1729-1743`; skips `cdbtm.c:417,452`, `execMain.c:666`; serialize `cdbdisp_dtx.c:158-177` |

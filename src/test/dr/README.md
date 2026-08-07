@@ -46,7 +46,7 @@ a while; subsequent runs reuse the image.
    It also creates a user table (`dr_wal_applied`) *after* the base backup, so
    that table exists only in the WAL (not the backup).
 2. The **dr** container restores the coordinator's base backup; **frozen-seeds
-   DR-local topology** (`gpseed_dr_topology`, `DR_SEED=1`) while preserving the
+   DR-local topology** (`ggseed_dr_topology`, `DR_SEED=1`) while preserving the
    recovery-start state (save/restore `backup_label` + `pg_control`, the M4 fix);
    arms `hot_standby` + `standby.signal` +
    `restore_command`; and starts the coordinator as a **live, continuous
@@ -127,7 +127,7 @@ of reporting a pass, so an inconclusive run can never look green.
 - Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
 - **`DR_SEED`** (dr service env) defaults to `1`: the DR coordinator is
-  frozen-seeded with DR-local topology (`gpseed_dr_topology`) *and* its
+  frozen-seeded with DR-local topology (`ggseed_dr_topology`) *and* its
   recovery-start state (`backup_label` + `pg_control`) is preserved around the
   seed (the M4 fix), so it resumes production's WAL from the archive instead of
   forking the timeline. Set `DR_SEED=0` to skip the seed (the DR then mirrors

@@ -235,8 +235,10 @@ Applied after the first round of use:
   without bound for a cluster that has no RPO at all. Both are now NULL out of recovery, and
   `rpo_seconds` with them.
 
-- **`gg_recovery` is renamed `ggdr`**, and its `stats` subcommand to `stat`, matching the
-  view it prints.
+- **Utilities take the `gg` prefix too:** `gg_recovery` is renamed `ggdr` (its `stats`
+  subcommand to `stat`, matching the view it prints), and `gpseed_dr_topology` becomes
+  `ggseed_dr_topology`. `pg_last_paused_restore_point()` deliberately stays `pg_*`, per
+  the reasoning above.
 
 
 ---

@@ -17,8 +17,9 @@
   `7.x-dr`.
 - **Superseded in part:** D2's `gp_dr_replica` + `dr_replica.signal` gate is replaced by
   ADR-0004 (hot standby *is* DR mode). D1/D3 and the rest stand. Names below are also
-  pre-rename: the `gg_recovery` utility is now `ggdr` (its `stats` subcommand `stat`), and
-  the feature's SQL objects carry a `gg_` prefix — see ADR-0004 D5.
+  pre-rename: the `gg_recovery` utility is now `ggdr` (its `stats` subcommand `stat`),
+  `gpseed_dr_topology` is `ggseed_dr_topology`, and the feature's SQL objects carry a
+  `gg_` prefix — see ADR-0004 D5.
 
 ---
 

@@ -515,15 +515,15 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     rows = _parse_topology(topology)
     if restore_command is None:
         restore_command = "cp %s/seg%%c/%%f %%p" % wal_archive
-    # gpseed_dr_topology ships beside ggdr in $GPHOME/bin; also try PATH and $GPHOME.
+    # ggseed_dr_topology ships beside ggdr in $GPHOME/bin; also try PATH and $GPHOME.
     here = os.path.dirname(os.path.abspath(__file__))
     seed_prog = next((c for c in (
-        os.path.join(here, "gpseed_dr_topology"),
-        shutil.which("gpseed_dr_topology"),
-        os.path.join(os.environ.get("GPHOME", ""), "bin", "gpseed_dr_topology"),
+        os.path.join(here, "ggseed_dr_topology"),
+        shutil.which("ggseed_dr_topology"),
+        os.path.join(os.environ.get("GPHOME", ""), "bin", "ggseed_dr_topology"),
     ) if c and os.path.exists(c)), None)
     if not seed_prog:
-        sys.exit("ggdr create-replica: cannot find gpseed_dr_topology "
+        sys.exit("ggdr create-replica: cannot find ggseed_dr_topology "
                  "(looked next to ggdr, on PATH, and in $GPHOME/bin)")
     print("ggdr create-replica: building a DR replica for %d instance(s) from %s"
           % (len(rows), basebackup_dir))
@@ -592,7 +592,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     _run(["cp", "-p", ctl, ctl + ".drsave"])
     rc, out, err = _run([seed_prog, cdd, topology])
     if rc != 0:
-        sys.exit("ggdr create-replica: gpseed_dr_topology failed: %s" % (err or out))
+        sys.exit("ggdr create-replica: ggseed_dr_topology failed: %s" % (err or out))
     # (a) restore recovery-start state so recovery resumes from the backup checkpoint
     if have_label:
         _run(["mv", label + ".drsave", label])
