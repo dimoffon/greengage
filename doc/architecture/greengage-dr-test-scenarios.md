@@ -105,7 +105,7 @@ that tries to allocate a `gxid`.
 | **C-4** | `ggdr pause` (immediate pause), then read | Reads *work* but the cut is **not** cluster-consistent — each node halted wherever it was. `gg_stat_dr_replica_summary.consistent_restore_point` is `NULL`. Operators must treat this as "inspect a node", never "serve a report". | NEW | DEGRADE |
 | **C-5** | A long analytical query spanning an **advance** (`gg_dr_switch` to the next restore point), while production has run `VACUUM` | The query can be delayed then cancelled: `canceling statement due to conflict with recovery … User query might have needed to see row versions that must be removed`. With one backend per segment, **cancelling any one segment fails the whole distributed query**. `hot_standby_feedback` cannot help — there is no streaming connection back to production. Since free-running mode was removed, this is now confined to advance bursts rather than being the steady state. | NEW | DEGRADE |
 | **C-6** | Same as C-5 with `max_standby_archive_delay = -1` | Queries survive; **replay stalls instead**, so RPO grows for as long as the query runs. Demonstrates the knob is a trade, not a fix. | NEW | DEGRADE |
-| **C-7** | Query issued *just before* an advance and spanning it | Same conflict exposure as C-5. Operational rule: size serve windows to your longest report. | NEW | DEGRADE |
+| **C-7** | Transaction open on the DR **spanning an advance**, holding a lock on a table production rewrote | **Measured — see [C-7/V-10 results](#appendix--c-7--v-10-measured-vacuum-full-under-a-live-reader).** The reader is cancelled, not fed a torn view: `canceling statement due to conflict with recovery / User was holding a relation lock for too long`. Its whole transaction aborts; after rollback the next statement sees the new cut. The reader also **delays the advance for the whole cluster** by `max_standby_archive_delay`. | **RUN** | DEGRADE (fails safe) |
 | **C-8** | `switch` to a restore point **already drained past** | Times out — recovery only moves forward. Recovery is to pick a restore point still ahead. | NEW | REFUSE |
 | **C-9** | `switch` armed for a restore point production has **not created yet** | Succeeds when the WAL arrives — nodes catch it cleanly instead of overshooting. This is the pattern the promote test uses. | AUTO | PASS |
 | **C-10** | Per-segment archive **skew**: one segment lags | The cluster cannot reach a consistent cut until the slowest segment has archived *and* replayed through its N-LSN. `stats` shows the laggard. **The slowest archiver gates everyone.** | NEW | DEGRADE |
@@ -133,7 +133,7 @@ replica?*
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **V-10** | `VACUUM FULL` a large **user** table on production | Correct on the DR, but with three costs: (1) the whole table is re-WAL'd (`wal_level = replica` forces it) → **archive burst and an RPO spike proportional to table size**; (2) the replayed **AccessExclusiveLock** cancels DR queries touching that table after `max_standby_archive_delay`; (3) transient **2× disk** on the DR while both relfilenodes exist. Schedule inside a paused window and advance afterwards. | NEW | DEGRADE |
+| **V-10** | `VACUUM FULL` a large **user** table on production | Correct on the DR, but with three costs: (1) the whole table is re-WAL'd (`wal_level = replica` forces it) → **archive burst and an RPO spike proportional to table size**; (2) the replayed **AccessExclusiveLock** cancels DR queries touching that table after `max_standby_archive_delay` — [measured](#appendix--c-7--v-10-measured-vacuum-full-under-a-live-reader); (3) transient **2× disk** on the DR while both relfilenodes exist. Schedule inside a paused window and advance afterwards. | NEW | DEGRADE |
 | **V-11** | `CLUSTER` a user table | Identical to V-10 — same rewrite mechanics. | NEW | DEGRADE |
 | **V-12** | `REINDEX` a user index | Index rebuilt via WAL on the DR; lock conflict for queries using that index during the advance. | NEW | DEGRADE |
 | **V-13** | **`VACUUM FULL` / `CLUSTER` / `REINDEX` / `TRUNCATE` on a protected topology catalog** (`gp_segment_configuration`, its indexes/TOAST, `gp_configuration_history`, `gp_id`, `gp_version_at_initdb`) | The DR **halts, deliberately and loudly**: `relmap_redo()` → `DRRejectForbiddenRemap()` raises `FATAL` *before* any on-disk write, so the replay LSN never advances past the offending record. The node's postmaster goes down. **Recovery is to rebuild that DR node from a fresh base backup + re-seed.** There is no preemptive block on production — treat these catalogs as immutable while a DR is attached. This is the sharpest operational contract in the feature and must be demonstrated, not just documented. | NEW | HALT (by design) |
@@ -521,6 +521,65 @@ it is the right one.
 **Still outstanding**
 
 - The dense fixture is **not wired into CI**; it is run on demand against two images.
+
+---
+
+## Appendix — C-7 / V-10 measured: `VACUUM FULL` under a live reader
+
+The question this answers: a DR paused at `rp1` has an open transaction reading a heap
+table; production `VACUUM FULL`s that table and creates `rp2`; the DR is then switched to
+`rp2`. Does the reader fail, or does it silently observe a state that exists at neither
+restore point?
+
+**Setup.** `test_h`, 100 000 rows, on a DR paused at `rp1`. Production then
+`DELETE`s 10 000 rows, `VACUUM FULL`s the table (relfilenode 16394 → **16397**, a full
+rewrite) and creates `rp2`. So `rp1` = 100 000 rows, `rp2` = 90 000 rows, and the two cuts
+are distinguishable. `max_standby_archive_delay` is the default 30s.
+
+**Result — the reader is cancelled; it is never shown a torn view.**
+
+```
+begin;
+select count(*) as first_read from test_h;     ->  100000        (rp1, as expected)
+select pg_sleep(75);
+    ERROR:  canceling statement due to conflict with recovery
+    DETAIL:  User was holding a relation lock for too long.
+select count(*) as second_read from test_h;
+    ERROR:  current transaction is aborted, commands ignored until end of transaction block
+commit;                                        ->  ROLLBACK
+select count(*) as after_commit from test_h;   ->  90000         (rp2, new transaction)
+```
+
+The first `SELECT` takes `AccessShareLock` on `test_h` and holds it for the transaction.
+Replaying production's rewrite requires `AccessExclusiveLock`, so the startup process waits
+`max_standby_archive_delay` and then cancels the holder. The transaction aborts as a unit —
+the second read never runs, so there is no way to observe half of `rp1` and half of `rp2`
+inside one transaction. Only after `ROLLBACK`, in a *new* transaction, does the session see
+`rp2`.
+
+**The reader also delays the whole cluster.** The same `gg_dr_switch('rp2')` took:
+
+| | wall time |
+|---|---|
+| with the live reader holding its lock | **31s** (= `max_standby_archive_delay` + change) |
+| with no long-held lock (fresh short queries only) | **1s** |
+
+That is the operationally important half of the finding: one long-running report does not
+merely risk itself, it stalls every other consumer's advance by up to
+`max_standby_archive_delay` — and with `max_standby_archive_delay = -1` it would stall the
+advance indefinitely.
+
+**What this run does *not* establish.** A second run polled `test_h` with short queries
+throughout the advance and saw only `100000` then `90000` — no intermediate value, no
+errors. That is weak evidence, not proof: the advance lasted ~1s, and in this workload the
+intermediate cut (after the `DELETE`, before the rewrite) happens to have the same row count
+as `rp2`. The general exposure stands and is untested: **nothing prevents queries while an
+advance is in flight**, and mid-advance the cluster is at an arbitrary LSN, not a restore
+point — precisely the position §D2 says carries no cross-node guarantee. Demonstrating a
+genuinely torn mid-advance read needs a distributed transaction straddling the two restore
+points, i.e. the C-3 fault-injection machinery pointed at an advance window rather than at a
+cut. Until that is run, "do not query during an advance" is a convention, not something the
+implementation enforces.
 
 ---
 
