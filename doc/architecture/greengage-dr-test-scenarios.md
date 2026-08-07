@@ -62,7 +62,7 @@ that tries to allocate a `gxid`.
 | **Q-5** | Multi-slice **JOIN** (redistribute/broadcast motion, QE_READER consume path) | Reader gangs work; under stop-and-go every slice sees the same static snapshot. | AUTO |
 | **Q-6** | Aggregates, window functions, `GROUP BY`/`ORDER BY` with **spill to disk** | Work files are ordinary temp files — no WAL, no catalog write. | NEW |
 | **Q-7** | Read-only CTEs, subqueries, `UNION ALL` mixing a coordinator-entry row with segment rows | The last one is planned onto a **writer** gang; the gxid check is exempted for standby QEs via `IS_STANDBY_QE()` (`xact.c:2510`). `gg_stat_dr_replica` itself is this shape. | AUTO (via M5) |
-| **Q-8** | Multi-statement read transaction (`BEGIN; SELECT; SELECT; COMMIT`) | Repeatable within a serve window — replay is paused, so the local recovery snapshot is static. | NEW |
+| **Q-8** | Multi-statement read transaction (`BEGIN; SELECT; SELECT; COMMIT`) | Repeatable **only while the cluster stays paused** — and that is a property of replay being stopped, not of the snapshot. Across an advance the same transaction sees new data **even at REPEATABLE READ**; see [why the rp1 snapshot does not hold](#appendix--why-a-snapshot-taken-at-rp1-does-not-hold-across-an-advance). | **RUN** |
 | **Q-9** | `DECLARE CURSOR` / `FETCH` within one serve window | Same static-snapshot argument. **Caveat:** a cursor held across an `N → N+1` advance is exposed to recovery conflicts (see C-5). | NEW |
 | **Q-10** | `EXPLAIN` and `EXPLAIN ANALYZE` of a **SELECT** | `commandType == CMD_SELECT`, no rowMarks → passes the DR gate. | NEW |
 | **Q-11** | `PREPARE` / `EXECUTE` of a SELECT; plan reuse across an advance | Plan-cache invalidations arrive as replayed catalog invalidations. | NEW |
@@ -647,6 +647,69 @@ when a restore-point record is replayed, and resuming clears the name. Most like
 intra-query timing artifact of the dispatched view straddling the moment segment 0 paused. It
 does not affect the finding (and, as above, the NULL is what makes the summary correctly
 withhold its blessing), but it was not chased down.
+
+---
+
+## Appendix — why a snapshot taken at rp1 does not hold across an advance
+
+The natural expectation is that MVCC should cover this: pin a snapshot while the cluster is
+paused at `rp1`, and everything replayed afterwards should simply be too new to see. It does
+not work, and the reason is worth knowing because it is not a bug in the advance — it is what
+the snapshot on a replica actually *is*.
+
+**Measured.** One `REPEATABLE READ` transaction, spanning an advance from `mrp1` to `mrp2`:
+
+| | wallclock | `now()` (transaction start) | `mark` by segment |
+|---|---|---|---|
+| first read | 12:40:06.918 | `12:40:06.893273` | `-` (empty) |
+| second read | 12:40:31.937 | `12:40:06.893273` | `0:1,1:1` |
+
+Same `now()`, `transaction_isolation = repeatable read`, clean `COMMIT`. So this is one
+transaction, and data committed after its snapshot became visible inside it. **A pinned
+snapshot does not hold.**
+
+**Why — two independent reasons, both by construction.**
+
+*1. The distributed snapshot's `xmax` is a prefetched watermark, not a commit counter.*
+`CreateDRStandbyDistributedSnapshot()` sets `xmax = ShmemVariableCache->nextGxid`, which redo
+advances from `XLOG_NEXTGXID` records. Those are written by `XLogPutNextGxid(nextLimit)` where
+`nextLimit = nextGxid + GxidCount + gp_gxid_prefetch_num` (`cdbtm.c`) — a *pre-allocation
+ceiling*, logged in batches of **8192** by default. So `xmax` already sits far above anything
+that has actually committed in the replayed stream. A transaction that arrives later falls
+into the gap:
+
+```
+gxid < ds->xmax                    -> not rejected as "in the future"
+gxid not in inProgressXidArray     -> not masked as in-doubt
+                                      (it had not been replayed when the snapshot was built,
+                                       so its DISTRIBUTED_COMMIT was not in the array)
+=> the distributed snapshot says VISIBLE; local MVCC then decides, and after the advance the
+   tuple's local xact is committed -> visible.
+```
+
+The in-progress set answers *“what is in doubt right now”*, not *“what has happened so far”*.
+That is exactly right for the job it was built for — masking a straddler **at a cut** (§D3) —
+and gives no protection against transactions that arrive afterwards.
+
+*2. The local snapshot is not pinned either.* On a live cluster the QD publishes its local
+snapshot into shared memory and the reader QEs use it, which is what makes a transaction's view
+stable across statements and slices. `qdSerializeDtxContextInfo()` calls
+`updateSharedLocalSnapshot()` **only** for `DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE` — the
+standby-reader context is deliberately excluded (`cdbdisp_dtx.c`). Each QE therefore takes its
+own fresh local snapshot, per statement, at whatever position it has replayed to.
+
+**So the guarantee was never "the snapshot is a cut" — it is "replay is stopped".** §5.5 of the
+architecture document says as much: the snapshot-leader machinery was skipped precisely because
+*“under stop-and-go this problem collapses — replay is paused while serving, so the local
+recovery snapshot is static”*. Remove the pause and the property it was resting on goes with
+it. This is why C-12's torn read is reachable and why holding a transaction open does not help.
+
+**What would actually be needed** to serve consistently *while* replay advances — not proposed,
+just scoped honestly: a pinned local snapshot shared to the reader gang (the
+`updateSharedLocalSnapshot` path, or the SR-2 "snapshot leader" scheme that was dropped), a
+distributed `xmax` derived from replayed commits rather than the allocation watermark, and
+retention of the row versions those snapshots need against replayed vacuum. That is a
+substantially larger feature than stop-and-go, and it is the reason stop-and-go was chosen.
 
 ---
 
