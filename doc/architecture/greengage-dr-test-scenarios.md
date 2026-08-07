@@ -22,7 +22,7 @@ them (T-3, HA-1) predict *failures*.
 
 Base fixture: `docker-compose -f src/test/dr/docker-compose.yml up --build` — a production
 container (coordinator + 2 segments, archiving per content) and a DR container sharing an
-`/archive` volume, built with `gg_recovery create-replica`.
+`/archive` volume, built with `ggdr create-replica`.
 
 ---
 
@@ -30,7 +30,7 @@ container (coordinator + 2 segments, archiving per content) and a DR container s
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **A-1** | `gg_recovery create-replica` from per-content base backups + WAL archive | Every node restored, coordinator frozen-seeded with DR-local topology, replica armed (`hot_standby`, `restore_command`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build topology check confirming the seed describes this cluster (V-21). | AUTO | PASS |
+| **A-1** | `ggdr create-replica` from per-content base backups + WAL archive | Every node restored, coordinator frozen-seeded with DR-local topology, replica armed (`hot_standby`, `restore_command`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build topology check confirming the seed describes this cluster (V-21). | AUTO | PASS |
 | **A-2** | DR describes **itself**, not production | `gp_segment_configuration.hostname` on the DR reads `dr`, never production's host. The frozen-tuple seed (`xmin = FrozenTransactionId`) is unconditionally visible with no CLOG dependency, and the redo filter blocks production's records from overwriting it. | AUTO | PASS |
 | **A-3** | Production mutates `gp_segment_configuration` (hostname change) | DR value is **unchanged**. `DRRedoShouldFilter()` sees every referenced block in the protected set and skips `rm_redo`; `lastReplayedEndRecPtr` still advances, so the DR stays in LSN lock-step. | AUTO | PASS |
 | **A-4** | Redo filter is **selective** — a user table created on production *after* the base backup | Table appears on the DR. Proof the filter only skips the topology catalogs, not ordinary WAL. | AUTO | PASS |
@@ -61,15 +61,15 @@ that tries to allocate a `gxid`.
 | **Q-4** | InitPlan-bearing read (`select (select count(*) from t)`) | The InitPlan/subplan DTX setup is skipped under DR mode (`execMain.c:666`), so no gxid is demanded. | AUTO |
 | **Q-5** | Multi-slice **JOIN** (redistribute/broadcast motion, QE_READER consume path) | Reader gangs work; under stop-and-go every slice sees the same static snapshot. | AUTO |
 | **Q-6** | Aggregates, window functions, `GROUP BY`/`ORDER BY` with **spill to disk** | Work files are ordinary temp files — no WAL, no catalog write. | NEW |
-| **Q-7** | Read-only CTEs, subqueries, `UNION ALL` mixing a coordinator-entry row with segment rows | The last one is planned onto a **writer** gang; the gxid check is exempted for standby QEs via `IS_STANDBY_QE()` (`xact.c:2510`). `gp_stat_dr_replica` itself is this shape. | AUTO (via M5) |
+| **Q-7** | Read-only CTEs, subqueries, `UNION ALL` mixing a coordinator-entry row with segment rows | The last one is planned onto a **writer** gang; the gxid check is exempted for standby QEs via `IS_STANDBY_QE()` (`xact.c:2510`). `gg_stat_dr_replica` itself is this shape. | AUTO (via M5) |
 | **Q-8** | Multi-statement read transaction (`BEGIN; SELECT; SELECT; COMMIT`) | Repeatable within a serve window — replay is paused, so the local recovery snapshot is static. | NEW |
 | **Q-9** | `DECLARE CURSOR` / `FETCH` within one serve window | Same static-snapshot argument. **Caveat:** a cursor held across an `N → N+1` advance is exposed to recovery conflicts (see C-5). | NEW |
 | **Q-10** | `EXPLAIN` and `EXPLAIN ANALYZE` of a **SELECT** | `commandType == CMD_SELECT`, no rowMarks → passes the DR gate. | NEW |
 | **Q-11** | `PREPARE` / `EXECUTE` of a SELECT; plan reuse across an advance | Plan-cache invalidations arrive as replayed catalog invalidations. | NEW |
 | **Q-12** | Reads of **AO / AOCO** and partitioned tables | Append-optimized reads consume `pg_aoseg` + visimap, all replayed. Worth explicit coverage since AO is the common GP storage. | NEW |
 | **Q-13** | `SET`, `SHOW`, `RESET`, `DISCARD`, session GUC changes | No WAL, no catalog write. | NEW |
-| **Q-14** | `ALTER SYSTEM SET` + `pg_reload_conf()` | Writes `postgresql.auto.conf`, not WAL — allowed on a standby. `gg_recovery switch` depends on this. | AUTO (via `gg_recovery`) |
-| **Q-15** | `pg_last_paused_restore_point()`, `gp_stat_dr_replica`, `gp_stat_dr_replica_summary` | Read-only accessors over `XLogCtl` + `gp_dist_random('gp_id')`. | AUTO |
+| **Q-14** | `ALTER SYSTEM SET` + `pg_reload_conf()` | Writes `postgresql.auto.conf`, not WAL — allowed on a standby. `ggdr switch` depends on this. | AUTO (via `ggdr`) |
+| **Q-15** | `pg_last_paused_restore_point()`, `gg_stat_dr_replica`, `gg_stat_dr_replica_summary` | Read-only accessors over `XLogCtl` + `gp_dist_random('gp_id')`. | AUTO |
 | **Q-16** | Read from an external table (gpfdist / PXF readable) | Read-only dispatch. **Confirm empirically** — external scans have their own gang requirements. | NEW `PREDICTED` |
 
 ### B.2 — Not supported (must be refused, with the right error)
@@ -100,10 +100,10 @@ that tries to allocate a `gxid`.
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **C-1** | All nodes paused at restore point `N`; read twice | Identical results. Replay is stopped, so the local recovery snapshot is static and the distributed dimension is a fixed as-of-N `DistributedSnapshot`. **Zero recovery-conflict exposure inside a serve window.** | AUTO | PASS |
-| **C-2** | Advance `N → N+1` (`gg_recovery switch`), re-read | Results move forward atomically to the new cut — data written on production between N and N+1 becomes visible together. | AUTO | PASS |
+| **C-2** | Advance `N → N+1` (`ggdr switch`), re-read | Results move forward atomically to the new cut — data written on production between N and N+1 becomes visible together. | AUTO | PASS |
 | **C-3** | **The straddle.** A distributed 2PC txn *T* whose coordinator `XLOG_XACT_DISTRIBUTED_COMMIT` lands *before* the restore point but whose commit-prepared broadcast lands *after* (injected with the `dtm_broadcast_commit_prepared` fault) | At the cut, *T*'s rows are **invisible everywhere** and no error is raised. `CreateDRStandbyDistributedSnapshot()` places `shmCommittedGxidArray` entries into the **in-progress (invisible)** set — the semantic inversion that compensates for the straddle. After advancing past *T*'s forget, its rows appear. | AUTO | PASS |
-| **C-4** | `gg_recovery pause` (immediate pause), then read | Reads *work* but the cut is **not** cluster-consistent — each node halted wherever it was. `gp_stat_dr_replica_summary.consistent_restore_point` is `NULL`. Operators must treat this as "inspect a node", never "serve a report". | NEW | DEGRADE |
-| **C-5** | A long analytical query spanning an **advance** (`gp_dr_switch` to the next restore point), while production has run `VACUUM` | The query can be delayed then cancelled: `canceling statement due to conflict with recovery … User query might have needed to see row versions that must be removed`. With one backend per segment, **cancelling any one segment fails the whole distributed query**. `hot_standby_feedback` cannot help — there is no streaming connection back to production. Since free-running mode was removed, this is now confined to advance bursts rather than being the steady state. | NEW | DEGRADE |
+| **C-4** | `ggdr pause` (immediate pause), then read | Reads *work* but the cut is **not** cluster-consistent — each node halted wherever it was. `gg_stat_dr_replica_summary.consistent_restore_point` is `NULL`. Operators must treat this as "inspect a node", never "serve a report". | NEW | DEGRADE |
+| **C-5** | A long analytical query spanning an **advance** (`gg_dr_switch` to the next restore point), while production has run `VACUUM` | The query can be delayed then cancelled: `canceling statement due to conflict with recovery … User query might have needed to see row versions that must be removed`. With one backend per segment, **cancelling any one segment fails the whole distributed query**. `hot_standby_feedback` cannot help — there is no streaming connection back to production. Since free-running mode was removed, this is now confined to advance bursts rather than being the steady state. | NEW | DEGRADE |
 | **C-6** | Same as C-5 with `max_standby_archive_delay = -1` | Queries survive; **replay stalls instead**, so RPO grows for as long as the query runs. Demonstrates the knob is a trade, not a fix. | NEW | DEGRADE |
 | **C-7** | Query issued *just before* an advance and spanning it | Same conflict exposure as C-5. Operational rule: size serve windows to your longest report. | NEW | DEGRADE |
 | **C-8** | `switch` to a restore point **already drained past** | Times out — recovery only moves forward. Recovery is to pick a restore point still ahead. | NEW | REFUSE |
@@ -144,7 +144,7 @@ replica?*
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **V-20** | Production `VACUUM` **truncates trailing pages of a protected topology catalog**. Reproduced by `src/test/dr/docker-compose.dense.yml` | **Was a real defect; now fixed and verified end to end** ([results](#appendix--v-20-reproduced-and-fixed-end-to-end)): unguarded build → DR left with 0 topology rows; guarded build → 3 rows intact, guard log line on the real record. `XLOG_SMGR_TRUNCATE` is emitted with `XLogRegisterData` only, **no registered buffers** (`storage.c:315-326`), so it has zero block references, and `DRRedoShouldFilter()` deliberately applies any such record (unit-tested as `test_dr_mode_no_blocks_applies`) — correctly, since that is also a commit record's shape. The truncate branch of `smgr_redo` had no protected-relfilenode guard, and the seed never rewrites the relation (`DELETE` → `INSERT`s → `VACUUM FREEZE`, `gpseed_dr_topology:107-110`), so production's record named **the same `RelFileNode`** holding the DR's frozen topology. Confirmed reproducible: against a dense page the seed's rows land on a trailing block a later production truncation would discard (see [V-21 results](#appendix--v-21-measured-on-the-fixture)). **Fixed** by `DRRedoShouldFilterRelFileNode()` (`dr_redo_filter.c:207-217`), called from `smgr_redo` (`storage.c:698-715`), which **skips** the truncation and logs at `LOG`. Skip rather than `FATAL`: an ignored truncation has no lasting consequence, whereas halting would take every DR node down on a routine production autovacuum. Expected behaviour now: the DR keeps its own pages, replay continues, one `LOG` line per skipped truncation. | NEW | PASS (regression) |
-| **V-21** | Assert the DR's topology seed took, and where its rows physically landed | Now **wired into `gg_recovery create-replica` as step 7** (`_check_seeded_topology()`): it reads `gp_segment_configuration` back from the coordinator and requires it to match the topology file on `dbid`/`content`/`port`/`hostname` — a silent seed failure **fails the build**. It also reports the heap size and the block holding the live rows; above block 0 means this node's topology depends on the truncation guard. Verified in both fixtures: the default one reports `1 page(s), live rows on block 0` and stays quiet; the dense one reports `12 page(s), live rows on block 11` and emits the note. First measured manually — see [results](#appendix--v-21-measured-on-the-fixture). | **RUN + automated** | PASS |
+| **V-21** | Assert the DR's topology seed took, and where its rows physically landed | Now **wired into `ggdr create-replica` as step 7** (`_check_seeded_topology()`): it reads `gp_segment_configuration` back from the coordinator and requires it to match the topology file on `dbid`/`content`/`port`/`hostname` — a silent seed failure **fails the build**. It also reports the heap size and the block holding the live rows; above block 0 means this node's topology depends on the truncation guard. Verified in both fixtures: the default one reports `1 page(s), live rows on block 0` and stays quiet; the dense one reports `12 page(s), live rows on block 11` and emits the note. First measured manually — see [results](#appendix--v-21-measured-on-the-fixture). | **RUN + automated** | PASS |
 
 ---
 
@@ -175,7 +175,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **HA-1** | **Production segment fails over to its mirror** (FTS promotes; that content's timeline goes 1 → 2) while the DR is attached | **Failure, confirmed by code reading** (chain traced end to end — see [HA-1 analysis](#appendix--ha-1-verified-against-the-code) below). The DR node for that content replays every TLI-1 segment the *old* primary managed to archive, then requests the next TLI-1 segment — which either was never archived (the old primary died mid-segment) or exists only as `….partial`. `restore_command` misses, and because the timeline goal is `CONTROLFILE` the node **never rescans for `00000002.history`** and never switches to TLI 2 — even though the TLI-2 segments are sitting in the same archive directory it is already reading. It retries the same missing filename every `wal_retrieve_retry_interval` **forever**. The failed restore logs at **DEBUG2** — invisible at default `log_min_messages` — so the node is **indistinguishable from a healthy DR whose production is simply idle**. **Verify at runtime, then decide:** `recovery_target_timeline = 'latest'` (HA-2), or document mirror failover as "rebuild that DR node". | NEW | **GAP** |
-| **HA-1b** | **Detecting** the HA-1 stall from the shipped observability | **Second gap: you cannot.** `rpo_seconds` grows — but it grows identically when production is idle, because it is `now() - min(pg_last_xact_replay_timestamp())`. `replay_lsn` freezes — same ambiguity. **Neither `gp_stat_dr_replica` nor `gp_stat_dr_replica_summary` exposes a timeline id**, and `pg_last_wal_replay_lsn()` does not reveal one either; you have to reach `pg_control_checkpoint()` or the archive directory listing to see that production has forked onto TLI 2 while the DR is stuck on TLI 1. Consider adding a `timeline` column to `gp_stat_dr_replica` regardless of how HA-1 is resolved. | NEW | **GAP** |
+| **HA-1b** | **Detecting** the HA-1 stall from the shipped observability | **Second gap: you cannot.** `rpo_seconds` grows — but it grows identically when production is idle, because it is `now() - min(pg_last_xact_replay_timestamp())`. `replay_lsn` freezes — same ambiguity. **Neither `gg_stat_dr_replica` nor `gg_stat_dr_replica_summary` exposes a timeline id**, and `pg_last_wal_replay_lsn()` does not reveal one either; you have to reach `pg_control_checkpoint()` or the archive directory listing to see that production has forked onto TLI 2 while the DR is stuck on TLI 1. Consider adding a `timeline` column to `gg_stat_dr_replica` regardless of how HA-1 is resolved. | NEW | **GAP** |
 | **HA-2** | Same as HA-1 with `recovery_target_timeline = 'latest'` and the `.history` file archived | Should work, and the archive-only case is genuinely reachable: the WAL-source state machine advances to `XLOG_FROM_STREAM` **even with no `primary_conninfo`** ("Move to XLOG_FROM_STREAM state in either case… immediate failure if we didn't launch walreceiver", `xlog.c:13337`), which is where the rescan hook lives. So a slot-less archive-only DR does reach `rescanLatestTimeLine()`, reads `00000002.history` via `restore_command`, and follows the fork. Note `recovery_target_timeline` is **`PGC_POSTMASTER`** — flipping it costs a restart of each DR node, though a restart *after* a fork still recovers (startup runs `findNewestTimeLine()`, `xlog.c:5693`). **Also check the last pre-fork segment:** the old timeline's final partial segment is archived as `….partial`, which a plain `cp`-based `restore_command` will not find. Expect either clean continuation or a stall precisely at the fork LSN — determine which, and whether `restore_command` needs `.partial` handling. | NEW `PREDICTED` | to determine |
 | **HA-3** | The failover's `gp_segment_configuration` churn (role `p`↔`m` swap, mode/status updates, `gp_configuration_history` inserts) reaching the DR | **Filtered.** All those records reference only protected blocks, so the DR's topology stays DR-local through a production HA event. This half of the scenario should pass even when HA-1 fails — worth asserting separately so the two failure modes don't mask each other. | NEW | PASS |
 | **HA-4** | `gprecoverseg` rebuilds the old primary as a mirror; later `gprecoverseg -r` rebalances back | The rebalance is a **second promotion** → another timeline increment for that content. Different contents legitimately sit on different timelines — harmless, because each content has its own independent WAL/LSN space. But it multiplies HA-1's exposure. | NEW | see HA-1/HA-2 |
@@ -217,15 +217,15 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **P-1** | `switch <rp>` to a consistent cut, then promote there | `pg_promote(false)` + `pg_wal_replay_resume()` on **segments first, then the coordinator**, each polled out of recovery — recovery ends exactly after N. **No second phase and no restart:** DR behaviour is keyed on "in recovery with hot standby", so it lifts with recovery itself. | AUTO | PASS |
-| **P-2** | After promotion: `gp_stat_dr_replica.dr_replica = f` **without any restart**, all nodes out of recovery, distributed **writes** succeed | `IsDRReplicaMode()` false → the DR gate, the standby-reader context and the redo filter all disengage; FTS and DTX run normally. Poll for the first FTS cycle before asserting writes. | AUTO | PASS |
+| **P-2** | After promotion: `gg_stat_dr_replica.dr_replica = f` **without any restart**, all nodes out of recovery, distributed **writes** succeed | `IsDRReplicaMode()` false → the DR gate, the standby-reader context and the redo filter all disengage; FTS and DTX run normally. Poll for the first FTS cycle before asserting writes. | AUTO | PASS |
 | **P-3** | After promotion: data equals production **as of the promote cut** | The promoted cluster is a real point-in-time copy — verify per-table row counts *and* content, not just counts. | AUTO (commented) | PASS |
 | **P-4** | `promote` when nodes are **not all paused at one restore point** (e.g. after `pause`, or mid-advance) | Refused by the precondition guard. `pause` is not a consistent cut and must not be promotable. | NEW | REFUSE |
 | **P-5** | `promote --at <rp>` where `<rp>` ≠ the cut the cluster is actually at | Refused. | NEW | REFUSE |
 | **P-6** | **Promote exactly at a straddle cut** (the C-3 fault-injected state) | The highest-value untested case. In-doubt prepared transactions exist on segments at the cut; DTX recovery on the promoted coordinator must resolve them **atomically** — committed everywhere (its `DISTRIBUTED_COMMIT` was replayed) or aborted everywhere. Assert the post-promotion row count is *exactly* 10 or *exactly* 30, never a torn value, and that no orphaned prepared transactions remain (`pg_prepared_xacts` empty on every segment). | NEW | PASS (to prove) |
-| **P-7** | `gp_dr_promote('wrong_rp')` — a restore point the cluster is not at | Refused with the point it *is* at. Guards against promoting the wrong cut by typo. | AUTO | REFUSE |
+| **P-7** | `gg_dr_promote('wrong_rp')` — a restore point the cluster is not at | Refused with the point it *is* at. Guards against promoting the wrong cut by typo. | AUTO | REFUSE |
 | **P-8** | Attempt to resume DR mode after promotion | Not possible — recovery only moves forward. Promotion is irreversible; assert the utility says so rather than half-working. | NEW | REFUSE |
-| **P-9** | Planned switchover drill, end to end: quiesce production → `gp_create_restore_point('cutover')` → `gg_recovery switch cutover` → `promote --at cutover` → redirect clients | Zero data loss (production quiesced before the restore point). The full operational rehearsal. | NEW (MANUAL) | PASS |
-| **P-10** | Unplanned failover: production lost mid-flight, segments archived unevenly | Promote from the **latest verified common restore point** (`gg_recovery stats` → `consistent serve point`). Computing that automatically when some segments archived past N and others did not **is not implemented** — the scenario documents the manual procedure and its RPO. | NEW (MANUAL) | DEGRADE |
+| **P-9** | Planned switchover drill, end to end: quiesce production → `gp_create_restore_point('cutover')` → `ggdr switch cutover` → `promote --at cutover` → redirect clients | Zero data loss (production quiesced before the restore point). The full operational rehearsal. | NEW (MANUAL) | PASS |
+| **P-10** | Unplanned failover: production lost mid-flight, segments archived unevenly | Promote from the **latest verified common restore point** (`ggdr stat` → `consistent serve point`). Computing that automatically when some segments archived past N and others did not **is not implemented** — the scenario documents the manual procedure and its RPO. | NEW (MANUAL) | DEGRADE |
 
 ---
 
@@ -233,8 +233,8 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **O-1** | `gp_stat_dr_replica` with all nodes paused at one restore point | One row per node; all report `dr_replica = t`, `in_recovery = t`, and the same `restore_point`. | AUTO | PASS |
-| **O-2** | `gp_stat_dr_replica_summary` rollup | `consistent_restore_point` non-NULL **only** when every node is paused at the same point; `rpo_seconds` finite and non-negative. | AUTO | PASS |
+| **O-1** | `gg_stat_dr_replica` with all nodes paused at one restore point | One row per node; all report `dr_replica = t`, `in_recovery = t`, and the same `restore_point`. | AUTO | PASS |
+| **O-2** | `gg_stat_dr_replica_summary` rollup | `consistent_restore_point` non-NULL **only** when every node is paused at the same point; `rpo_seconds` finite and non-negative. | AUTO | PASS |
 | **O-3** | **Served-N is faithful.** Re-point `gp_pause_on_restore_point_replay` to a name never reached, *without* resuming | The view still reports the **actually-reached** restore point — it reads `XLogCtlData.pausedRestorePointName` captured from the replayed WAL record, not the configured GUC. A GUC-based implementation would lie here. | AUTO | PASS |
 | **O-4** | Summary while one node lags (mixed restore points) | `consistent_restore_point` is `NULL`, `all_paused = false`. The signal an operator must trust before serving a report. | NEW | PASS |
 | **O-5** | No cross-node LSN comparison is offered anywhere | Deliberate: each node has its own WAL/LSN space, so LSNs are not comparable across nodes. Assert that no view or tool invites a `min(replay_lsn)` "cut" — that approximation is exactly what the straddle breaks. | NEW | PASS |
@@ -242,15 +242,15 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 
 ---
 
-## Group K — `gg_recovery` and `gg_walfilter` tooling
+## Group K — `ggdr` and `gg_walfilter` tooling
 
 | ID | Scenario | Expected behaviour | Status |
 |---|---|---|---|
-| **U-1** | `gg_recovery stats` reports the consistent serve point | AUTO | PASS |
-| **U-2** | `gg_recovery switch <rp>` — all nodes advance and pause at `<rp>`; new data visible | AUTO | PASS |
-| **U-3** | `gp_dr_switch()` / `gp_dr_promote()` — the SQL equivalents, dispatched cluster-wide from the coordinator | Same effect as the utility's `switch` / `promote`, reachable by a client that can only connect to the coordinator. | AUTO | PASS |
-| **U-4** | `gg_recovery pause` — every node halts immediately; summary shows no consistent point | NEW | PASS |
-| **U-5** | `gg_recovery` against a **multi-host** DR | **Not supported in the PoC** — it reaches every node by local socket. Document the failure and the per-host workaround. | NEW (MANUAL) | DEGRADE |
+| **U-1** | `ggdr stat` reports the consistent serve point | AUTO | PASS |
+| **U-2** | `ggdr switch <rp>` — all nodes advance and pause at `<rp>`; new data visible | AUTO | PASS |
+| **U-3** | `gg_dr_switch()` / `gg_dr_promote()` — the SQL equivalents, dispatched cluster-wide from the coordinator | Same effect as the utility's `switch` / `promote`, reachable by a client that can only connect to the coordinator. | AUTO | PASS |
+| **U-4** | `ggdr pause` — every node halts immediately; summary shows no consistent point | NEW | PASS |
+| **U-5** | `ggdr` against a **multi-host** DR | **Not supported in the PoC** — it reaches every node by local socket. Document the failure and the per-host workaround. | NEW (MANUAL) | DEGRADE |
 | **U-6** | `gg_walfilter` black-box suite (`src/test/dr/test_gg_walfilter.py`) against the installed binary | AUTO (gates the DR build) | PASS |
 | **U-7** | `gg_walfilter inspect --gp-dr-topology <segment>` on a real archived segment containing topology changes | Reports exactly the records the in-backend filter would skip — **both** rules: all-blocks-match (`DRRedoShouldFilter`) and the `XLOG_SMGR_TRUNCATE` payload target (`DRRedoShouldFilterRelFileNode`). Verified on the dense fixture's own archived WAL: the aligned tool flags `Storage` at the exact LSN the engine's guard logged, one more record than the pre-alignment binary. Covered by 7 cases in `test_gg_walfilter.py` (40/40), incl. `SMGR_CREATE` must *not* be filtered — the engine guards only the truncate branch. | AUTO | PASS |
 | **U-8** | `gg_walfilter restore` used as the `restore_command` (opt-in out-of-engine filtering, ADR-0002 path) | Filtered segments install atomically; the DR reaches the same state as with the in-backend filter. Keeps the alternative path from bit-rotting. | NEW | PASS |
@@ -292,7 +292,7 @@ link. Each step is a direct code reference, not an inference:
 
 1. **The DR is armed with `'current'`, unconditionally.** `cmd_create_replica` writes
    `recovery_target_timeline = 'current'` into every node's `postgresql.conf`
-   (`gpMgmt/bin/gg_recovery:586`). There is no CLI flag to override it.
+   (`gpMgmt/bin/ggdr:586`). There is no CLI flag to override it.
 2. **`'current'` means "do not follow forks".** `check_recovery_target_timeline()` maps the
    string to `RECOVERY_TARGET_TIMELINE_CONTROLFILE` (`guc.c:12212-12213`).
 3. **Startup pins the TLI from `pg_control`.** `findNewestTimeLine()` is called only for
@@ -373,7 +373,7 @@ measured; see the V-21 appendix below.
 ## Appendix — V-21 measured on the fixture
 
 Run against `src/test/dr/docker-compose.yml` (production: coordinator + 2 segments, no
-mirrors; DR built by `gg_recovery create-replica`). The rest of the suite passed 28/28 on
+mirrors; DR built by `ggdr create-replica`). The rest of the suite passed 28/28 on
 the same run, so the DR was in its normal, healthy state when measured.
 
 **Same relfilenode — confirmed in a live system, not just from reading the seed script:**

@@ -8,6 +8,7 @@
   written (with one fix, D1.2).
 - **Note:** the gate this ADR refers to (`gp_dr_replica` + `dr_replica.signal`) is now
   `EnableHotStandby && RecoveryInProgress()` — see ADR-0004. The decision itself stands.
+- **Note:** `gg_recovery` is now named `ggdr` (ADR-0004 D5); references below are pre-rename.
 
 ---
 

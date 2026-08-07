@@ -1526,7 +1526,7 @@ UNION ALL
 ------------------------------------------------------------------
 -- Greengage DR (M5): read-replica observability.
 --
--- gp_stat_dr_replica reports, per node (coordinator + each primary segment), the
+-- gg_stat_dr_replica reports, per node (coordinator + each primary segment), the
 -- DR/recovery state and the restore point the node is currently paused at.  It
 -- follows the gp_suboverflowed_backend fan-out (coordinator row UNION per-segment
 -- rows via gp_dist_random('gp_id')); the per-node functions run on each node, so
@@ -1539,31 +1539,39 @@ UNION ALL
 -- only.  The cross-cluster consistency signal is "every node paused at the SAME
 -- restore point" (consistent_restore_point), not LSN closeness.
 ------------------------------------------------------------------
--- NB: is_paused guards pg_is_wal_replay_paused() with a scalar subquery rather
--- than the obvious CASE.  Both branches of this view are correct in isolation,
--- but the UNION ALL of an entry-DB row with a gp_dist_random() row defeats the
--- CASE short-circuit, and the function ERRORs outside recovery -- so the whole
--- view failed on a promoted cluster, exactly when an operator wants to read it.
-CREATE VIEW gp_stat_dr_replica AS
+-- NB: the recovery-dependent columns are all guarded with a scalar subquery
+-- rather than the obvious CASE.  Each branch of this view is correct in
+-- isolation, but the UNION ALL of an entry-DB row with a gp_dist_random() row
+-- defeats the CASE short-circuit, and pg_is_wal_replay_paused() ERRORs outside
+-- recovery -- so the whole view failed on a promoted cluster, exactly when an
+-- operator wants to read it.
+--
+-- replay_lsn and replay_time are guarded for a different reason: they do not
+-- error once recovery ends, they keep reporting the last replayed position
+-- forever.  On a promoted cluster that is stale trivia dressed up as status --
+-- and it makes rpo_seconds grow without bound for a cluster that has no RPO at
+-- all.  Both go NULL the moment the node leaves recovery.
+CREATE VIEW gg_stat_dr_replica AS
   SELECT -1 AS gp_segment_id, 'coordinator'::text AS role,
          (current_setting('hot_standby')::bool AND pg_is_in_recovery()) AS dr_replica,
          pg_is_in_recovery() AS in_recovery,
-         pg_last_wal_replay_lsn() AS replay_lsn,
-         pg_last_xact_replay_timestamp() AS replay_time,
+         (SELECT pg_last_wal_replay_lsn() WHERE pg_is_in_recovery()) AS replay_lsn,
+         (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()) AS replay_time,
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false) AS is_paused,
          pg_last_paused_restore_point() AS restore_point
 UNION ALL
   SELECT gp_segment_id, 'segment'::text,
          (current_setting('hot_standby')::bool AND pg_is_in_recovery()),
          pg_is_in_recovery(),
-         pg_last_wal_replay_lsn(),
-         pg_last_xact_replay_timestamp(),
+         (SELECT pg_last_wal_replay_lsn() WHERE pg_is_in_recovery()),
+         (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()),
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false),
          pg_last_paused_restore_point()
     FROM gp_dist_random('gp_id') ORDER BY 1;
 
 -- Single-row rollup: is the whole cluster a consistent, safe-to-serve window?
-CREATE VIEW gp_stat_dr_replica_summary AS
+-- rpo_seconds is NULL once the cluster is out of recovery, because replay_time is.
+CREATE VIEW gg_stat_dr_replica_summary AS
   SELECT count(*) AS node_count,
          bool_and(dr_replica) AS all_dr_replica,
          bool_and(in_recovery) AS all_in_recovery,
@@ -1572,10 +1580,10 @@ CREATE VIEW gp_stat_dr_replica_summary AS
                AND count(DISTINCT restore_point) = 1
               THEN max(restore_point) ELSE NULL END AS consistent_restore_point,
          extract(epoch FROM now() - min(replay_time)) AS rpo_seconds
-    FROM gp_stat_dr_replica;
+    FROM gg_stat_dr_replica;
 
-GRANT SELECT ON gp_stat_dr_replica TO PUBLIC;
-GRANT SELECT ON gp_stat_dr_replica_summary TO PUBLIC;
+GRANT SELECT ON gg_stat_dr_replica TO PUBLIC;
+GRANT SELECT ON gg_stat_dr_replica_summary TO PUBLIC;
 
 --
 -- We have a few function definitions in here, too.

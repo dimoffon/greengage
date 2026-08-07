@@ -1,10 +1,10 @@
 #!/bin/bash
-# dr-entrypoint.sh -- build the DR cluster with `gg_recovery create-replica`
+# dr-entrypoint.sh -- build the DR cluster with `ggdr create-replica`
 # (restore base backups + frozen-seed DR-local topology + arm DR mode + start every
 # node in continuous archive recovery), then run the milestone regression suite:
 # M1 (redo filter) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
-# M5 (observability), the gg_recovery switch/pause/stats utility test, and finally
-# the SQL recovery-control test (gp_dr_switch / gp_dr_promote -> online read-write).
+# M5 (observability), the ggdr switch/pause/stats utility test, and finally
+# the SQL recovery-control test (gg_dr_switch / gg_dr_promote -> online read-write).
 set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
@@ -29,7 +29,7 @@ COORD=${DR_DATADIR[-1]}
 # gpstart/gpstop resolve the coordinator datadir from $COORDINATOR_DATA_DIRECTORY
 # (or the legacy $MASTER_DATA_DIRECTORY), else they abort with "Environment Variable
 # COORDINATOR_DATA_DIRECTORY not set!".  The primary gets this from gpdemo-env.sh, but
-# the DR cluster is built by gg_recovery (not gpdemo), so no such file exists here.
+# the DR cluster is built by ggdr (not gpdemo), so no such file exists here.
 # Export it (so this script's own gpstart/gpstop work) AND persist it as a sourceable
 # env file + ~/.bashrc line (so a fresh `docker exec dr bash` shell has it too) -- e.g.
 # to gpstop the promoted cluster before rebuilding the replica with create-replica --force.
@@ -54,7 +54,7 @@ for content in $ALL_CONTENTS; do NODES+=("${DR_DATADIR[$content]}:${DR_PORT[$con
 log "dr: waiting for production to create + archive the restore point ..."
 for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2; done
 
-# --- M4: build the whole DR cluster in one shot via the gg_recovery utility.
+# --- M4: build the whole DR cluster in one shot via the ggdr utility.
 #     create-replica restores each instance's base backup, frozen-seeds the
 #     DR-local topology into the coordinator (hostname 'dr'), gates on the WAL
 #     archive being complete enough to reach consistency, arms DR mode
@@ -62,7 +62,7 @@ for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2
 #     every node with the M3 pause target dr_rp1, and starts each in archive
 #     recovery.  This exercises the SAME code path an operator would run, instead
 #     of open-coding the restore/seed/arm/start inline. ---
-GG="python3 $SRC/gpMgmt/bin/gg_recovery"
+GG="python3 $SRC/gpMgmt/bin/ggdr"
 export PGPORT="$PORT_BASE" PGDATABASE=postgres
 
 # --- auxiliary-tooling gate: gg_walfilter black-box tests (against the
@@ -79,14 +79,14 @@ else
 	die "gg_walfilter tests FAILED; refusing to build the DR cluster"
 fi
 
-log "dr: building the DR replica via 'gg_recovery create-replica' (M4) ..."
+log "dr: building the DR replica via 'ggdr create-replica' (M4) ..."
 set +e
 $GG create-replica \
 	--topology "$TOPO_FILE" \
 	--basebackup-dir "$BASEBACKUP" \
 	--wal-archive "$WAL_ARCHIVE" \
 	--pause-at dr_rp1 \
-	--force 2>&1 | sed 's/^/    gg_recovery: /'
+	--force 2>&1 | sed 's/^/    ggdr: /'
 cr_rc=${PIPESTATUS[0]}
 set -e
 [ "$cr_rc" = 0 ] || log "dr: WARNING create-replica exit=$cr_rc (continuing; assertions below will show the real state)"
@@ -302,26 +302,26 @@ if [ -n "$sok" ]; then
 	fi
 
 	# --- M5: DR observability.  The cluster is now paused at dr_rp_straddle_done,
-	#     so gp_stat_dr_replica / _summary should report all 3 nodes in recovery,
+	#     so gg_stat_dr_replica / _summary should report all 3 nodes in recovery,
 	#     paused, at that same consistent restore point. ---
-	echo "================ M5: gp_stat_dr_replica observability (paused at dr_rp_straddle_done) ================"
+	echo "================ M5: gg_stat_dr_replica observability (paused at dr_rp_straddle_done) ================"
 	p5=0; f5=0
 	ok5() { log "dr-test: PASS  $1"; p5=$((p5+1)); }
 	no5() { log "dr-test: FAIL  $1"; f5=$((f5+1)); }
-	rows=$(dsp "select count(*) from gp_stat_dr_replica;")
-	[ "$rows" = 3 ] && ok5 "M5: gp_stat_dr_replica has 3 rows (coordinator + 2 segments)" \
-					|| no5 "M5: gp_stat_dr_replica rows = '$rows' (expected 3)"
-	r=$(dsp "select count(*) from gp_stat_dr_replica where dr_replica and in_recovery;")
+	rows=$(dsp "select count(*) from gg_stat_dr_replica;")
+	[ "$rows" = 3 ] && ok5 "M5: gg_stat_dr_replica has 3 rows (coordinator + 2 segments)" \
+					|| no5 "M5: gg_stat_dr_replica rows = '$rows' (expected 3)"
+	r=$(dsp "select count(*) from gg_stat_dr_replica where dr_replica and in_recovery;")
 	[ "$r" = 3 ] && ok5 "M5: all 3 nodes report dr_replica=t and in_recovery=t" \
 				 || no5 "M5: dr_replica/in_recovery nodes = '$r' (expected 3)"
-	r=$(dsp "select count(*) from gp_stat_dr_replica where restore_point = 'dr_rp_straddle_done';")
+	r=$(dsp "select count(*) from gg_stat_dr_replica where restore_point = 'dr_rp_straddle_done';")
 	[ "$r" = 3 ] && ok5 "M5: all 3 nodes report restore_point='dr_rp_straddle_done' (per-node served N via new C accessor)" \
 				 || no5 "M5: nodes at dr_rp_straddle_done = '$r' (expected 3)"
-	r=$(dsp "select node_count||'|'||all_in_recovery||'|'||all_paused||'|'||coalesce(consistent_restore_point,'<null>') from gp_stat_dr_replica_summary;")
+	r=$(dsp "select node_count||'|'||all_in_recovery||'|'||all_paused||'|'||coalesce(consistent_restore_point,'<null>') from gg_stat_dr_replica_summary;")
 	[ "$r" = "3|true|true|dr_rp_straddle_done" ] \
 		&& ok5 "M5: summary = 3 nodes, all_in_recovery, all_paused, consistent_restore_point=dr_rp_straddle_done" \
 		|| no5 "M5: summary = '$r' (expected 3|true|true|dr_rp_straddle_done)"
-	r=$(dsp "select rpo_seconds >= 0 from gp_stat_dr_replica_summary;")
+	r=$(dsp "select rpo_seconds >= 0 from gg_stat_dr_replica_summary;")
 	[ "$r" = t ] && ok5 "M5: summary rpo_seconds is a finite, non-negative RPO" \
 				 || no5 "M5: rpo_seconds check = '$r'"
 	# Faithful served-N: re-point the pause GUC to a name never reached, WITHOUT
@@ -333,7 +333,7 @@ if [ -n "$sok" ]; then
 		PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_reload_conf();' >/dev/null 2>&1 || true
 	done
 	sleep 3
-	r=$(dsp "select coalesce(consistent_restore_point,'<null>') from gp_stat_dr_replica_summary;")
+	r=$(dsp "select coalesce(consistent_restore_point,'<null>') from gg_stat_dr_replica_summary;")
 	[ "$r" = "dr_rp_straddle_done" ] \
 		&& ok5 "M5: served-N is FAITHFUL -- view still reports dr_rp_straddle_done after GUC re-pointed to 'never_reached' (C accessor, not GUC)" \
 		|| no5 "M5: served-N = '$r' after GUC re-point (expected dr_rp_straddle_done; a GUC-based served-N would wrongly show 'never_reached')"
@@ -344,48 +344,48 @@ if [ -n "$sok" ]; then
 		log "================ M5 OBSERVABILITY TEST: FAIL ($f5 of $((p5+f5)) failed) ================"
 	fi
 
-	# --- gg_recovery: the DR recovery-control utility (switch / pause / stats).
+	# --- ggdr: the DR recovery-control utility (switch / pause / stats).
 	#     The cluster is paused at dr_rp_straddle_done; drive it forward to
 	#     dr_rp_switch.  There is no 'follow' mode: a replica only ever serves
 	#     while paused at a restore point, which is the one cut with a
 	#     cross-node guarantee. ---
-	echo "================ gg_recovery: DR recovery-control utility ================"
+	echo "================ ggdr: DR recovery-control utility ================"
 	p6=0; f6=0
 	ok6() { log "dr-test: PASS  $1"; p6=$((p6+1)); }
 	no6() { log "dr-test: FAIL  $1"; f6=$((f6+1)); }
 	for _ in $(seq 1 60); do [ -f "$ARCHIVE/gg_ready" ] && break; sleep 2; done
-	if $GG stats 2>&1 | grep -q "consistent serve point: dr_rp_straddle_done"; then
-		ok6 "gg_recovery stats: consistent serve point = dr_rp_straddle_done"
+	if $GG stat 2>&1 | grep -q "consistent serve point: dr_rp_straddle_done"; then
+		ok6 "ggdr stat: consistent serve point = dr_rp_straddle_done"
 	else
-		no6 "gg_recovery stats: did not report dr_rp_straddle_done"; $GG stats 2>&1 | tail -6 >&2
+		no6 "ggdr stat: did not report dr_rp_straddle_done"; $GG stat 2>&1 | tail -6 >&2
 	fi
 	if $GG switch dr_rp_switch 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_switch'"; then
-		ok6 "gg_recovery switch dr_rp_switch: all 3 nodes advanced to the new restore point"
+		ok6 "ggdr switch dr_rp_switch: all 3 nodes advanced to the new restore point"
 	else
-		no6 "gg_recovery switch dr_rp_switch: did not reach on all nodes"
+		no6 "ggdr switch dr_rp_switch: did not reach on all nodes"
 	fi
 	r=$(dsp "select count(*) from gg_switch;")
-	[ "$r" = 5 ] && ok6 "gg_recovery switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \
-				 || no6 "gg_recovery switch: gg_switch = '$r' (expected 5)"
-	if $GG stats 2>&1 | grep -q "consistent serve point: dr_rp_switch"; then
-		ok6 "gg_recovery stats: consistent serve point moved to dr_rp_switch"
+	[ "$r" = 5 ] && ok6 "ggdr switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \
+				 || no6 "ggdr switch: gg_switch = '$r' (expected 5)"
+	if $GG stat 2>&1 | grep -q "consistent serve point: dr_rp_switch"; then
+		ok6 "ggdr stat: consistent serve point moved to dr_rp_switch"
 	else
-		no6 "gg_recovery stats: did not report dr_rp_switch after the switch"
+		no6 "ggdr stat: did not report dr_rp_switch after the switch"
 	fi
 	echo "========================================================================="
 	if [ "$f6" -eq 0 ]; then
-		log "================ gg_recovery TEST: PASS ($p6/$((p6+f6))) ================"
+		log "================ ggdr TEST: PASS ($p6/$((p6+f6))) ================"
 	else
-		log "================ gg_recovery TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
+		log "================ ggdr TEST: FAIL ($f6 of $((p6+f6)) failed) ================"
 	fi
 
-	# --- SQL recovery control: gp_dr_switch() / gp_dr_promote().
-	#     The same cluster-wide steps gg_recovery performs, but dispatched from
+	# --- SQL recovery control: gg_dr_switch() / gg_dr_promote().
+	#     The same cluster-wide steps ggdr performs, but dispatched from
 	#     the coordinator, so a client that can only reach the coordinator can
 	#     drive recovery.  Both run here against the live DR: switch advances the
 	#     whole cluster to a fresh restore point, then promote cuts it there.
 	#     Promote is last because it is irreversible. ---
-	echo "================ SQL recovery control: gp_dr_switch / gp_dr_promote ================"
+	echo "================ SQL recovery control: gg_dr_switch / gg_dr_promote ================"
 	p7=0; f7=0
 	ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
 	no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
@@ -399,26 +399,20 @@ if [ -n "$sok" ]; then
 	# QE runs it inside the dispatched transaction.  It is a dispatched function call
 	# now, which is never subject to that check -- assert the usage stays legal.
 	r=$(dsps "begin;
-select gp_dr_switch('dr_rp_promote', 300);
+select gg_dr_switch('dr_rp_promote');
 commit;")
-	echo "$r" | grep -qx t && ok7 "gp_dr_switch('dr_rp_promote') returned true inside a transaction block (whole cluster advanced from the coordinator)" \
-				 || no7 "gp_dr_switch returned '$r' (expected t)"
-	r=$(dsp "select consistent_restore_point from gp_stat_dr_replica_summary;")
-	[ "$r" = dr_rp_promote ] && ok7 "summary consistent_restore_point = dr_rp_promote after gp_dr_switch" \
+	echo "$r" | grep -qx t && ok7 "gg_dr_switch('dr_rp_promote') returned true inside a transaction block (whole cluster advanced from the coordinator)" \
+				 || no7 "gg_dr_switch returned '$r' (expected t)"
+	r=$(dsp "select consistent_restore_point from gg_stat_dr_replica_summary;")
+	[ "$r" = dr_rp_promote ] && ok7 "summary consistent_restore_point = dr_rp_promote after gg_dr_switch" \
 						  || no7 "summary consistent_restore_point = '$r' (expected dr_rp_promote)"
 	r=$(dsp "select count(*) from gg_promote;")
 	[ "$r" = 7 ] && ok7 "data as-of dr_rp_promote is visible (gg_promote=7)" \
 				 || no7 "gg_promote = '$r' (expected 7)"
 
-	# promote refuses when asked for a point the cluster is not at
-	r=$(dsp "select gp_dr_promote('not_this_one', 60);")
-	echo "$r" | grep -qi "not \"not_this_one\"\|paused at restore point" \
-		&& ok7 "gp_dr_promote refuses a mismatched --at ($(echo "$r" | grep -i ERROR | head -1))" \
-		|| no7 "gp_dr_promote did not refuse a mismatched restore point -> $r"
-
-	r=$(dsp "select gp_dr_promote(null, 300);")
-	[ "$r" = t ] && ok7 "gp_dr_promote() returned true (cluster promoted at dr_rp_promote)" \
-				 || no7 "gp_dr_promote returned '$r' (expected t)"
+	r=$(dsp "select gg_dr_promote();")
+	[ "$r" = t ] && ok7 "gg_dr_promote() returned true (cluster promoted at dr_rp_promote)" \
+				 || no7 "gg_dr_promote returned '$r' (expected t)"
 
 	# every node must now be OUT of recovery -- and DR mode lifts with it, no restart.
 	# Poll: promotion is asynchronous per node, and the coordinator additionally
@@ -434,9 +428,19 @@ commit;")
 	done
 	[ "$outrec" = "${#NODES[@]}" ] && ok7 "all ${#NODES[@]} nodes OUT of recovery (pg_is_in_recovery()=f)" \
 								  || no7 "only $outrec/${#NODES[@]} nodes out of recovery"
-	for _ in $(seq 1 30); do r=$(dsp "select dr_replica from gp_stat_dr_replica where gp_segment_id = -1;"); [ "$r" = f ] && break; sleep 2; done
+	for _ in $(seq 1 30); do r=$(dsp "select dr_replica from gg_stat_dr_replica where gp_segment_id = -1;"); [ "$r" = f ] && break; sleep 2; done
 	[ "$r" = f ] && ok7 "dr_replica=f without any restart (mode is keyed on recovery, not a GUC)" \
 				 || no7 "dr_replica = '$r' after promotion (expected f)"
+	# Recovery-position columns must go NULL once out of recovery: they do not error
+	# there, they keep reporting the last replayed position forever, which is stale
+	# trivia on a production cluster -- and it made rpo_seconds grow without bound
+	# for a cluster that has no RPO at all.
+	r=$(dsp "select count(*) from gg_stat_dr_replica where replay_lsn is not null or replay_time is not null;")
+	[ "$r" = 0 ] && ok7 "replay_lsn/replay_time are NULL on all nodes after promotion (no stale recovery position)" \
+				 || no7 "$r node(s) still report replay_lsn/replay_time after promotion (expected 0)"
+	r=$(dsp "select coalesce(rpo_seconds::text,'<null>') from gg_stat_dr_replica_summary;")
+	[ "$r" = "<null>" ] && ok7 "summary rpo_seconds is NULL after promotion (a promoted cluster has no RPO)" \
+					   || no7 "rpo_seconds = '$r' after promotion (expected NULL)"
 
 	# the promoted cluster must accept a DISTRIBUTED write; FTS needs a probe cycle first.
 	wok=

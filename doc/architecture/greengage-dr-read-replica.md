@@ -16,7 +16,7 @@ grounded in the source; `file:line` references point at the shipped code.
 4. [How it is implemented](#4-how-it-is-implemented)
 5. [Snapshot synchronization — detailed flow](#5-snapshot-synchronization--detailed-flow)
 6. [Operational workflows](#6-operational-workflows)
-7. [`gg_recovery` utility reference](#7-gg_recovery-utility-reference)
+7. [`ggdr` utility reference](#7-ggdr-utility-reference)
 8. [Pros and cons](#8-pros-and-cons)
 9. [Corner cases and limitations](#9-corner-cases-and-limitations)
 10. [Appendix — code map, GUCs, catalog objects](#10-appendix)
@@ -63,7 +63,7 @@ Two things break if you naively point a base backup of production at `standby.si
    illegal for a process in recovery.
 
 The feature is, in essence, the set of targeted core changes that make those two things
-work, plus the tooling (`gg_recovery`) to drive the lifecycle.
+work, plus the tooling (`ggdr`) to drive the lifecycle.
 
 ### 1.4 Milestone map
 
@@ -75,9 +75,9 @@ The implementation is organized as milestones; this document is structured aroun
 | M2 | Read-only enforcement | §4.3 |
 | M2′ | Standby distributed read (dispatch while in recovery) | §4.4 |
 | M3 | Consistent reads (restore-point-gated, as-of-N snapshot) | §4.5, §5 |
-| M4 | Build a DR replica (`gg_recovery create-replica`) | §6.1 |
-| M5 | Observability (`gp_stat_dr_replica`, `pg_last_paused_restore_point`) | §4.6 |
-| M6 | Promotion (`gg_recovery promote`, `gp_dr_promote()`) | §6.3, §6.4 |
+| M4 | Build a DR replica (`ggdr create-replica`) | §6.1 |
+| M5 | Observability (`gg_stat_dr_replica`, `pg_last_paused_restore_point`) | §4.6 |
+| M6 | Promotion (`ggdr promote`, `gg_dr_promote()`) | §6.3, §6.4 |
 
 ---
 
@@ -96,7 +96,7 @@ The implementation is organized as milestones; this document is structured aroun
    → distributed barrier under      ─── restore_command pulls ──────┤ • DR-local topology (own dbids)   │
      TwophaseCommitLock; every                                      │ • pause replay at restore point N │
      node writes XLOG_RESTORE_POINT                                 └───────────────┬───────────────────┘
-                                                                     gg_recovery drives the whole cluster
+                                                                     ggdr drives the whole cluster
                                                                      as one: switch / pause /       
                                                                      stats / promote / create-replica
 ```
@@ -126,9 +126,9 @@ Being explicit about provenance matters for maintenance:
 - M2 read-only enforcement.
 - The `DTX_CONTEXT_QD_STANDBY_READER` distributed-transaction context.
 - The M3 as-of-N distributed snapshot builder `CreateDRStandbyDistributedSnapshot()`.
-- The M5 served-restore-point accessor + `gp_stat_dr_replica` views.
-- The `gp_dr_switch()` / `gp_dr_promote()` recovery-control functions (§6.4).
-- The `gg_recovery` / `gpseed_dr_topology` utilities.
+- The M5 served-restore-point accessor + `gg_stat_dr_replica` views.
+- The `gg_dr_switch()` / `gg_dr_promote()` recovery-control functions (§6.4).
+- The `ggdr` / `gpseed_dr_topology` utilities.
 
 **Reused upstream Greengage hot-standby dispatch** (commit `35e95b9c`, 2023, *"Enable hot
 standby dispatch"* — predates and is independent of DR):
@@ -422,7 +422,7 @@ distributed-capable path) does not write a shared local snapshot for the standby
 (`qdSerializeDtxContextInfo()`, `cdbdisp_dtx.c:158-177`).
 
 **The writer-gang gxid exemption.** Some read-only plans (e.g. a `UNION ALL` of a
-coordinator-entry row with segment rows, as `gp_stat_dr_replica` does) are planned onto a
+coordinator-entry row with segment rows, as `gg_stat_dr_replica` does) are planned onto a
 **writer** gang, which reaches the writer-context path that normally requires a valid gxid.
 On a standby that gxid never exists, so the check is exempted for standby QEs
 (`xact.c:2510-2517`):
@@ -465,7 +465,7 @@ and `SIGHUP` (the paused startup process re-reads config via `HandleStartupProcI
 re-point *before* resume, or the node free-runs to end-of-WAL.
 
 A clean cross-node cut is reached when **every** node is paused at the **same** restore
-point. That is exactly the "consistent serve point" `gg_recovery` computes (§7).
+point. That is exactly the "consistent serve point" `ggdr` computes (§7).
 
 #### 4.5.3 The as-of-N distributed snapshot
 
@@ -501,11 +501,11 @@ actually served.
 **Cluster-wide views** (`src/backend/catalog/system_views.sql:1542-1573`, in **`pg_catalog`**,
 `GRANT SELECT ... TO PUBLIC`):
 
-- **`gp_stat_dr_replica`** — one row per node
+- **`gg_stat_dr_replica`** — one row per node
   (`gp_segment_id, role, dr_replica, in_recovery, replay_lsn, replay_time, is_paused,
   restore_point`). The coordinator row `UNION ALL`s the per-segment rows via
   `gp_dist_random('gp_id')`, so each node reports its own local recovery state.
-- **`gp_stat_dr_replica_summary`** — one-row rollup:
+- **`gg_stat_dr_replica_summary`** — one-row rollup:
   `node_count, all_dr_replica, all_in_recovery, all_paused, consistent_restore_point,
   rpo_seconds`. `consistent_restore_point` is non-`NULL` **only** when every node is paused
   at the same restore point
@@ -620,8 +620,8 @@ a query that *spans* an advance can hit standard hot-standby recovery conflicts 
 
 ## 6. Operational workflows
 
-All three workflows are driven by the `gg_recovery` utility (§7). Examples assume the
-utility is on `PATH` or invoked as `python3 .../gpMgmt/bin/gg_recovery`, run **on the DR
+All three workflows are driven by the `ggdr` utility (§7). Examples assume the
+utility is on `PATH` or invoked as `python3 .../gpMgmt/bin/ggdr`, run **on the DR
 coordinator host**, with `PGPORT`/`PGDATABASE` pointing at the DR coordinator.
 
 ### 6.1 Configure (build) a DR cluster
@@ -642,7 +642,7 @@ coordinator host**, with `PGPORT`/`PGDATABASE` pointing at the DR coordinator.
 cluster:
 
 ```bash
-gg_recovery create-replica \
+ggdr create-replica \
     --topology     /archive/dr_topology.tsv \
     --basebackup-dir /archive/basebackup \
     --wal-archive  /archive/wal \
@@ -683,18 +683,18 @@ and (with `--pause-at`) paused at a consistent restore point ready to serve as-o
 
 ### 6.2 Start / drive replication
 
-Replication is continuous archive recovery — it runs by itself once armed. `gg_recovery`
+Replication is continuous archive recovery — it runs by itself once armed. `ggdr`
 controls *how far* the cluster replays and whether it exposes a consistent cut:
 
 ```bash
 # Advance the whole cluster to a new consistent restore point and pause there:
-gg_recovery switch rp_hourly_42        # → every node paused at rp_hourly_42 (as-of-N cut)
+ggdr switch rp_hourly_42        # → every node paused at rp_hourly_42 (as-of-N cut)
 
 # Immediately halt replay on every node at wherever it is (NOT a consistent cut):
-gg_recovery pause
+ggdr pause
 
 # Inspect:
-gg_recovery stats
+ggdr stat
 ```
 
 There is deliberately **no free-running mode**. A replica only ever serves while paused at a
@@ -715,8 +715,8 @@ Promotion turns the read-only DR cluster into a normal online read-write cluster
 every node at the **same** restore point.
 
 ```bash
-gg_recovery switch rp_failover_point       # reach a consistent cut first (if not already)
-gg_recovery promote --at rp_failover_point  # promote there; --yes to skip the prompt
+ggdr switch rp_failover_point       # reach a consistent cut first (if not already)
+ggdr promote --at rp_failover_point  # promote there; --yes to skip the prompt
 ```
 
 `cmd_promote` (two phases):
@@ -735,7 +735,7 @@ gg_recovery promote --at rp_failover_point  # promote there; --yes to skip the p
 After promotion `IsDRReplicaMode()` is false, writes succeed, and FTS/DTX run normally.
 Promotion is **irreversible** (recovery only moves forward).
 
-The same cut can be taken from SQL with `gp_dr_promote()` (§6.4), which is what a client
+The same cut can be taken from SQL with `gg_dr_promote()` (§6.4), which is what a client
 that can reach only the coordinator would use.
 
 ### 6.4 Driving recovery from SQL
@@ -746,23 +746,23 @@ each host:
 
 | Function | Purpose |
 |---|---|
-| `gp_dr_switch(restore_point text, timeout_seconds int)` → `bool` | Re-point every node's pause target at `restore_point`, resume replay, and wait until all of them are paused there. Returns `true` at the consistent cut, `false` on timeout (the arming has still been applied — keep watching `gp_stat_dr_replica_summary`). |
-| `gp_dr_promote(at_restore_point text, timeout_seconds int)` → `bool` | Promote the whole cluster at its current consistent restore point. Refuses unless every node is paused at one point, equal to `at_restore_point` when given. Irreversible. |
+| `gg_dr_switch(restore_point text)` → `bool` | Re-point every node's pause target at `restore_point`, resume replay, and wait until all of them are paused there. Returns `true` at the consistent cut, `false` on timeout (the arming has still been applied — keep watching `gg_stat_dr_replica_summary`). |
+| `gg_dr_promote()` → `bool` | Promote the whole cluster at its current consistent restore point. Refuses unless every node is paused at one point, equal to `at_restore_point` when given. Irreversible. |
 
-Status has no function of its own: `gp_stat_dr_replica` and `gp_stat_dr_replica_summary`
+Status has no function of its own: `gg_stat_dr_replica` and `gg_stat_dr_replica_summary`
 (§4.6) already report it cluster-wide, and duplicating them as a function would only create
 a second thing to keep in step.
 
 ```sql
-SELECT gp_dr_switch('rp_hourly_43', 300);   -- advance the cluster, wait for the cut
-SELECT * FROM gp_stat_dr_replica_summary;   -- confirm consistent_restore_point
-SELECT gp_dr_promote(NULL, 300);            -- promote here
+SELECT gg_dr_switch('rp_hourly_43');   -- advance the cluster, wait for the cut
+SELECT * FROM gg_stat_dr_replica_summary;   -- confirm consistent_restore_point
+SELECT gg_dr_promote();            -- promote here
 ```
 
 Both are superuser-only, must run on the coordinator in dispatch mode, and refuse outright
 on a cluster that is not in recovery. Each applies its step to every primary segment with
 `CdbDispatchCommand()` and to the coordinator through SPI, so the two legs take the same
-path a client would. The steps themselves are the same ones `gg_recovery` performs —
+path a client would. The steps themselves are the same ones `ggdr` performs —
 `ALTER SYSTEM` on the pause GUC, `pg_reload_conf()`, `pg_wal_replay_resume()`, and for
 promotion `pg_promote(false)` — and they are legal in recovery because none of them writes
 WAL: `ALTER SYSTEM` writes `postgresql.auto.conf` and the rest touch shared memory only.
@@ -774,9 +774,9 @@ coordinator's FTS finds them live when it starts probing.
 
 ---
 
-## 7. `gg_recovery` utility reference
+## 7. `ggdr` utility reference
 
-`gpMgmt/bin/gg_recovery` — a single-file Python 3 CLI that drives a DR read-replica's
+`gpMgmt/bin/ggdr` — a single-file Python 3 CLI that drives a DR read-replica's
 recovery, treating the whole cluster (coordinator + every primary segment) as one.
 
 ### 7.1 Connection model
@@ -796,7 +796,7 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 |---------|---------|
 | `switch <restore_point>` | Stop-and-go: re-point every node to `<restore_point>`, resume, and wait until **all** are paused there (a consistent as-of-N cut). |
 | `pause` | Immediately pause replay on every node at its current point. **Not** a consistent cut. |
-| `stats` | Per-node recovery statistics + a cluster summary (mode, consistent serve point, RPO). |
+| `stat` | Per-node recovery statistics + a cluster summary (mode, consistent serve point, RPO). |
 | `promote [--at <rp>] [--no-restart] [--yes] [--timeout <s>]` | Promote the DR cluster to online read-write at a single consistent restore point. Irreversible. |
 | `create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir> [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]` | Build the whole DR replica from per-instance base backups (§6.1). |
 
@@ -804,7 +804,7 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 
 ```bash
 # Status — the summary line tells you if it is safe to serve consistent reads:
-$ gg_recovery stats
+$ ggdr stat
   content  role         in_recovery paused restore_point          replay_lsn        replay_age
   -1       coordinator  yes         yes    rp_hourly_42            0/9A00028         12s
   0        segment      yes         yes    rp_hourly_42            0/7C00190         12s
@@ -815,15 +815,15 @@ $ gg_recovery stats
   RPO: ~13s behind production's last replayed commit
 
 # Advance the whole cluster to the next hourly restore point (consistent cut):
-$ gg_recovery switch rp_hourly_43
+$ ggdr switch rp_hourly_43
 
 
 # Planned switchover:
-$ gg_recovery switch  rp_failover
-$ gg_recovery promote --at rp_failover --yes
+$ ggdr switch  rp_failover
+$ ggdr promote --at rp_failover --yes
 
 # Build a fresh DR replica (overwrite existing datadirs), armed but not started:
-$ gg_recovery create-replica \
+$ ggdr create-replica \
       --topology /archive/dr_topology.tsv \
       --basebackup-dir /archive/basebackup \
       --wal-archive /archive/wal \
@@ -871,7 +871,7 @@ $ gg_recovery create-replica \
   retention, and (for object stores) eventual consistency all matter.
 - **Config is inherited and frozen** (roles, resource groups/queues, GUCs from replicated
   catalogs); changing them on the DR is unsupported.
-- **PoC operational gaps** (see §9): single-host `gg_recovery` connectivity, no automated
+- **PoC operational gaps** (see §9): single-host `ggdr` connectivity, no automated
   restore-point scheduler, mirrorless DR (no in-DR HA), no automatic
   latest-complete-common-restore-point computation on unclean failure.
 
@@ -922,7 +922,7 @@ $ gg_recovery create-replica \
 
 **Operational (PoC scope)**
 
-- **`gg_recovery` is single-host.** It reaches every node by local socket; multi-host needs
+- **`ggdr` is single-host.** It reaches every node by local socket; multi-host needs
   `pg_hba`/ssh or per-host invocation.
 - **No restore-point scheduler.** Production must create distributed restore points itself
   (cadence = the RPO knob); the PoC does not ship the scheduler.
@@ -965,10 +965,10 @@ $ gg_recovery create-replica \
 | As-of-N snapshot | `CreateDRStandbyDistributedSnapshot()` `procarray.c:2166`; wiring `procarray.c:2570-2577`; array backing `cdbtm.c:1149-1150` |
 | Pause mechanism | GUC `guc_gp.c:4727-4736`; `pauseRecoveryOnRestorePoint()` `xlog.c:5976` (call `xlog.c:7811-7812`); `recoveryPausesHere()` `xlog.c:6205`; SIGHUP `startup.c:159-168` |
 | Served-N accessor | `pausedRestorePointName` `xlog.c:773` (capture :6005-6008, clear :6246); `GetPausedRestorePointName()` `xlog.c:6390-6396`; `pg_last_paused_restore_point()` `xlogfuncs.c:606-615` (OID 7016) |
-| Views | `system_views.sql:1542-1573` (`gp_stat_dr_replica`, `gp_stat_dr_replica_summary`, `pg_catalog`) |
+| Views | `system_views.sql:1542-1573` (`gg_stat_dr_replica`, `gg_stat_dr_replica_summary`, `pg_catalog`) |
 | Distributed barrier | `gp_create_restore_point()` `xlogfuncs_gp.c:35` (barrier :89-100) |
-| SQL recovery control | `gp_dr_switch()` / `gp_dr_promote()` + helpers `xlogfuncs_gp.c`; catalog `pg_proc.dat` OIDs 7017/7018 |
-| Utility | `gpMgmt/bin/gg_recovery` |
+| SQL recovery control | `gg_dr_switch()` / `gg_dr_promote()` + helpers `xlogfuncs_gp.c`; catalog `pg_proc.dat` OIDs 7017/7018 |
+| Utility | `gpMgmt/bin/ggdr` |
 
 ### 10.2 GUCs
 
@@ -980,17 +980,17 @@ $ gg_recovery create-replica \
 ### 10.3 Catalog / function objects
 
 - `pg_last_paused_restore_point()` → `text` (OID 7016) — served restore point, or `NULL`.
-- `gp_stat_dr_replica` (view, `pg_catalog`) — per-node recovery state.
-- `gp_stat_dr_replica_summary` (view, `pg_catalog`) — cluster rollup incl.
+- `gg_stat_dr_replica` (view, `pg_catalog`) — per-node recovery state.
+- `gg_stat_dr_replica_summary` (view, `pg_catalog`) — cluster rollup incl.
   `consistent_restore_point`, `rpo_seconds`.
-- `gp_dr_switch(text, int4)` → `bool` (OID 7017) — advance the cluster to a restore point.
-- `gp_dr_promote(text, int4)` → `bool` (OID 7018) — promote at the current cut.
+- `gg_dr_switch(text)` → `bool` (OID 7017) — advance the cluster to a restore point.
+- `gg_dr_promote()` → `bool` (OID 7018) — promote at the current cut.
 
 ### 10.4 Test fixture
 
 `src/test/dr/` — a two-container fixture (production + DR sharing an `/archive` volume) that
-builds the DR via `gg_recovery create-replica` and exercises M1/M2/M2′/M3/M5 plus
-`gg_recovery` `switch`/`pause`/`stats` plus the SQL control functions end-to-end
+builds the DR via `ggdr create-replica` and exercises M1/M2/M2′/M3/M5 plus
+`ggdr` `switch`/`pause`/`stats` plus the SQL control functions end-to-end
 (`docker-compose -f src/test/dr/docker-compose.yml up --build`).
 
 `src/test/dr/docker-compose.dense.yml` — a second, opt-in fixture for the §4.2.3 truncation

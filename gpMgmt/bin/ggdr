@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gg_recovery -- control a Greengage DR read-replica's recovery.
+"""ggdr -- control a Greengage DR read-replica's recovery.
 
 A DR read-replica is a second Greengage cluster kept current from production via
 WAL archiving and permanently in archive recovery.  Every node (coordinator +
@@ -15,9 +15,9 @@ taken while replay advances have no cross-node guarantee to offer.
 The cluster-wide steps below are also available as SQL, so a client that can
 reach only the coordinator can drive recovery without this tool:
 
-    SELECT gp_dr_switch('rp_hourly_42');      -- advance + wait, cluster-wide
-    SELECT gp_dr_promote();                   -- promote at the current cut
-    SELECT * FROM gp_stat_dr_replica_summary; -- status
+    SELECT gg_dr_switch('rp_hourly_42');      -- advance + wait, cluster-wide
+    SELECT gg_dr_promote();                   -- promote at the current cut
+    SELECT * FROM gg_stat_dr_replica_summary; -- status
 
 Subcommands
 -----------
@@ -35,7 +35,7 @@ Subcommands
         it happens to be), so it is for inspection, not for serving.  Resume with
         'switch <rp>'.
 
-  stats
+  stat
         Print per-node recovery statistics and a cluster summary: in recovery?
         paused? served restore point, replay LSN, replay age, and whether there is
         a consistent serve point (all nodes paused at the same restore point).
@@ -66,7 +66,7 @@ Connection
 Run this on the DR coordinator host.  The coordinator is reached locally (via the
 standard libpq environment: PGPORT, PGDATABASE, ...); the node list and each
 segment's address/port come from the DR's own gp_segment_configuration.  All
-connections are utility-mode (no dispatch), so switch/stats keep working even when
+connections are utility-mode (no dispatch), so switch/stat keep working even when
 the cluster has no consistent serve point.
 """
 
@@ -104,7 +104,7 @@ def get_nodes():
         "from gp_segment_configuration where role='p' order by content;" % (FIELDSEP, FIELDSEP),
     )
     if rc != 0 or not out:
-        sys.exit("gg_recovery: cannot read gp_segment_configuration on the coordinator "
+        sys.exit("ggdr: cannot read gp_segment_configuration on the coordinator "
                  "(port %d): %s" % (COORD_PORT, err or "no rows"))
     nodes = []
     for line in out.splitlines():
@@ -183,20 +183,20 @@ def _repoint_and_resume(nodes, target):
 
 def cmd_switch(restore_point):
     nodes = get_nodes()
-    print("gg_recovery switch: re-pointing %d node(s) to restore point '%s'"
+    print("ggdr switch: re-pointing %d node(s) to restore point '%s'"
           % (len(nodes), restore_point))
     _repoint_and_resume(nodes, restore_point)
-    print("gg_recovery switch: waiting for every node to reach '%s' ..." % restore_point)
+    print("ggdr switch: waiting for every node to reach '%s' ..." % restore_point)
     deadline = time.time() + 300
     states = []
     while time.time() < deadline:
         states = [node_state(*n) for n in nodes]
         if all(s["ok"] and s["paused"] and s["restore_point"] == restore_point for s in states):
-            print("gg_recovery switch: DONE -- all %d node(s) paused at '%s' "
+            print("ggdr switch: DONE -- all %d node(s) paused at '%s' "
                   "(consistent serve point)" % (len(nodes), restore_point))
             return 0
         time.sleep(2)
-    print("gg_recovery switch: TIMEOUT -- not all nodes reached '%s':" % restore_point)
+    print("ggdr switch: TIMEOUT -- not all nodes reached '%s':" % restore_point)
     for s in states:
         if s["ok"]:
             print("  %-13s: paused=%s at '%s'"
@@ -210,7 +210,7 @@ def cmd_switch(restore_point):
 
 def cmd_pause():
     nodes = get_nodes()
-    print("gg_recovery pause: pausing replay on %d node(s) at their current point" % len(nodes))
+    print("ggdr pause: pausing replay on %d node(s) at their current point" % len(nodes))
     for content, address, port in nodes:
         host, p = _conn(content, address, port)
         rc, out, err = _psql(p, "select pg_wal_replay_pause();", host=host)
@@ -218,18 +218,18 @@ def cmd_pause():
         if err and "not in progress" not in err.lower():
             note = "  [warn: %s]" % err.splitlines()[0]
         print("  %-13s (port %d): paused%s" % (_label(content), port, note))
-    print("gg_recovery pause: replay halted.")
+    print("ggdr pause: replay halted.")
     print("  NOTE: an IMMEDIATE pause halts each node wherever it is, which is NOT a")
     print("        cross-node consistent cut.  For a consistent, safe-to-serve point use")
     print("        'switch <rp>'.  Resume with 'switch <rp>'.")
     return 0
 
 
-def cmd_stats():
+def cmd_stat():
     nodes = get_nodes()
     states = [node_state(*n) for n in nodes]
 
-    print("gg_recovery: DR read-replica recovery status\n")
+    print("ggdr: DR read-replica recovery status\n")
     hdr = "  %-8s %-11s %-11s %-6s %-22s %-16s %s"
     print(hdr % ("content", "role", "in_recovery", "paused", "restore_point", "replay_lsn", "replay_age"))
     print("  " + " ".join("-" * n for n in (8, 11, 11, 6, 22, 16, 10)))
@@ -308,47 +308,47 @@ def cmd_promote(at=None, assume_yes=False, timeout=300):
     #     breaks as nodes leave recovery). ---
     states = [node_state(*n) for n in nodes]
     if not all(s["ok"] for s in states):
-        sys.exit("gg_recovery promote: some nodes are unreachable; refusing.")
+        sys.exit("ggdr promote: some nodes are unreachable; refusing.")
     if not all(s["in_recovery"] for s in states):
-        sys.exit("gg_recovery promote: not every node is in recovery; refusing.")
+        sys.exit("ggdr promote: not every node is in recovery; refusing.")
     if not all(s["paused"] for s in states):
-        sys.exit("gg_recovery promote: not every node is paused -- run 'gg_recovery switch <rp>' "
+        sys.exit("ggdr promote: not every node is paused -- run 'ggdr switch <rp>' "
                  "to reach a consistent restore point first.")
     served = set(s["restore_point"] for s in states)
     if len(served) != 1 or "" in served:
-        sys.exit("gg_recovery promote: nodes are NOT at a single consistent restore point (%s); "
-                 "run 'gg_recovery switch <rp>' first." % sorted(served))
+        sys.exit("ggdr promote: nodes are NOT at a single consistent restore point (%s); "
+                 "run 'ggdr switch <rp>' first." % sorted(served))
     consistent_n = next(iter(served))
     if at and consistent_n != at:
-        sys.exit("gg_recovery promote: cluster is at '%s', not --at '%s'; refusing." % (consistent_n, at))
+        sys.exit("ggdr promote: cluster is at '%s', not --at '%s'; refusing." % (consistent_n, at))
 
-    print("gg_recovery promote: promoting the whole cluster at consistent restore point '%s'"
+    print("ggdr promote: promoting the whole cluster at consistent restore point '%s'"
           % consistent_n)
     if not assume_yes:
         sys.stderr.write("  This is IRREVERSIBLE (recovery only moves forward). Type 'yes' to continue: ")
         sys.stderr.flush()
         if sys.stdin.readline().strip().lower() != "yes":
-            sys.exit("gg_recovery promote: aborted.")
+            sys.exit("ggdr promote: aborted.")
 
     segs = [n for n in nodes if n[0] != -1]
     coord = next(n for n in nodes if n[0] == -1)
 
     # --- phase 1: exit recovery at N, SEGMENTS FIRST then COORDINATOR ---
-    print("gg_recovery promote: phase 1 -- exiting recovery (segments first)")
+    print("ggdr promote: phase 1 -- exiting recovery (segments first)")
     for content, address, port in segs:
         host, p = _conn(content, address, port)
         _psql(p, "select pg_promote(false);", host=host)      # arm the promote trigger
         _psql(p, "select pg_wal_replay_resume();", host=host)  # unpause -> recovery ends AFTER N
         print("  %-13s (port %d): promote armed + resumed" % (_label(content), port))
     if not _wait_out_of_recovery(segs, timeout):
-        sys.exit("gg_recovery promote: segments did not exit recovery within %ds." % timeout)
+        sys.exit("ggdr promote: segments did not exit recovery within %ds." % timeout)
     print("  all segments out of recovery")
     c, a, p_ = coord
     host, cp = _conn(c, a, p_)
     _psql(cp, "select pg_promote(false);", host=host)
     _psql(cp, "select pg_wal_replay_resume();", host=host)
     if not _wait_out_of_recovery([coord], timeout):
-        sys.exit("gg_recovery promote: coordinator did not exit recovery within %ds." % timeout)
+        sys.exit("ggdr promote: coordinator did not exit recovery within %ds." % timeout)
     print("  coordinator out of recovery")
 
     # Nothing else to do: DR behaviour is keyed on "in recovery with hot standby"
@@ -358,7 +358,7 @@ def cmd_promote(at=None, assume_yes=False, timeout=300):
     #
     # standby.signal is left in place deliberately: a promoted node ignores it,
     # and removing it here would only matter if the datadir were later reused.
-    print("gg_recovery promote: DONE -- cluster promoted to online read-write "
+    print("ggdr promote: DONE -- cluster promoted to online read-write "
           "(as-of restore point '%s'); DR mode disengaged with recovery, no restart needed."
           % consistent_n)
     return 0
@@ -375,11 +375,11 @@ def _parse_topology(path):
                 continue
             cols = line.split("\t")
             if len(cols) < 10:
-                sys.exit("gg_recovery create-replica: %s:%d has %d columns, need >=10" % (path, ln, len(cols)))
+                sys.exit("ggdr create-replica: %s:%d has %d columns, need >=10" % (path, ln, len(cols)))
             rows.append({"dbid": int(cols[0]), "content": int(cols[1]), "role": cols[2],
                          "port": int(cols[6]), "hostname": cols[7], "datadir": cols[9]})
     if not any(r["content"] == -1 for r in rows):
-        sys.exit("gg_recovery create-replica: topology has no coordinator (content=-1) row")
+        sys.exit("ggdr create-replica: topology has no coordinator (content=-1) row")
     return sorted(rows, key=lambda r: r["content"])
 
 
@@ -515,7 +515,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     rows = _parse_topology(topology)
     if restore_command is None:
         restore_command = "cp %s/seg%%c/%%f %%p" % wal_archive
-    # gpseed_dr_topology ships beside gg_recovery in $GPHOME/bin; also try PATH and $GPHOME.
+    # gpseed_dr_topology ships beside ggdr in $GPHOME/bin; also try PATH and $GPHOME.
     here = os.path.dirname(os.path.abspath(__file__))
     seed_prog = next((c for c in (
         os.path.join(here, "gpseed_dr_topology"),
@@ -523,9 +523,9 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         os.path.join(os.environ.get("GPHOME", ""), "bin", "gpseed_dr_topology"),
     ) if c and os.path.exists(c)), None)
     if not seed_prog:
-        sys.exit("gg_recovery create-replica: cannot find gpseed_dr_topology "
-                 "(looked next to gg_recovery, on PATH, and in $GPHOME/bin)")
-    print("gg_recovery create-replica: building a DR replica for %d instance(s) from %s"
+        sys.exit("ggdr create-replica: cannot find gpseed_dr_topology "
+                 "(looked next to ggdr, on PATH, and in $GPHOME/bin)")
+    print("ggdr create-replica: building a DR replica for %d instance(s) from %s"
           % (len(rows), basebackup_dir))
 
     # --- 1. safety / idempotence ---
@@ -538,13 +538,13 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         has_pid = os.path.exists(os.path.join(dd, "postmaster.pid"))
         if not force:
             if has_pid:
-                sys.exit("gg_recovery create-replica: %s has a postmaster.pid (running?); "
+                sys.exit("ggdr create-replica: %s has a postmaster.pid (running?); "
                          "stop the cluster or pass --force to stop+overwrite it." % dd)
             if os.path.exists(dd) and os.listdir(dd):
-                sys.exit("gg_recovery create-replica: %s is non-empty; use --force to overwrite." % dd)
+                sys.exit("ggdr create-replica: %s is non-empty; use --force to overwrite." % dd)
             continue
         if has_pid and not _stop_node(dd):
-            sys.exit("gg_recovery create-replica: a live postmaster still holds %s after "
+            sys.exit("ggdr create-replica: a live postmaster still holds %s after "
                      "'pg_ctl stop'; refusing to overwrite it." % dd)
 
     # --- 2. restore each instance's base backup ---
@@ -552,14 +552,14 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         dd, c = r["datadir"], r["content"]
         src = os.path.join(basebackup_dir, "seg%d" % c)
         if not os.path.isdir(src):
-            sys.exit("gg_recovery create-replica: base backup %s not found" % src)
+            sys.exit("ggdr create-replica: base backup %s not found" % src)
         _run(["rm", "-rf", dd]); os.makedirs(os.path.dirname(dd), exist_ok=True)
         rc, out, err = _run(["cp", "-a", src, dd])
         if rc != 0:
-            sys.exit("gg_recovery create-replica: restore of content %d failed: %s" % (c, err))
+            sys.exit("ggdr create-replica: restore of content %d failed: %s" % (c, err))
         os.chmod(dd, 0o700)
         if not os.path.exists(os.path.join(dd, "backup_label")):
-            sys.exit("gg_recovery create-replica: content %d base backup has no backup_label "
+            sys.exit("ggdr create-replica: content %d base backup has no backup_label "
                      "(was it taken with pg_basebackup --target-gp-dbid?)" % c)
         print("  restored content %d -> %s" % (c, dd))
 
@@ -571,9 +571,9 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         adir = _archive_dir(wal_archive, c)
         start_file = _backup_label_start_file(dd)
         if not os.path.isdir(adir) or not os.listdir(adir):
-            sys.exit("gg_recovery create-replica: WAL archive %s is missing/empty; refusing (fail-closed)." % adir)
+            sys.exit("ggdr create-replica: WAL archive %s is missing/empty; refusing (fail-closed)." % adir)
         if start_file and not os.path.exists(os.path.join(adir, start_file)):
-            sys.exit("gg_recovery create-replica: archive %s lacks the backup START WAL segment %s; "
+            sys.exit("ggdr create-replica: archive %s lacks the backup START WAL segment %s; "
                      "refusing (fail-closed)." % (adir, start_file))
         print("  archive gate OK for content %d (start=%s)" % (c, start_file or "?"))
 
@@ -581,7 +581,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     coord = next(r for r in rows if r["content"] == -1)
     cdd = coord["datadir"]
     if scratch_seed:
-        sys.exit("gg_recovery create-replica: --scratch-seed not yet implemented in this PoC")
+        sys.exit("ggdr create-replica: --scratch-seed not yet implemented in this PoC")
     print("  seeding DR-local topology into the coordinator (%s)" % cdd)
     label = os.path.join(cdd, "backup_label")
     ctl = os.path.join(cdd, "global", "pg_control")
@@ -592,7 +592,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     _run(["cp", "-p", ctl, ctl + ".drsave"])
     rc, out, err = _run([seed_prog, cdd, topology])
     if rc != 0:
-        sys.exit("gg_recovery create-replica: gpseed_dr_topology failed: %s" % (err or out))
+        sys.exit("ggdr create-replica: gpseed_dr_topology failed: %s" % (err or out))
     # (a) restore recovery-start state so recovery resumes from the backup checkpoint
     if have_label:
         _run(["mv", label + ".drsave", label])
@@ -614,7 +614,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         dd = r["datadir"]
         open(os.path.join(dd, "postgresql.auto.conf"), "w").close()   # drop production sync-rep settings
         with open(os.path.join(dd, "postgresql.conf"), "a") as f:
-            f.write("\n# --- GREENGAGE DR REPLICA (gg_recovery create-replica) ---\n")
+            f.write("\n# --- GREENGAGE DR REPLICA (ggdr create-replica) ---\n")
             f.write("hot_standby = on\n")
             f.write("restore_command = '%s'\n" % restore_command)
             f.write("recovery_target_timeline = 'current'\n")
@@ -629,7 +629,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     print("    export COORDINATOR_DATA_DIRECTORY=%s" % cdd)
 
     if no_start:
-        print("gg_recovery create-replica: DONE (armed, not started; --no-start).")
+        print("ggdr create-replica: DONE (armed, not started; --no-start).")
         return 0
 
     # --- 6. start each node in recovery + poll for liveness ---
@@ -649,19 +649,19 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
             time.sleep(3)
     # --- 7. post-build check: the seed describes THIS cluster (V-21) ---
     seed_rc = _check_seeded_topology(rows) if ok == len(rows) else 0
-    print("gg_recovery create-replica: DONE -- %d/%d node(s) live in recovery." % (ok, len(rows)))
+    print("ggdr create-replica: DONE -- %d/%d node(s) live in recovery." % (ok, len(rows)))
     return 0 if (ok == len(rows) and seed_rc == 0) else 1
 
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="gg_recovery",
-        description="Control a Greengage DR read-replica's recovery (switch / pause / stats / promote).")
+        prog="ggdr",
+        description="Control a Greengage DR read-replica's recovery (switch / pause / stat / promote).")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_switch = sub.add_parser("switch", help="pause every node at <restore_point> (stop-and-go)")
     p_switch.add_argument("restore_point", help="the restore point to pause the whole cluster at")
     sub.add_parser("pause", help="immediately pause replay on every node (not a consistent cut)")
-    sub.add_parser("stats", help="print recovery statistics")
+    sub.add_parser("stat", help="print recovery statistics")
     p_prom = sub.add_parser("promote", help="promote the DR cluster to a normal online read-write cluster")
     p_prom.add_argument("--at", metavar="RP", help="require the consistent cut to equal this restore point")
     p_prom.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -684,8 +684,8 @@ def main():
         return cmd_switch(args.restore_point)
     if args.cmd == "pause":
         return cmd_pause()
-    if args.cmd == "stats":
-        return cmd_stats()
+    if args.cmd == "stat":
+        return cmd_stat()
     if args.cmd == "promote":
         return cmd_promote(at=args.at,
                            assume_yes=args.yes, timeout=args.timeout)

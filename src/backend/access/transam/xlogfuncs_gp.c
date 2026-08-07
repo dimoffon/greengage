@@ -309,8 +309,8 @@ gp_switch_wal(PG_FUNCTION_ARGS)
  * primary segment and applies the same step locally, so one SQL call moves the
  * whole cluster.
  *
- * Status is read from the gp_stat_dr_replica / gp_stat_dr_replica_summary views;
- * there is deliberately no gp_dr_stats() function duplicating them.
+ * Status is read from the gg_stat_dr_replica / gg_stat_dr_replica_summary views;
+ * there is deliberately no gg_dr_stat() function duplicating them.
  * ---------------------------------------------------------------------------
  */
 
@@ -340,7 +340,7 @@ dr_dispatch(const char *cmd)
  * Calls AlterSystemSetConfigFile() directly instead of executing an ALTER SYSTEM
  * statement, because standard_ProcessUtility() gates AlterSystemStmt behind
  * PreventInTransactionBlock() and every caller here is already inside one:
- * gp_dr_switch() runs inside a SELECT, and on a segment the dispatched statement
+ * gg_dr_switch() runs inside a SELECT, and on a segment the dispatched statement
  * may be executing inside the dispatched transaction.  The underlying action is
  * identical -- it writes the file and nothing else.
  */
@@ -371,14 +371,14 @@ dr_set_pause_target(const char *target)
 	char	   *cmd;
 
 	/*
-	 * Dispatch gp_dr_switch() itself: on a segment it is the per-node primitive
+	 * Dispatch gg_dr_switch() itself: on a segment it is the per-node primitive
 	 * (see the Gp_role check at the top of it) and returns immediately.  A
 	 * function call, not `ALTER SYSTEM ...`, because the utility statement is
 	 * rejected by PreventInTransactionBlock whenever the QE happens to run it
 	 * inside the dispatched transaction -- which depends on gang and DTX state,
 	 * so it worked in some deployments and failed in others.
 	 */
-	cmd = psprintf("SELECT pg_catalog.gp_dr_switch(%s, 0)",
+	cmd = psprintf("SELECT pg_catalog.gg_dr_switch(%s)",
 				   quote_literal_cstr(target));
 	dr_dispatch(cmd);
 	pfree(cmd);
@@ -454,7 +454,7 @@ dr_control_precheck(const char *fname)
 }
 
 /*
- * gp_dr_switch(restore_point, timeout_seconds) -> bool
+ * gg_dr_switch(restore_point) -> bool
  *
  * Stop-and-go: re-point every node's pause target at `restore_point`, resume
  * replay, and wait until all of them are paused there -- a consistent serve
@@ -463,16 +463,13 @@ dr_control_precheck(const char *fname)
  * arming it before production creates it is fine and is how you catch a point
  * cleanly instead of overshooting it.
  *
- * Returns true once every node is paused there, false on timeout (the arming
- * has still been applied, so the caller can keep waiting on
- * gp_stat_dr_replica_summary.consistent_restore_point).
+ * Blocks until every node is paused there, then returns true.  There is no
+ * timeout argument: see the wait loop below.  Cancel it like any other query.
  */
 Datum
-gp_dr_switch(PG_FUNCTION_ARGS)
+gg_dr_switch(PG_FUNCTION_ARGS)
 {
 	char	   *target = text_to_cstring(PG_GETARG_TEXT_P(0));
-	int			timeout = PG_GETARG_INT32(1);
-	int			waited;
 
 	/*
 	 * On a segment, this is the per-node primitive the coordinator dispatched:
@@ -484,12 +481,12 @@ gp_dr_switch(PG_FUNCTION_ARGS)
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to call gp_dr_switch()")));
+					 errmsg("must be superuser to call gg_dr_switch()")));
 		dr_write_pause_target(target);
 		PG_RETURN_BOOL(true);
 	}
 
-	dr_control_precheck("gp_dr_switch");
+	dr_control_precheck("gg_dr_switch");
 	if (target[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -502,25 +499,35 @@ gp_dr_switch(PG_FUNCTION_ARGS)
 	dr_set_pause_target(target);
 	dr_reload_and_resume();
 
-	for (waited = 0; waited < timeout; waited++)
+	/*
+	 * Wait until every node is paused there.  No timeout: how long this takes is
+	 * a property of how much WAL lies between here and the target, which the
+	 * caller cannot usefully guess -- and a timeout that fires leaves the target
+	 * armed anyway, so it would report a failure that is not one.  The wait is
+	 * interruptible, so pg_cancel_backend() (or Ctrl-C) is the way out.
+	 */
+	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (dr_all_paused_at(target))
 			PG_RETURN_BOOL(true);
 		pg_usleep(1000000L);
 	}
-	ereport(WARNING,
-			(errmsg("timed out after %d seconds waiting for the cluster to reach restore point \"%s\"",
-					timeout, target),
-			 errhint("The pause target is armed on every node; watch gp_stat_dr_replica_summary.consistent_restore_point.")));
-	PG_RETURN_BOOL(false);
 }
 
 /*
- * gp_dr_promote(at_restore_point, timeout_seconds) -> bool
+ * gg_dr_promote() -> bool
  *
  * Promote the whole DR cluster to an online read-write cluster, cutting every
- * node at the same restore point.  Irreversible: recovery only moves forward.
+ * node at the restore point it is currently paused at.  Irreversible: recovery
+ * only moves forward.
+ *
+ * No arguments: a replica is promoted from where it *is*, and where it is, is a
+ * restore point (that is the only state it serves from).  Naming the point again
+ * would only let the caller assert something the function already validates --
+ * that every node is paused, and at the same one -- so it validates and reports
+ * the point instead of asking for it.  Use gg_dr_switch() first to choose a
+ * different cut.
  *
  * Segments are promoted before the coordinator so that when the coordinator's
  * FTS starts probing, the segments it probes are already live.
@@ -530,14 +537,11 @@ gp_dr_switch(PG_FUNCTION_ARGS)
  * so it lifts by itself the moment recovery ends.
  */
 Datum
-gp_dr_promote(PG_FUNCTION_ARGS)
+gg_dr_promote(PG_FUNCTION_ARGS)
 {
-	char	   *at = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
-	int			timeout = PG_GETARG_INT32(1);
 	char		local[MAXFNAMELEN];
-	int			waited;
 
-	dr_control_precheck("gp_dr_promote");
+	dr_control_precheck("gg_dr_promote");
 
 	/*
 	 * Precondition: one consistent cut.  Promoting from anywhere else -- an
@@ -549,17 +553,12 @@ gp_dr_promote(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the cluster is not paused at a restore point"),
-				 errhint("Use gp_dr_switch() to reach a consistent restore point first.")));
-	if (at != NULL && strcmp(at, local) != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("the cluster is paused at restore point \"%s\", not \"%s\"",
-						local, at)));
+				 errhint("Use gg_dr_switch() to reach a consistent restore point first.")));
 	if (!dr_all_paused_at(local))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("not every node is paused at restore point \"%s\"", local),
-				 errhint("Check gp_stat_dr_replica_summary.consistent_restore_point.")));
+				 errhint("Check gg_stat_dr_replica_summary.consistent_restore_point.")));
 
 	/*
 	 * Promote first, then resume: promotion only arms the trigger, and the
@@ -593,15 +592,11 @@ gp_dr_promote(PG_FUNCTION_ARGS)
 	 * you need the stronger guarantee.  In practice the segments are up within a
 	 * second or two, and the first distributed query will wait for FTS anyway.
 	 */
-	for (waited = 0; waited < timeout; waited++)
+	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (!RecoveryInProgress())
 			PG_RETURN_BOOL(true);
 		pg_usleep(1000000L);
 	}
-	ereport(WARNING,
-			(errmsg("timed out after %d seconds waiting for the coordinator to leave recovery",
-					timeout)));
-	PG_RETURN_BOOL(false);
 }

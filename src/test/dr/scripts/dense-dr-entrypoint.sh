@@ -40,7 +40,7 @@ export COORDINATOR_DATA_DIRECTORY="$COORD" MASTER_DATA_DIRECTORY="$COORD" PGPORT
 NODES=()
 for content in $ALL_CONTENTS; do NODES+=("${DR_DATADIR[$content]}:${DR_PORT[$content]}"); done
 
-GG="python3 $SRC/gpMgmt/bin/gg_recovery"
+GG="python3 $SRC/gpMgmt/bin/ggdr"
 log "dense-dr: building the replica (paused at dense_rp_pre, before the truncation) ..."
 set +e
 $GG create-replica \
@@ -48,7 +48,7 @@ $GG create-replica \
 	--basebackup-dir "$BASEBACKUP" \
 	--wal-archive "$WAL_ARCHIVE" \
 	--pause-at dense_rp_pre \
-	--force 2>&1 | sed 's/^/    gg_recovery: /'
+	--force 2>&1 | sed 's/^/    ggdr: /'
 set -e
 
 # Utility-mode helper: the checks must keep working even if the topology catalog

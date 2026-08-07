@@ -26,7 +26,7 @@ Four review findings prompted this change.
    coordinator; querying them loads the very hosts they protect, and an FTS failover onto a
    mirror strands the readers.
 
-4. **Recovery control was only reachable from a shell.** `gg_recovery` needs a connection to
+4. **Recovery control was only reachable from a shell.** `ggdr` needs a connection to
    every node; a client that can reach only the coordinator could observe DR status through
    the views but could not act on it.
 
@@ -60,7 +60,7 @@ the second key this ADR removes. Scenario H-4 exists to keep the warning honest.
 
 ### D2 — Recovery is supported only *up to a restore point*
 
-`gg_recovery follow` is removed. A replica serves reads only while paused at a distributed
+`ggdr follow` is removed. A replica serves reads only while paused at a distributed
 restore point. Reaching any other position is still possible (`pause`, or an advance in
 flight), but is for inspection, not for serving, and `stats` reports no consistent serve
 point there.
@@ -185,10 +185,10 @@ writes on both sides — DDL above all.
 
 ### D4 — Cluster-wide recovery control in SQL
 
-`gp_dr_switch(restore_point, timeout)` and `gp_dr_promote(at_restore_point, timeout)`
+`gg_dr_switch(restore_point, timeout)` and `gg_dr_promote(at_restore_point, timeout)`
 (`xlogfuncs_gp.c`, OIDs 7017/7018) apply each step to every primary segment via
 `CdbDispatchCommand()` and to the coordinator directly. Status keeps using the existing
-`gp_stat_dr_replica` views; a third status surface would only be one more thing to keep in
+`gg_stat_dr_replica` views; a third status surface would only be one more thing to keep in
 step.
 
 Two implementation notes worth preserving, because both were found the hard way:
@@ -196,13 +196,48 @@ Two implementation notes worth preserving, because both were found the hard way:
 - The local `ALTER SYSTEM` leg **cannot** go through SPI. These functions run inside a
   `SELECT`, and `standard_ProcessUtility` calls `PreventInTransactionBlock` for
   `AlterSystemStmt`; the local leg therefore calls `AlterSystemSetConfigFile()` directly.
-- `gp_dr_promote()` waits for **this node** to leave recovery, not the segments. Segments
+- `gg_dr_promote()` waits for **this node** to leave recovery, not the segments. Segments
   cannot be polled from here: the QE protocol check refuses a standby QD talking to a
   promoted QE (and the reverse once this node is promoted), and they cannot be promoted
   synchronously either, because `recoveryPausesHere()` does not watch for the promote
   trigger — `pg_promote(true)` on a paused node would wait for a resume only another session
-  could send. `gg_recovery promote`, which holds a connection per node, remains the path
+  could send. `ggdr promote`, which holds a connection per node, remains the path
   when the stronger guarantee is needed.
+
+### D5 — Naming and signatures (review follow-up)
+
+Applied after the first round of use:
+
+- **`gg_` prefix for everything this feature adds.** `gg_dr_switch`, `gg_dr_promote`,
+  `gg_stat_dr_replica`, `gg_stat_dr_replica_summary`. `gp_` is the historical Greenplum
+  prefix; new Greengage objects take `gg_`. Pre-existing objects the feature *uses* keep
+  their names (`gp_create_restore_point`, `gp_pause_on_restore_point_replay`,
+  `gp_segment_configuration`), as does `pg_last_paused_restore_point()`, which is
+  deliberately named alongside the `pg_*` recovery accessors it sits with
+  (`pg_is_wal_replay_paused`, `pg_last_wal_replay_lsn`) rather than after this feature.
+
+- **No timeout arguments.** How long a switch takes is a property of how much WAL lies
+  between here and the target, which the caller cannot usefully guess. Worse, a timeout
+  that fires leaves the pause target armed anyway, so it reported a failure that was not
+  one. Both functions now block until done; the wait is interruptible, so
+  `pg_cancel_backend()` — or Ctrl-C — is the way out, which is the mechanism operators
+  already have for every other long query.
+
+- **`gg_dr_promote()` takes no arguments.** A replica is promoted from where it *is*, and
+  where it is, is a restore point — that is the only state it serves from. The old
+  `at_restore_point` argument only let the caller assert something the function already
+  validates. The validation stays (every node paused, all at the same point) and the
+  function reports the point it found; it no longer asks to be told.
+
+- **Recovery-position columns clear on promotion.** `replay_lsn` and `replay_time` do not
+  error once recovery ends — they keep reporting the last replayed position forever. On a
+  promoted cluster that is stale trivia presented as status, and it made `rpo_seconds` grow
+  without bound for a cluster that has no RPO at all. Both are now NULL out of recovery, and
+  `rpo_seconds` with them.
+
+- **`gg_recovery` is renamed `ggdr`**, and its `stats` subcommand to `stat`, matching the
+  view it prints.
+
 
 ---
 
@@ -210,11 +245,11 @@ Two implementation notes worth preserving, because both were found the hard way:
 
 - One mode instead of two; promotion no longer restarts the cluster.
 - `CATALOG_VERSION_NO` bumped (new `pg_proc` entries) — both clusters must be rebuilt.
-- A latent bug surfaced and was fixed on the way: `gp_stat_dr_replica` called
+- A latent bug surfaced and was fixed on the way: `gg_stat_dr_replica` called
   `pg_is_wal_replay_paused()` under a `CASE` guard, but the `UNION ALL` of an entry-DB row
   with a `gp_dist_random()` row defeats the short-circuit, so the whole view **errored on a
   promoted cluster** — exactly when an operator wants to read it. The guard is now a scalar
   subquery. This was never noticed because no test had read the view after promotion.
 - Verified end to end on the container fixture: 36/36 (M1+M2 7, M2′ 5, M3 6, M5 6,
-  `gg_recovery` 4, SQL recovery control 8), plus the V-20 dense fixture 5/5 and the
+  `ggdr` 4, SQL recovery control 8), plus the V-20 dense fixture 5/5 and the
   `gg_walfilter` suite 40/40.

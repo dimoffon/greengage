@@ -15,6 +15,7 @@
   [cybertec-postgresql/walbouncer](https://github.com/cybertec-postgresql/walbouncer) —
   a streaming-replication proxy that filters a WAL stream per standby (by tablespace /
   database) by replacing unwanted records with no-ops.
+- **Note:** `gg_recovery` is now named `ggdr` (ADR-0004 D5); references below are pre-rename.
 
 ---
 

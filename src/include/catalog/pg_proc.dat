@@ -6092,14 +6092,14 @@
 
 # Greengage DR: cluster-wide recovery control (see xlogfuncs_gp.c).
 { oid => '7017', descr => 'advance the whole DR cluster to a restore point and pause there',
-  proname => 'gp_dr_switch', provolatile => 'v', proparallel => 'u',
-  prorettype => 'bool', proargtypes => 'text int4',
-  prosrc => 'gp_dr_switch' },
+  proname => 'gg_dr_switch', provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool', proargtypes => 'text',
+  prosrc => 'gg_dr_switch' },
 
-{ oid => '7018', descr => 'promote the DR cluster to online read-write at its restore point',
-  proname => 'gp_dr_promote', provolatile => 'v', proparallel => 'u',
-  prorettype => 'bool', proargtypes => 'text int4', proisstrict => 'f',
-  prosrc => 'gp_dr_promote' },
+{ oid => '7018', descr => 'promote the DR cluster to online read-write at its current restore point',
+  proname => 'gg_dr_promote', provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool', proargtypes => '',
+  prosrc => 'gg_dr_promote' },
 
 { oid => '3071', descr => 'pause wal replay',
   proname => 'pg_wal_replay_pause', provolatile => 'v', prorettype => 'void',
