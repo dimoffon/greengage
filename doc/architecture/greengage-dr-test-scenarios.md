@@ -110,6 +110,7 @@ that tries to allocate a `gxid`.
 | **C-9** | `switch` armed for a restore point production has **not created yet** | Succeeds when the WAL arrives — nodes catch it cleanly instead of overshooting. This is the pattern the promote test uses. | AUTO | PASS |
 | **C-10** | Per-segment archive **skew**: one segment lags | The cluster cannot reach a consistent cut until the slowest segment has archived *and* replayed through its N-LSN. `stats` shows the laggard. **The slowest archiver gates everyone.** | NEW | DEGRADE |
 | **C-11** | Compare DR as-of-N against a production snapshot taken at N | Row-for-row equality on every table across every segment. The end-to-end correctness assertion the milestone tests only approximate with counts. | NEW | PASS |
+| **C-12** | **Read issued *during* an advance**, with WAL volume skewed to one segment | **Measured — [torn read reproduced](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced).** One distributed transaction observed half-committed across segments for ~2.1s: present on the light segment, absent on the heavy one still replaying. A state reachable at neither cut. Not a snapshot-builder defect — per-node replay skew, which the in-doubt masking does not address. The summary's `consistent_restore_point` is correctly NULL throughout that window, so the signal exists; nothing enforces it. | **RUN** | **GAP (by convention)** |
 
 ---
 
@@ -569,17 +570,83 @@ merely risk itself, it stalls every other consumer's advance by up to
 `max_standby_archive_delay` — and with `max_standby_archive_delay = -1` it would stall the
 advance indefinitely.
 
-**What this run does *not* establish.** A second run polled `test_h` with short queries
-throughout the advance and saw only `100000` then `90000` — no intermediate value, no
-errors. That is weak evidence, not proof: the advance lasted ~1s, and in this workload the
-intermediate cut (after the `DELETE`, before the rewrite) happens to have the same row count
-as `rp2`. The general exposure stands and is untested: **nothing prevents queries while an
-advance is in flight**, and mid-advance the cluster is at an arbitrary LSN, not a restore
-point — precisely the position §D2 says carries no cross-node guarantee. Demonstrating a
-genuinely torn mid-advance read needs a distributed transaction straddling the two restore
-points, i.e. the C-3 fault-injection machinery pointed at an advance window rather than at a
-cut. Until that is run, "do not query during an advance" is a convention, not something the
-implementation enforces.
+**What this run did not establish** was the mid-advance case: a second pass polled `test_h`
+with short queries throughout the advance and saw only `100000` then `90000`, but the advance
+lasted ~1s and that workload's intermediate cut happens to have the same row count as `rp2`.
+That question is now answered separately and in the affirmative — see
+[C-11 below](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced).
+
+---
+
+## Appendix — C-11 measured: a torn mid-advance read, reproduced
+
+The open question from C-7: mid-advance the cluster sits at an arbitrary LSN rather than a
+restore point, so is a *genuinely* torn read reachable — a state achievable at neither the
+old cut nor the new one? **Yes, and it is easy to hit.**
+
+**The mechanism is not the coordinator/segment straddle — it is per-node replay skew.** Each
+DR node replays its own WAL independently, so during an advance they sit at different
+positions. Skew that deliberately and the window becomes seconds wide.
+
+**Setup.** Between `mrp1` and `mrp2`, production writes:
+
+1. 3 000 000 rows into `bulk`, every one keyed so it hashes to **segment 0** — so segment 0
+   must replay ~500 MB of WAL to cross the interval and segment 1 has almost none;
+2. then **one distributed transaction** inserting a single row into `mark` on *each*
+   segment: `BEGIN; INSERT INTO mark VALUES (1,…),(2,…); COMMIT;`
+
+So `mark` is empty at `mrp1` and has one row per segment at `mrp2`. Any other combination is
+unreachable at either cut.
+
+**Result.** Sampling `SELECT gp_segment_id, count(*) FROM mark GROUP BY 1` every 150 ms from a
+warm session, across the advance:
+
+| observed | meaning | samples |
+|---|---|---|
+| `-` | empty on both | 22 — this is `mrp1` |
+| **`1:1`** | **the row is on segment 1 and absent on segment 0** | **14 (~2.1 s)** |
+| `0:1,1:1` | one row on each | 99 — this is `mrp2` |
+
+The middle state is one distributed transaction observed **half-committed across segments**.
+It exists at neither restore point. A second run reproduced it and captured why, sampling
+per-node state alongside:
+
+```
+12:07:34.018 | -         | -1:Pmrp1, 0:Pmrp1, 1:Pmrp1    all three paused at mrp1
+12:07:37.435 | 1:1       | -1:Pmrp2, 0:P-,    1:Pmrp2    coordinator + seg1 at mrp2; seg0 has NO restore point
+12:07:39.729 | 0:1,1:1   | -1:Pmrp2, 0:Pmrp2, 1:Pmrp2    all three at mrp2
+```
+
+The light segment and the coordinator reach `mrp2` and pause; the heavy segment is still
+grinding through the bulk WAL. Every query issued in that window reads a cluster whose nodes
+are at different points in the log.
+
+**What this does and does not mean**
+
+- It is **not** a defect in the snapshot builder. The in-doubt masking (§D3) compensates for
+  the coordinator committing ahead of its segments *at a restore point*. It has nothing to
+  say about segments being at different LSNs, which is what an advance is.
+- The **views tell the truth throughout.** `consistent_restore_point` is
+  `CASE WHEN count(*) = count(restore_point) AND count(DISTINCT restore_point) = 1 …`, and in
+  the middle sample segment 0's `restore_point` is NULL — so the summary reports **no
+  consistent serve point** for exactly the window in which reads are unsafe. (Derived from the
+  view definition, not separately sampled.) An operator or client that gates on that column
+  before querying is safe; one that does not, is not.
+- **The guarantee is therefore conditional, and should be stated that way**: reads are
+  cross-segment consistent *while the cluster is paused at a common restore point*, which is
+  not the same as "the replica is consistent". Nothing in the engine refuses a query mid-advance.
+
+**Worth considering** (not implemented): refusing distributed reads outright when
+`consistent_restore_point` is NULL would make the property an invariant rather than a
+convention — the same move ADR-0004 D1 made for DR mode itself. The cost is that `pause` and
+mid-advance inspection stop working, so it wants a deliberate escape hatch.
+
+**Incidental observation, unexplained.** In the middle sample segment 0 reports
+`is_paused = true` with a NULL `restore_point`, which should not co-occur — a pause is set
+when a restore-point record is replayed, and resuming clears the name. Most likely an
+intra-query timing artifact of the dispatched view straddling the moment segment 0 paused. It
+does not affect the finding (and, as above, the NULL is what makes the summary correctly
+withhold its blessing), but it was not chased down.
 
 ---
 
