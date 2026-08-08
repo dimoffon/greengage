@@ -1,5 +1,11 @@
 # ADR-0001: Disaster-Recovery Read Replica for Greengage 7
 
+> **Historical — proof-of-concept record.** Superseded in full by
+> [ADR-0006](0006-dr-read-replica.md), which states the design as it stands today in one
+> self-contained document. This file is kept for the rationale behind a particular
+> decision, including mechanisms that were adopted and later reversed; do not read it as a
+> description of the current implementation.
+
 - **Status:** Accepted — implemented and validated end-to-end on branch `7.x-dr` (proof of concept).
   **Amendment history:** ADR-0002 (2026-08) briefly superseded the *apply-time redo
   filter* mechanism of D3 with a restore-time WAL filter utility (`gg_walfilter` in

@@ -1,5 +1,11 @@
 # ADR-0002: Restore-Time WAL Filtering (`gg_walfilter`) Replaces the In-Backend Redo Filter
 
+> **Historical — proof-of-concept record.** Superseded in full by
+> [ADR-0006](0006-dr-read-replica.md), which states the design as it stands today in one
+> self-contained document. This file is kept for the rationale behind a particular
+> decision, including mechanisms that were adopted and later reversed; do not read it as a
+> description of the current implementation.
+
 - **Status:** **Superseded in part by ADR-0003 (2026-08-03)** — the *default-mechanism*
   decision (restore-time filtering replacing the in-backend redo filter) was reversed
   the same day after re-weighing the principal trade-off recorded below ("protection

@@ -99,9 +99,9 @@ that tries to allocate a `gxid`.
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **C-1** | All nodes paused at restore point `N`; read twice | Identical results. Every node answers from the local MVCC image it froze when it stopped at `N` (ADR-0005), and while paused there is no replay either. **Zero recovery-conflict exposure inside a serve window.** | AUTO | PASS |
+| **C-1** | All nodes paused at restore point `N`; read twice | Identical results. Every node answers from the local MVCC image it froze when it stopped at `N` (ADR-0006 D8), and while paused there is no replay either. **Zero recovery-conflict exposure inside a serve window.** | AUTO | PASS |
 | **C-2** | Advance `N → N+1` (`gg_dr_switch` / `ggdr switch`), re-read | Results move forward atomically to the new cut — data written on production between N and N+1 becomes visible together, on every node at the same moment, because the new image is published only after all of them have arrived. | AUTO | PASS |
-| **C-3** | **The straddle.** A distributed 2PC txn *T* whose coordinator `XLOG_XACT_DISTRIBUTED_COMMIT` lands *before* the restore point but whose commit-prepared broadcast lands *after* (injected with the `dtm_broadcast_commit_prepared` fault) | At the cut, *T*'s **rows** are invisible and no error is raised: on every segment *T* is prepared-only, so its local xid is still in `KnownAssignedXids` and the frozen image reads it as in-progress. After advancing past *T*'s forget, its rows appear. The coordinator's own local xact *is* committed at the cut, so a *T* that also wrote coordinator catalog is asymmetric — see [ADR-0005 D5.1](adr/0005-dr-served-restore-point-snapshot.md); that asymmetry pre-dates and survives this design, and fails loudly rather than silently. | AUTO | PASS |
+| **C-3** | **The straddle.** A distributed 2PC txn *T* whose coordinator `XLOG_XACT_DISTRIBUTED_COMMIT` lands *before* the restore point but whose commit-prepared broadcast lands *after* (injected with the `dtm_broadcast_commit_prepared` fault) | At the cut, *T*'s **rows** are invisible and no error is raised: on every segment *T* is prepared-only, so its local xid is still in `KnownAssignedXids` and the frozen image reads it as in-progress. After advancing past *T*'s forget, its rows appear. The coordinator's own local xact *is* committed at the cut, so a *T* that also wrote coordinator catalog is asymmetric — see [ADR-0006 D8](adr/0006-dr-read-replica.md); that asymmetry pre-dates and survives this design, and fails loudly rather than silently. | AUTO | PASS |
 | **C-4** | `ggdr pause` (immediate pause), then read | Reads work and still answer as of the last **published** restore point — an immediate pause stops the WAL, it does not change what is served. `gg_stat_dr_replica_summary.consistent_restore_point` goes `NULL` because the nodes' *replay* positions no longer agree, which is the honest report of the cluster's replay state, not of the served image. | NEW | PASS |
 | **C-5** | A long analytical query spanning an **advance** (`gg_dr_switch` to the next restore point), while production has run `VACUUM` | The query can be delayed then cancelled: `canceling statement due to conflict with recovery … User query might have needed to see row versions that must be removed`. With one backend per segment, **cancelling any one segment fails the whole distributed query**. `hot_standby_feedback` cannot help — there is no streaming connection back to production. Since free-running mode was removed, this is now confined to advance bursts rather than being the steady state. | NEW | DEGRADE |
 | **C-6** | Same as C-5 with `max_standby_archive_delay` raised from the built-in `0` | Queries survive longer; **replay stalls instead**, so RPO grows for as long as the query runs. Demonstrates the knob is a trade, not a fix. `-1` is not the far end of that trade but a trap: it blocks the startup process inside redo, so replay stops altogether. | NEW | DEGRADE |
@@ -110,7 +110,7 @@ that tries to allocate a `gxid`.
 | **C-9** | `switch` armed for a restore point production has **not created yet** | Succeeds when the WAL arrives — nodes catch it cleanly instead of overshooting. This is the pattern the promote test uses. | AUTO | PASS |
 | **C-10** | Per-segment archive **skew**: one segment lags | The cluster cannot reach a consistent cut until the slowest segment has archived *and* replayed through its N-LSN. `stats` shows the laggard. **The slowest archiver gates everyone.** | NEW | DEGRADE |
 | **C-11** | Compare DR as-of-N against a production snapshot taken at N | Row-for-row equality on every table across every segment. The end-to-end correctness assertion the milestone tests only approximate with counts. | NEW | PASS |
-| **C-12** | **Read issued *during* an advance**, with WAL volume skewed to one segment | **Was a reproduced torn read; now fixed and regression-tested.** [The original measurement](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced) caught one distributed transaction half-committed across segments for ~2.1s — a state reachable at neither cut. Every node now answers from the image frozen at the published point regardless of where its replay has got to (ADR-0005), so a mid-advance read returns the *N* image or is cancelled. The fixture holds the skewed state still instead of racing it: the segments are driven to `dr_rp2` by hand while the coordinator stays at `dr_rp1`, and the read must keep returning the `dr_rp1` answer. | AUTO | PASS |
+| **C-12** | **Read issued *during* an advance**, with WAL volume skewed to one segment | **Was a reproduced torn read; now fixed and regression-tested.** [The original measurement](#appendix--c-11-measured-a-torn-mid-advance-read-reproduced) caught one distributed transaction half-committed across segments for ~2.1s — a state reachable at neither cut. Every node now answers from the image frozen at the published point regardless of where its replay has got to (ADR-0006 D8), so a mid-advance read returns the *N* image or is cancelled. The fixture holds the skewed state still instead of racing it: the segments are driven to `dr_rp2` by hand while the coordinator stays at `dr_rp1`, and the read must keep returning the `dr_rp1` answer. | AUTO | PASS |
 
 ---
 
@@ -205,7 +205,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 |---|---|---|---|---|
 | **H-1** | Kill (`SIGKILL`) a DR node and restart it | Crash recovery re-applies from the last checkpoint; **the redo filter re-applies identically**, so the DR-local topology survives. Verify `gp_segment_configuration` still reads `dr` and the node returns to its pause target. | NEW | PASS |
 | **H-2** | Restart the whole DR cluster | Comes back in recovery, still read-only, `hot_standby` still on, pause target preserved (it lives in `postgresql.conf` / `postgresql.auto.conf`). The frozen image does **not** survive — it is shared memory — so each node re-freezes and self-publishes the first time it reaches a restore point again. Between start and that moment, queries are refused with *"this disaster-recovery replica has no restore point to serve from"*; connecting, `ALTER SYSTEM` and `pg_ctl reload` keep working. | NEW | PASS |
-| **H-2b** | Restart **one** node in the middle of an advance from `N` to `N+1` | The restarted node replays to `N+1`, finds nothing served, and publishes `N+1` on its own while its peers still serve `N` — a torn window that closes when the coordinator's `gg_dr_switch()` publishes `N+1` everywhere. **Left open deliberately:** every way of closing it leaves the node refusing snapshots with no way back in. See [ADR-0005 D3](adr/0005-dr-served-restore-point-snapshot.md). | NEW | **GAP (documented)** |
+| **H-2b** | Restart **one** node in the middle of an advance from `N` to `N+1` | The restarted node replays to `N+1`, finds nothing served, and publishes `N+1` on its own while its peers still serve `N` — a torn window that closes when the coordinator's `gg_dr_switch()` publishes `N+1` everywhere. **Left open deliberately:** every way of closing it leaves the node refusing snapshots with no way back in. See [ADR-0006 D9](adr/0006-dr-read-replica.md). | NEW | **GAP (documented)** |
 | **H-3** | Start a node with `hot_standby = off` in recovery | `IsDRReplicaMode()` is false, so it is an ordinary (unqueryable) standby: no topology filter, no read-only enforcement. This is what keeps mirrors and the standby coordinator unaffected by the fold. | NEW | PASS |
 | **H-4** | **Footgun check:** set `hot_standby = on` on an in-cluster **mirror**, let production change topology, then fail over to it | The mirror's `gp_segment_configuration` is frozen by the topology filter, so after FTS promotes it the cluster describes a stale topology. This is a documented misconfiguration, not a supported mode — the scenario exists to show the damage is real and to keep the warning honest. | NEW | documented footgun |
 | **H-5** | A DR **segment** dies while the coordinator serves | The distributed query fails (no DR-local mirrors, no DR-local FTS — a DR node never leaves `PM_HOT_STANDBY`). **Mirrorless DR is a deliberate PoC scope decision**; the recovery is to rebuild that node. Demonstrate the failure is clean and diagnosable. | NEW | DEGRADE |
@@ -624,23 +624,26 @@ are at different points in the log.
 
 **What this does and does not mean**
 
-- It is **not** a defect in the snapshot builder. The in-doubt masking (§D3) compensates for
-  the coordinator committing ahead of its segments *at a restore point*. It has nothing to
-  say about segments being at different LSNs, which is what an advance is.
+- It was **not** a defect in the snapshot builder of the day. The in-doubt masking
+  compensated for the coordinator committing ahead of its segments *at a restore point*. It
+  had nothing to say about segments being at different LSNs, which is what an advance is.
 - The **views tell the truth throughout.** `consistent_restore_point` is
   `CASE WHEN count(*) = count(restore_point) AND count(DISTINCT restore_point) = 1 …`, and in
   the middle sample segment 0's `restore_point` is NULL — so the summary reports **no
   consistent serve point** for exactly the window in which reads are unsafe. (Derived from the
   view definition, not separately sampled.) An operator or client that gates on that column
   before querying is safe; one that does not, is not.
-- **The guarantee is therefore conditional, and should be stated that way**: reads are
-  cross-segment consistent *while the cluster is paused at a common restore point*, which is
-  not the same as "the replica is consistent". Nothing in the engine refuses a query mid-advance.
+- **The guarantee was therefore conditional**: reads were cross-segment consistent *while
+  the cluster was paused at a common restore point*, which is not the same as "the replica
+  is consistent", and nothing in the engine refused a query mid-advance.
 
-**Worth considering** (not implemented): refusing distributed reads outright when
-`consistent_restore_point` is NULL would make the property an invariant rather than a
-convention — the same move ADR-0004 D1 made for DR mode itself. The cost is that `pause` and
-mid-advance inspection stop working, so it wants a deliberate escape hatch.
+**What shipped instead** ([ADR-0006](adr/0006-dr-read-replica.md) D8). Making the property
+an invariant did not, in the end, mean refusing reads while `consistent_restore_point` is
+NULL — that would have taken `pause` and mid-advance inspection with it. Every node instead
+serves the local image it froze at the point the cluster last published, so a mid-advance
+read *is* consistent: it answers as of that point, or is cancelled. `consistent_restore_point`
+keeps reporting the replay positions, which is a different and still useful question — it is
+what tells you whether an advance is in flight.
 
 **Incidental observation, unexplained.** In the middle sample segment 0 reports
 `is_paused = true` with a NULL `restore_point`, which should not co-occur — a pause is set
@@ -709,7 +712,7 @@ reachable, and why holding a transaction open did not help.
 
 ### What was done about it
 
-**ADR-0005** — each node freezes its **local** MVCC snapshot when it stops at the restore
+**[ADR-0006](adr/0006-dr-read-replica.md) D8** — each node freezes its **local** MVCC snapshot when it stops at the restore
 point, and serves that image for every read until the next point is published. The two
 reasons above are addressed by not depending on either:
 

@@ -68,7 +68,7 @@ a while; subsequent runs reuse the image.
    `… exec dr env PGOPTIONS='-c gp_role=utility' psql -p 7000 postgres`.
 
 4. **M3 skew** — the regression test for the mid-advance torn read (scenario C-12,
-   [ADR-0005](../../../doc/architecture/adr/0005-dr-served-restore-point-snapshot.md)).
+   [ADR-0006](../../../doc/architecture/adr/0006-dr-read-replica.md) D8).
    Rather than racing a real advance, it *holds* the dangerous state still: the
    **segments** are driven to `dr_rp2` by hand while the **coordinator** stays at
    `dr_rp1`, so `dr_m3`'s second row is replayed and locally committed on a segment

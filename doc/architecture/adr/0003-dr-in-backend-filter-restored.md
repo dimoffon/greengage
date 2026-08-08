@@ -1,5 +1,11 @@
 # ADR-0003: The In-Backend Redo Filter Is the Default Again; `gg_walfilter` Becomes C Tooling in src/bin
 
+> **Historical — proof-of-concept record.** Superseded in full by
+> [ADR-0006](0006-dr-read-replica.md), which states the design as it stands today in one
+> self-contained document. This file is kept for the rationale behind a particular
+> decision, including mechanisms that were adopted and later reversed; do not read it as a
+> description of the current implementation.
+
 - **Status:** Accepted — implemented on branch `7.x-dr`
 - **Date:** 2026-08-03
 - **Supersedes:** the *default-mechanism* decision of ADR-0002 (restore-time filtering
