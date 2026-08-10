@@ -475,3 +475,7 @@ sharing an `/archive` volume, with the replica built by `ggdr create-replica`:
 - Proof-of-concept record (historical rationale only): ADR-0001 … ADR-0005 in this
   directory.
 - Test fixture: `src/test/dr/` (see its `README.md`).
+- Same content as a browsable page, with a diagram of the publish step (D8):
+  <https://claude.ai/code/artifact/2919af1b-adc3-45ce-9dad-2278fbf7d866> — a private link,
+  readable only by people it has been shared with. This file is the source of truth; the
+  page is a convenience and can lag it.
