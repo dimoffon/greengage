@@ -183,24 +183,24 @@ FROM gp_toolkit.gp_db_files_current AS f
 JOIN gp_segment_configuration AS gpconf
   ON gpconf.content = f.content
  AND gpconf.preferred_role = (f.segment_preferred_role)::char(1)
-WHERE f.table_name IN ('t_default', 'gp_segment_configuration', 't');
-        table_name        | table_schema | content | table_tablespace |      tablespace_location       
---------------------------+--------------+---------+------------------+--------------------------------
- gp_segment_configuration | pg_catalog   |       0 | pg_global        | <SEGMENT_BASE_DIR>/global
- gp_segment_configuration | pg_catalog   |       1 | pg_global        | <SEGMENT_BASE_DIR>/global
- gp_segment_configuration | pg_catalog   |       2 | pg_global        | <SEGMENT_BASE_DIR>/global
- t                        | public       |       0 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
- t                        | public       |       1 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
- t                        | public       |       2 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
- t_default                | public       |       0 | pg_default       | <SEGMENT_BASE_DIR>/base
- t_default                | public       |       1 | pg_default       | <SEGMENT_BASE_DIR>/base
- t_default                | public       |       2 | pg_default       | <SEGMENT_BASE_DIR>/base
+WHERE f.table_name IN ('t_default', 'gp_segment_configuration_internal', 't');
+            table_name             | table_schema | content | table_tablespace |      tablespace_location       
+-----------------------------------+--------------+---------+------------------+--------------------------------
+ gp_segment_configuration_internal | pg_catalog   |       0 | pg_global        | <SEGMENT_BASE_DIR>/global
+ gp_segment_configuration_internal | pg_catalog   |       1 | pg_global        | <SEGMENT_BASE_DIR>/global
+ gp_segment_configuration_internal | pg_catalog   |       2 | pg_global        | <SEGMENT_BASE_DIR>/global
+ t                                 | public       |       0 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
+ t                                 | public       |       1 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
+ t                                 | public       |       2 | ts_test          | <TEST_TABLESPACE_LOCATION_DIR>
+ t_default                         | public       |       0 | pg_default       | <SEGMENT_BASE_DIR>/base
+ t_default                         | public       |       1 | pg_default       | <SEGMENT_BASE_DIR>/base
+ t_default                         | public       |       2 | pg_default       | <SEGMENT_BASE_DIR>/base
 (9 rows)
 
 -- Check that returned files are exist
 CREATE view expected_files AS SELECT table_name, content, file
 FROM gp_toolkit.gp_db_files_current
-WHERE table_name IN ('t_default', 'gp_segment_configuration', 't');
+WHERE table_name IN ('t_default', 'gp_segment_configuration_internal', 't');
 CREATE EXTERNAL WEB TABLE file_list (line text)
 EXECUTE 'find -L $GP_SEG_DATADIR -type f'
 FORMAT 'TEXT';
@@ -214,17 +214,17 @@ SELECT
     END AS conclusion
 FROM expected_files AS e
 LEFT JOIN fl ON e.file = fl.line;
-        table_name        | content | conclusion  
---------------------------+---------+-------------
- gp_segment_configuration |       0 | file exists
- gp_segment_configuration |       1 | file exists
- gp_segment_configuration |       2 | file exists
- t                        |       0 | file exists
- t                        |       1 | file exists
- t                        |       2 | file exists
- t_default                |       0 | file exists
- t_default                |       1 | file exists
- t_default                |       2 | file exists
+            table_name             | content | conclusion  
+-----------------------------------+---------+-------------
+ gp_segment_configuration_internal |       0 | file exists
+ gp_segment_configuration_internal |       1 | file exists
+ gp_segment_configuration_internal |       2 | file exists
+ t                                 |       0 | file exists
+ t                                 |       1 | file exists
+ t                                 |       2 | file exists
+ t_default                         |       0 | file exists
+ t_default                         |       1 | file exists
+ t_default                         |       2 | file exists
 (9 rows)
 
 DROP VIEW expected_files;
