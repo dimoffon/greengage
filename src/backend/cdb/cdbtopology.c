@@ -123,10 +123,13 @@ GpTopoActiveProvider(void)
 /*
  * Initialise the active provider.
  *
- * Called eagerly from the postmaster once shared memory exists, so that an
+ * Called eagerly from PostmasterMain() once shared memory exists, so that an
  * unusable store is diagnosed at startup rather than at the first query, and
- * idempotently from the read and write paths, so that EXEC_BACKEND and any
- * path that reaches topology earlier than that still works.
+ * idempotently from the read and write paths, so that EXEC_BACKEND, standalone
+ * backends and initdb's bootstrap backend still work.
+ *
+ * A provider's startup() therefore runs in the postmaster, where there is no
+ * PGPROC: it must take no lock that could wait, and start no transaction.
  */
 void
 GpTopologyProviderStartup(void)

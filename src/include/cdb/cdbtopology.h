@@ -144,6 +144,12 @@ typedef struct GpTopologyRoutine
 	bool		readable_without_transaction;
 	bool		readable_without_shmem;
 
+	/*
+	 * Bring the store up, once, before anything can read it.  Runs in the
+	 * postmaster: no PGPROC, so no lock that could wait, and no transaction.
+	 * This is where a provider refuses to serve a store it cannot be correct
+	 * on.
+	 */
 	void		(*startup) (void);
 
 	/* Read the whole topology into `cxt`.  Never returns NULL. */

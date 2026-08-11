@@ -149,6 +149,7 @@
 
 #include "cdb/cdbgang.h"                /* cdbgang_parse_gpqeid_params */
 #include "cdb/cdbtm.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbendpoint.h"
 #include "cdb/ic_proxy_bgworker.h"
@@ -1431,6 +1432,22 @@ PostmasterMain(int argc, char *argv[])
 	 * Set up shared memory and semaphores.
 	 */
 	reset_shared(PostPortNumber);
+
+	/*
+	 * Bring up the cluster-topology store.
+	 *
+	 * Here, and not later, because every fail-closed check the store makes is
+	 * worth nothing if it fires in whichever backend happens to touch topology
+	 * first: a node with an unreadable or unmigrated store must refuse to
+	 * start, not refuse a query some minutes later.  This is the earliest point
+	 * that has all four things it needs -- shared memory and LWLocks exist
+	 * (reset_shared), the control file is read so the system identifier is
+	 * available, $PGDATA is the working directory, and the GUCs are final --
+	 * and no child exists yet, so a FATAL here has nothing to clean up.
+	 *
+	 * A no-op under the catalog provider, which has no startup().
+	 */
+	GpTopologyProviderStartup();
 
 	/*
 	 * Estimate number of openable files.  This must happen after setting up
