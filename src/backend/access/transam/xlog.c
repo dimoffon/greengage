@@ -8400,9 +8400,36 @@ StartupXLOG(void)
 	 * update ourselves as the new coordinator in catalog.  This does not
 	 * apply to a mirror (standby of a GPDB segment) because it is
 	 * managed by FTS.
+	 *
+	 * It does not apply to a disaster-recovery replica either, and for a
+	 * different reason: a DR coordinator is not a standby being activated
+	 * within a cluster, it is a whole cluster leaving recovery.  Its
+	 * gp_segment_configuration already describes itself, and promoting the
+	 * catalog would DELETE that coordinator row and promote a standby that
+	 * does not exist (segment_config_activate_standby()).
+	 *
+	 * Until now this was safe only by coincidence: gp_activate_standby()
+	 * returns early when the topology's coordinator dbid happens to equal this
+	 * node's gp_dbid, which is true of a well-formed seed and of nothing else.
+	 * Say what is meant instead, so that a change on either side fails visibly
+	 * rather than corrupting the topology.
+	 *
+	 * IsDRReplicaMode() is read here, and only here, because it is
+	 * EnableHotStandby && RecoveryInProgress() -- recovery ends a few dozen
+	 * lines below, so by the time UpdateCatalogForStandbyPromotion() runs the
+	 * answer would already be false.
 	 */
+	bool isDRReplica = IsDRReplicaMode();
 	bool needToPromoteCatalog = (IS_QUERY_DISPATCHER() &&
-								 ControlFile->state == DB_IN_ARCHIVE_RECOVERY);
+								 ControlFile->state == DB_IN_ARCHIVE_RECOVERY &&
+								 !isDRReplica);
+
+	if (isDRReplica && IS_QUERY_DISPATCHER() &&
+		ControlFile->state == DB_IN_ARCHIVE_RECOVERY)
+		ereport(LOG,
+				(errmsg("disaster-recovery replica: promoting in place as coordinator dbid %d",
+						GpIdentity.dbid),
+				 errdetail("Cluster topology already describes this cluster; standby-coordinator catalog promotion is not applicable.")));
 
 	/* start the archive_timeout timer and LSN running */
 	XLogCtl->lastSegSwitchTime = (pg_time_t) time(NULL);

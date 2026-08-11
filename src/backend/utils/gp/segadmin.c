@@ -800,7 +800,16 @@ gp_activate_standby(void)
 		/*
 		 * Job is already done, nothing needs to be done. We mostly crashed
 		 * after updating the catalogs.
+		 *
+		 * Logged rather than returned silently: this is the single most
+		 * load-bearing line on the promotion path, and until the caller was
+		 * taught to recognise a disaster-recovery replica explicitly
+		 * (StartupXLOG's needToPromoteCatalog) it was also the only thing
+		 * standing between a DR promotion and a deleted coordinator row.
 		 */
+		ereport(LOG,
+				(errmsg("standby activation: dbid %d is already the coordinator in gp_segment_configuration; nothing to do",
+						standby_dbid)));
 		return true;
 	}
 
