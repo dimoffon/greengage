@@ -63,8 +63,10 @@
 #include "catalog/pg_authid_d.h"
 #include "catalog/pg_class_d.h" /* pgrminclude ignore */
 #include "catalog/pg_collation_d.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
+#include "common/gp_topology_file.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
 #include "common/username.h"
@@ -252,6 +254,7 @@ static int	get_encoding_id(const char *encoding_name);
 static void set_input(char **dest, const char *filename);
 static void check_input(char *path);
 static void write_version_file(const char *extrapath);
+static void write_topology_file(void);
 static void set_null_conf(const char *);
 static void test_config_settings(void);
 static void setup_config(void);
@@ -874,6 +877,50 @@ write_version_file(const char *extrapath)
 		exit(1);
 	}
 	free(path);
+}
+
+/*
+ * Write the empty cluster topology store.
+ *
+ * Unconditionally, whatever gp_topology_source will be set to -- initdb cannot
+ * know a PGC_POSTMASTER GUC, and the point of always writing it is that its
+ * absence later means "deleted" rather than an ambiguous "empty".  generation 0
+ * is what says nobody has written it for real yet; the file store refuses to
+ * serve a dispatcher at that generation.
+ *
+ * After bootstrap, because the system identifier is minted by the bootstrap
+ * backend and there is nothing to record before then.
+ */
+static void
+write_topology_file(void)
+{
+	ControlFileData *controlfile;
+	GpTopologyFile topo;
+	bool		crc_ok;
+	GpTopologyFileError err;
+
+	controlfile = get_controlfile(pg_data, &crc_ok);
+	if (controlfile == NULL || !crc_ok)
+	{
+		pg_log_error("could not read \"%s/global/pg_control\"", pg_data);
+		exit(1);
+	}
+
+	memset(&topo, 0, sizeof(topo));
+	topo.version = GP_TOPOLOGY_FORMAT_VERSION;
+	topo.system_identifier = controlfile->system_identifier;
+	topo.generation = 0;
+	topo.nentries = 0;
+
+	err = gp_topology_write_file(pg_data, &topo, true, NULL);
+	if (err != GP_TOPOFILE_OK)
+	{
+		pg_log_error("could not write file \"%s/%s\": %s", pg_data,
+					 GP_TOPOLOGY_FILENAME, gp_topology_file_error_str(err));
+		exit(1);
+	}
+
+	pg_free(controlfile);
 }
 
 /*
@@ -3256,6 +3303,9 @@ initialize_data_directory(void)
 	 * Make the per-database PG_VERSION for template1 only after init'ing it
 	 */
 	write_version_file("base/1");
+
+	/* pg_control now exists, so the topology store can record its identifier */
+	write_topology_file();
 
 	/*
 	 * Create the stuff we don't need to use bootstrap mode for, using a
