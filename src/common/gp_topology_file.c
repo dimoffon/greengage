@@ -27,6 +27,7 @@
 #endif
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "common/file_perm.h"
@@ -583,8 +584,10 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 {
 	char		path[MAXPGPATH];
 	char	   *buf;
+	size_t		bufsize;
 	size_t		len = 0;
 	int			fd;
+	struct stat st;
 	GpTopologyFileError err;
 
 	memset(out, 0, sizeof(*out));
@@ -603,21 +606,40 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 	if (fd < 0)
 		return errno == ENOENT ? GP_TOPOFILE_ENOENT : GP_TOPOFILE_IO;
 
-	buf = topo_alloc0(GP_TOPOLOGY_MAX_SIZE);
+	/*
+	 * Size the buffer from the file, with slack: this is read once per
+	 * transaction that needs topology, so a fixed worst-case allocation would
+	 * be paid on every one of them.  The ceiling is what stops a corrupt or
+	 * hostile file from choosing the allocation.
+	 */
+	if (fstat(fd, &st) != 0)
+	{
+		close(fd);
+		return GP_TOPOFILE_IO;
+	}
+	if (st.st_size < 0 || (uint64) st.st_size > GP_TOPOLOGY_MAX_SIZE)
+	{
+		close(fd);
+		return GP_TOPOFILE_IO;
+	}
+	bufsize = (size_t) st.st_size + 1024;
+
+	buf = topo_alloc0(bufsize);
 
 	/* A short read is not EOF.  Loop until read() actually returns zero. */
 	for (;;)
 	{
 		ssize_t		nread;
 
-		if (len >= GP_TOPOLOGY_MAX_SIZE)
+		if (len >= bufsize)
 		{
+			/* the file grew under us; treat it as unreadable rather than torn */
 			topo_free(buf);
 			close(fd);
 			return GP_TOPOFILE_IO;
 		}
 
-		nread = read(fd, buf + len, GP_TOPOLOGY_MAX_SIZE - len);
+		nread = read(fd, buf + len, bufsize - len);
 		if (nread < 0)
 		{
 			if (errno == EINTR)
