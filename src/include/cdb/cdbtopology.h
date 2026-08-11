@@ -48,13 +48,23 @@ extern int	gp_topology_source;		/* GpTopologySourceKind; int for the GUC machine
 /*
  * How hard a writer needs to serialise.
  *
- * These are not interchangeable.  SERIALIZED reproduces what every segment
- * add and remove path does today -- AccessExclusiveLock, held to end of
- * transaction -- and that retention is what protects gpMgmt's multi-statement
- * reconfiguration transactions.  ROW reproduces what FTS does:
- * one or two rows per probe cycle, concurrent readers unaffected.  Raising FTS
- * to SERIALIZED would block every reader of the topology on every probe cycle
- * that changed anything.
+ * These are not interchangeable.  SERIALIZED means whole-set exclusivity held
+ * to end of transaction -- AccessExclusiveLock under the catalog provider --
+ * and that retention is what lets gpMgmt drive the topology through
+ * intermediate states across several statements of one transaction without
+ * anyone reading a half-finished cluster.  ROW is one or two rows with
+ * concurrent readers unaffected, which is what an FTS probe cycle needs;
+ * raising FTS to SERIALIZED would block every reader of the topology on every
+ * cycle that changed anything.
+ *
+ * SERIALIZED is what six of the eight segment add/remove entry points already
+ * took before the topology moved behind this interface.  The two exceptions
+ * are gp_remove_segment() and gp_remove_coordinator_standby(), whose heaviest
+ * lock was RowExclusiveLock: they are stronger now.  Neither can be given back
+ * its old lock through this enum -- ROW releases at end_write, where those two
+ * held to commit -- and the stronger lock is the safe direction, since both
+ * read the topology and then delete from it.  Said here because "SERIALIZED is
+ * what the callers already did" is true of most of them and not of those two.
  */
 typedef enum GpTopoWriteLevel
 {

@@ -376,6 +376,11 @@ gp_remove_segment(PG_FUNCTION_ARGS)
 	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER | UTILITY_MODE,
 						   "gp_remove_segment");
 
+	/*
+	 * Stronger than this path used to take: it topped out at RowExclusiveLock.
+	 * See GpTopoWriteLevel -- ROW is not the old behaviour either, and reading
+	 * the topology and then deleting from it wants the whole-set lock.
+	 */
 	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
 
 	remove_segment(ws, dbid);
@@ -586,6 +591,7 @@ gp_remove_coordinator_standby(PG_FUNCTION_ARGS)
 	mirroring_sanity_check(NULL, SUPERUSER | COORDINATOR_ONLY | UTILITY_MODE,
 						   "gp_remove_coordinator_standby");
 
+	/* Stronger than this path used to take; see gp_remove_segment(). */
 	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
 
 	dbid = content_get_mirror_dbid(ws, COORDINATOR_CONTENT_ID);
