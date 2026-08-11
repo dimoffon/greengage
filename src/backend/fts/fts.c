@@ -179,7 +179,7 @@ CdbComponentDatabases *readCdbComponentInfoAndUpdateStatus(void)
 	if (ftsProbeInfo->status_version == 0)
 	{
 		ftsProbeInfo->status_version++;
-		writeGpSegConfigToFTSFiles();
+		GpTopoPublishSnapshot();
 	}
 
 	return cdbs;
@@ -382,13 +382,15 @@ void FtsLoop()
 			if (updated_probe_state)
 			{
 				/*
-				 * File GPSEGCONFIGDUMPFILE under $PGDATA is used by other
-				 * components to fetch latest gp_segment_configuration outside
-				 * of a transaction. FTS updates this file in the first probe
-				 * and every probe which updated gp_segment_configuration.
+				 * Other components fetch the latest topology outside a
+				 * transaction, and the catalog provider serves them from a
+				 * flat dump in $PGDATA.  FTS refreshes it on the first probe
+				 * and on every probe that changed the topology.  A provider
+				 * that is already readable without a transaction keeps no such
+				 * copy, and this is a no-op there.
 				 */
 				StartTransactionCommand();
-				writeGpSegConfigToFTSFiles();
+				GpTopoPublishSnapshot();
 				CommitTransactionCommand();
 
 				ftsProbeInfo->status_version++;

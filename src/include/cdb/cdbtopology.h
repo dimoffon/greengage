@@ -178,9 +178,6 @@ extern GpSegConfigEntry *GpTopologyGetAll(MemoryContext cxt, int *nentries);
  */
 extern void GpTopoPublishSnapshot(void);
 
-/* The catalog provider's implementation of the above.  FTS-only. */
-extern void writeGpSegConfigToFTSFiles(void);
-
 /*
  * Mutating the topology
  * ---------------------

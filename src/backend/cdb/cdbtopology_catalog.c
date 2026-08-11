@@ -55,6 +55,7 @@
 static GpSegConfigEntry *readGpSegConfigFromCatalogRel(Relation rel, int *total_dbs);
 static GpSegConfigEntry *readGpSegConfigFromCatalog(int *total_dbs);
 static GpSegConfigEntry *readGpSegConfigFromFTSFiles(int *total_dbs);
+static void writeGpSegConfigToFTSFiles(void);
 
 /*
  * Helper functions for fetching latest gp_segment_configuration outside of
@@ -137,7 +138,7 @@ readGpSegConfigFromFTSFiles(int *total_dbs)
  * write contents to GPSEGCONFIGDUMPFILETMP first, then rename it to
  * GPSEGCONFIGDUMPFILE, it makes lockless read and write concurrently.
  */
-void
+static void
 writeGpSegConfigToFTSFiles(void)
 {
 	FILE	*fd;
