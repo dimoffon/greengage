@@ -77,7 +77,7 @@ advance() {   # $1=to -- move the whole cluster to a new restore point AND serve
 }
 
 BLKSZ=$(q "select current_setting('block_size')::int;")
-dr_pages()   { q "select pg_relation_size('gp_segment_configuration') / $BLKSZ;"; }
+dr_pages()   { q "select pg_relation_size('gp_segment_configuration_internal') / $BLKSZ;"; }
 dr_rows()    { q "select count(*) from gp_segment_configuration_internal;"; }
 dr_max_blk() { q "select coalesce(max(substring(ctid::text from '\((\d+),')::int), -1) from gp_segment_configuration_internal;"; }
 

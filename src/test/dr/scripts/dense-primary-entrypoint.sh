@@ -12,7 +12,7 @@
 # in -- a DENSE catalog -- which is what pushes the seed's rows onto a trailing
 # block:
 #
-#   1. fill gp_segment_configuration with filler rows, then delete them in the
+#   1. fill gp_segment_configuration_internal with filler rows, then delete them in the
 #      SAME transaction, so they are dead the moment they become visible (no
 #      other backend, FTS included, ever sees them) but still occupy their pages;
 #   2. base-backup in that state -- the DR inherits full pages and a free-space
@@ -71,7 +71,7 @@ u() { PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -Atc "$1"; }
 
 BLKSZ=$(u "select current_setting('block_size')::int;")
-pages() { u "select pg_relation_size('gp_segment_configuration') / $BLKSZ;"; }
+pages() { u "select pg_relation_size('gp_segment_configuration_internal') / $BLKSZ;"; }
 
 log "dense-primary: catalog before densify: $(pages) page(s) (block_size=$BLKSZ)"
 log "dense-primary: inserting + deleting $FILLER_ROWS filler rows in ONE transaction ..."
@@ -139,8 +139,8 @@ log "dense-primary: waiting for the DR to finish building ..."
 for _ in $(seq 1 900); do [ -f "$ARCHIVE/dense_dr_built" ] && break; sleep 2; done
 [ -f "$ARCHIVE/dense_dr_built" ] || die "timed out waiting for the DR to build"
 
-log "dense-primary: VACUUM gp_segment_configuration (reclaims the fillers -> truncates) ..."
-u "vacuum gp_segment_configuration;" >/dev/null
+log "dense-primary: VACUUM gp_segment_configuration_internal (reclaims the fillers -> truncates) ..."
+u "vacuum gp_segment_configuration_internal;" >/dev/null
 PROD_PAGES_AFTER=$(pages)
 log "dense-primary: catalog after VACUUM: $PROD_PAGES_AFTER page(s) (was $PROD_PAGES_DENSE)"
 if [ "$PROD_PAGES_AFTER" -lt "$PROD_PAGES_DENSE" ]; then
