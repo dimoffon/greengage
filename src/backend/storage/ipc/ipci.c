@@ -26,6 +26,7 @@
 #include "access/twophase.h"
 #include "access/distributedlog.h"
 #include "cdb/cdblocaldistribxact.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "commands/async.h"
 #include "executor/nodeShareInputScan.h"
@@ -230,6 +231,9 @@ CreateSharedMemoryAndSemaphores(int port)
 		/* size of expand version */
 		size = add_size(size, GpExpandVersionShmemSize());
 
+		/* size of the cluster-topology generation watermark */
+		size = add_size(size, GpTopologyShmemSize());
+
 		/* size of token and endpoint shared memory */
 		size = add_size(size, EndpointShmemSize());
 
@@ -391,6 +395,8 @@ CreateSharedMemoryAndSemaphores(int port)
 		InstrShmemInit();
 
 	GpExpandVersionShmemInit();
+
+	GpTopologyShmemInit();
 
 #ifdef EXEC_BACKEND
 

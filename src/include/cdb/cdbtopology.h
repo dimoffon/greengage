@@ -175,6 +175,29 @@ extern const GpTopologyRoutine *GpTopoActiveProvider(void);
 extern void GpTopologyProviderStartup(void);
 
 /*
+ * The topology generation watermark.
+ *
+ * A high-water mark of the store generation this postmaster has seen, for a
+ * provider whose store carries one.  Zero means "unknown, go and read the
+ * store" -- never "generation zero" -- which is what makes it correct after a
+ * crash-and-restart, where reset_shared() re-zeroes shared memory while the
+ * postmaster's own provider state survives.
+ *
+ * It is NOT the compare-and-set authority.  A provider that compared against
+ * this instead of against the store would be blind to every write made by a
+ * process that does not share this shared memory -- a frontend builder,
+ * single-user mode -- which is the case the CAS exists for.  What it earns is
+ * a monotonic check that the store has not gone backwards within one
+ * postmaster lifetime, and a cheap number for diagnostics.
+ *
+ * The topology itself never goes in shared memory.
+ */
+extern Size GpTopologyShmemSize(void);
+extern void GpTopologyShmemInit(void);
+extern uint64 GpTopoGenerationSeen(void);
+extern void GpTopoGenerationObserve(uint64 generation);
+
+/*
  * Read the whole topology.  Callers pass the context they want the result in:
  * getCdbComponentInfo() wants CdbComponentsContext, the SRF wants its per-call
  * context, and FTS calls this in a loop, so making the context implicit is how

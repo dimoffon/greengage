@@ -20,9 +20,82 @@
 #include "catalog/gp_segment_configuration.h"
 #include "cdb/cdbtopology.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
+#include "storage/shmem.h"
 #include "utils/memutils.h"
 
 int			gp_topology_source = GP_TOPOLOGY_SOURCE_CATALOG;
+
+/*
+ * The generation watermark.  See cdbtopology.h for what it is and, more
+ * importantly, what it is not.
+ */
+typedef struct GpTopologyShmemStruct
+{
+	pg_atomic_uint64 generation_seen;
+} GpTopologyShmemStruct;
+
+static GpTopologyShmemStruct *GpTopologyShmem = NULL;
+
+/*
+ * Sizing runs long before the proc array exists, so this must stay a
+ * compile-time constant.  In particular it must never be derived from the
+ * topology: that would read the store during shared-memory sizing, turn an
+ * unreadable store into a sizing failure, and have to return the same answer
+ * in the postmaster and in every EXEC_BACKEND child, which a store that can
+ * change between the two does not.
+ */
+Size
+GpTopologyShmemSize(void)
+{
+	return MAXALIGN(sizeof(GpTopologyShmemStruct));
+}
+
+void
+GpTopologyShmemInit(void)
+{
+	bool		found;
+
+	GpTopologyShmem = (GpTopologyShmemStruct *)
+		ShmemInitStruct("Cluster Topology", GpTopologyShmemSize(), &found);
+
+	if (!found)
+		pg_atomic_init_u64(&GpTopologyShmem->generation_seen, 0);
+}
+
+uint64
+GpTopoGenerationSeen(void)
+{
+	if (GpTopologyShmem == NULL)
+		return 0;
+
+	return pg_atomic_read_u64(&GpTopologyShmem->generation_seen);
+}
+
+/*
+ * Record that the store is at `generation`.
+ *
+ * Monotonic: a store that goes backwards within one postmaster lifetime -- an
+ * operator dropping an old copy onto a running cluster -- leaves the watermark
+ * ahead of it, which is the signal.  Callers write this under whatever lock
+ * their provider uses for the store; readers need none.
+ */
+void
+GpTopoGenerationObserve(uint64 generation)
+{
+	uint64		seen;
+
+	if (GpTopologyShmem == NULL)
+		return;
+
+	seen = pg_atomic_read_u64(&GpTopologyShmem->generation_seen);
+	while (generation > seen)
+	{
+		if (pg_atomic_compare_exchange_u64(&GpTopologyShmem->generation_seen,
+										   &seen, generation))
+			break;
+	}
+}
 
 extern const GpTopologyRoutine gp_topology_catalog_routine;
 
