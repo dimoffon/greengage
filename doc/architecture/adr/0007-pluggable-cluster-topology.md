@@ -265,9 +265,37 @@ the view must be created before both.
 error-message text, and those messages are about the topology, not about which relation
 happens to hold it.
 
-**Not done: `pg_upgrade`.** Renaming a shared catalog and adding a view is a catalog
-version bump, which this branch takes, but no upgrade path from a pre-provider cluster
-has been written or tested.
+**`pg_upgrade` across the rename.** The machinery is unaffected, which is worth stating
+because it is not obvious: `pg_upgrade` transfers relations by enumerating `pg_class` with
+`nspname NOT IN ('pg_catalog', …)` and `oid >= FirstNormalObjectId` (`info.c`), so the
+renamed catalog is never enumerated, never matched by name between the clusters, and never
+transferred. The new cluster gets its catalogs from its own `initdb`, and its topology from
+whatever created it. A `file`-mode cluster upgrades too: `pg_upgrade` starts both clusters
+with `gp_role=utility` (`server.c`), which does not hit the file provider's
+generation-0-in-dispatch refusal, and `is_greengage_dispatcher_mode()` reads a command-line
+flag rather than the catalog.
+
+What does change is what *user* objects can do with the name. Measured against a real
+cluster rather than reasoned about:
+
+| a dependent view that… | on the new view |
+|---|---|
+| selects columns, or `SELECT *` | works — identical column names, order and types |
+| selects a system column (`ctid`, `xmin`, …) | **fails to restore**: "column … does not exist" |
+| carries `FOR UPDATE` / `FOR SHARE` | restores *and* runs; the rowmark over a pulled-up function scan is a no-op |
+
+So `check_views_depending_on_topology_catalog()` in `check_gp.c` fails the upgrade on the
+middle row only, listing the offending views in a report file. `pg_depend` identifies them
+exactly — `find_expr_references_walker()` stores a Var's attnum in `refobjsubid`, and system
+columns have negative attnums — so no definition text is parsed. The check is gated on the
+old cluster still having the relation as a table, so it costs nothing once it is the view.
+
+The bottom row is deliberately **not** a check: it restores and runs, so failing the upgrade
+for it would block working clusters. It is a real semantics change though — a view that asked
+to lock rows silently stops locking — and this table is where it is recorded.
+
+Not covered by any check: references from inside function bodies. Nothing records them, so
+nothing can find them before they run.
 
 **`NUM_INDIVIDUAL_LWLOCKS` shifted** when `GpTopologyLock` (id 65) was added, so a tree
 built across that commit needs `make clean`.

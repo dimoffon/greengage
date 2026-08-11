@@ -39,6 +39,7 @@ static void check_for_missing_support_function_for_partitions(void);
 static void check_for_incompatible_guc_settings(void);
 static void check_views_with_removed_columns(void);
 static void check_views_with_removed_relations(void);
+static void check_views_depending_on_topology_catalog(void);
 
 /*
  *	check_greengage
@@ -64,6 +65,7 @@ check_greengage(void)
 	check_views_with_removed_types();
 	check_views_with_removed_columns();
 	check_views_with_removed_relations();
+	check_views_depending_on_topology_catalog();
 	check_for_disallowed_pg_operator();
 	check_views_with_changed_function_signatures();
 	check_execute_on_master_functions();
@@ -1749,6 +1751,140 @@ check_views_with_removed_relations()
 		   "| These views must be updated to use relations supported in the\n"
 		   "| target version or removed before upgrade can continue. A list\n"
 		   "| of the problem views is in the file:\n\t%s\n\n", output_path);
+	}
+	else
+		check_ok();
+}
+
+
+/*
+ *	check_views_depending_on_topology_catalog
+ *
+ *	gp_segment_configuration used to be a table.  It is now a view over
+ *	gp_get_segment_configuration(), and the table behind it is
+ *	gp_segment_configuration_internal.  The columns are identical -- same names,
+ *	same order, same types -- so a view that reads it upgrades and keeps working.
+ *	Most do, and failing those would be gratuitous.
+ *
+ *	What a view cannot offer is a system column.  A dependent view selecting
+ *	ctid, xmin, xmax, cmin or cmax fails to restore into the new cluster with
+ *	"column ... does not exist", so the upgrade has to stop before it starts.
+ *
+ *	pg_depend identifies these exactly, with no need to read the definition text:
+ *	find_expr_references_walker() records a Var's attnum in refobjsubid, and
+ *	system columns have negative attnums.
+ *
+ *	Deliberately NOT reported, having been checked rather than assumed:
+ *
+ *	  * FOR UPDATE / FOR SHARE on the relation.  A view carrying a rowmark over
+ *	    what is now a pulled-up function scan restores AND runs; the lock simply
+ *	    becomes a no-op.  That is a silent semantics change worth knowing about,
+ *	    but it is not an upgrade failure, and failing the upgrade for it would
+ *	    block clusters that work.
+ *	  * references from inside function bodies.  Nothing records them, so no
+ *	    check can find them here.  They fail when the function runs.
+ *
+ *	The check is a no-op unless the old cluster still has the relation as a
+ *	table, so upgrading a cluster that already has the view costs nothing.
+ */
+static void
+check_views_depending_on_topology_catalog(void)
+{
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+	bool		found = false;
+	int			dbnum;
+
+	prep_status("Checking for views using gp_segment_configuration's system columns");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir, "views_depending_on_topology_catalog.txt");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_objname;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn;
+
+		conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/*
+		 * Looked up by name rather than cast to regclass, so a cluster without
+		 * the relation yields no rows instead of an error, and restricted to
+		 * relkind 'r' so this is a no-op once the relation is already the view.
+		 */
+		res = executeQueryOrDie(conn,
+								"WITH topo AS ( "
+								"  SELECT c.oid "
+								"  FROM pg_catalog.pg_class c "
+								"  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+								"  WHERE c.relname = 'gp_segment_configuration' "
+								"    AND n.nspname = 'pg_catalog' "
+								"    AND c.relkind = 'r' "
+								") "
+								"SELECT DISTINCT "
+								"       quote_ident(vn.nspname) || '.' || quote_ident(v.relname) AS objname "
+								"FROM pg_catalog.pg_depend d "
+								"JOIN topo ON topo.oid = d.refobjid "
+								"JOIN pg_catalog.pg_rewrite r ON r.oid = d.objid "
+								"JOIN pg_catalog.pg_class v ON v.oid = r.ev_class "
+								"JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace "
+								"WHERE d.classid = 'pg_rewrite'::regclass "
+								"  AND d.refclassid = 'pg_class'::regclass "
+								"  AND d.refobjsubid < 0 "
+								"  AND v.relkind IN ('v', 'm') "
+								"  AND v.oid >= %u "
+								"ORDER BY objname;",
+								FirstNormalObjectId);
+
+		ntups = PQntuples(res);
+		if (ntups == 0)
+		{
+			PQclear(res);
+			PQfinish(conn);
+			continue;
+		}
+		found = true;
+
+		if (!script)
+		{
+			script = fopen(output_path, "w");
+			if (!script)
+				pg_fatal("could not open file \"%s\": %s\n",
+						 output_path, strerror(errno));
+		}
+
+		fprintf(script, "Database: %s\n", active_db->db_name);
+
+		i_objname = PQfnumber(res, "objname");
+		for (rowno = 0; rowno < ntups; rowno++)
+			fprintf(script, "  %s\n", PQgetvalue(res, rowno, i_objname));
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (script)
+		fclose(script);
+
+	if (found)
+	{
+		pg_log(PG_REPORT, "fatal\n");
+		gp_fatal_log(
+		   "| gp_segment_configuration is a view on the target version, over\n"
+		   "| the cluster's active topology store.  The table behind it is\n"
+		   "| gp_segment_configuration_internal, with the same columns.\n"
+		   "|\n"
+		   "| Reading gp_segment_configuration works unchanged.  The views\n"
+		   "| listed below select one of its SYSTEM columns (ctid, xmin, xmax,\n"
+		   "| cmin, cmax), which a view does not have, so they will not restore.\n"
+		   "| Drop them, or point them at gp_segment_configuration_internal if\n"
+		   "| they really mean the physical table.\n"
+		   "|\n"
+		   "| A list of the problem views is in the file:\n\t%s\n\n", output_path);
 	}
 	else
 		check_ok();
