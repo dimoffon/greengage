@@ -1,7 +1,6 @@
 # ADR-0007: Cluster Topology Behind a Pluggable Store
 
-- **Status:** Accepted — implemented on branch `7.x-dr` through phase P7. P8 (inverting the
-  dense fixture) is planned and not yet done; the section that describes it says so.
+- **Status:** Accepted — implemented on branch `7.x-dr`. All phases P0–P8 are done.
 - **Date:** 2026-08-11
 - **Relates to:** [ADR-0006](0006-dr-read-replica.md) — this record is the reason several
   of ADR-0006's mechanisms are expected to be deleted rather than maintained.
@@ -331,7 +330,40 @@ that returns nothing looks exactly like a topology with nothing in it.
 | P5 | The view, the catalog rename, `gp_update_segment_mode_status()` | Done |
 | P6 | DR switches to `file`; the frozen seed deleted | Done |
 | P7 | Delete the redo filter | Done |
-| P8 | Invert the dense fixture | Not started |
+| P8 | Invert the dense fixture to V-13′; docs | Done |
+
+### D11 — the fixture that used to prove the guard now proves its absence (P8)
+
+`docker-compose.dense.yml` becomes `docker-compose.maint.yml`, and its question inverts.
+
+It used to ask whether a replica's frozen-seeded topology survived production's `VACUUM`
+truncating the catalog it lived in — the answer, once, was no, and finding that out is what
+[the superseded V-20 appendices](../greengage-dr-test-scenarios.md) record. The topology does
+not live there any more, so the fixture now asks the opposite: **can production run ordinary
+maintenance on its topology catalog while a replica is attached?** Under the old design it
+could not — `VACUUM FULL`, `CLUSTER`, `REINDEX` and `TRUNCATE` rewrite a mapped shared
+catalog's relfilenode, and `DRRejectForbiddenRemap()` took every DR node down on that record.
+
+Production runs all four, each followed by its own restore point so the replica advances
+across them one at a time and a failure attributes to one operation. Per advance the replica
+must show: the same postmaster PID, seg0 hostname still `dr`, an unchanged node count, **a
+distributed read that still dispatches**, no `FATAL`, and the old guard's log line **zero**
+times.
+
+Three details keep the fixture from passing vacuously:
+
+- **The densify step stays.** Without dead tuples to reclaim, `VACUUM` would not truncate and
+  the first operation would be a no-op that still looked green.
+- **Production publishes each post-op relfilenode**, and the replica asserts it moved *and*
+  that the replica followed it. `REINDEX` rewrites the index rather than the heap, so that
+  operation checks the index's relfilenode — checking the heap's there would assert nothing.
+- **The distributed read is the point.** The fixture this replaces only ever read in utility
+  mode, because it expected the catalog might be destroyed. A distributed read proves the
+  topology is *usable*, not merely present.
+
+The run ends by promoting the maintained replica and asserting `gp_configuration_history`
+holds exactly the fresh `DR promoted at …` row — the tidy-up D10 describes, on a cluster that
+has just replayed four rewrites of the catalog that row lives in.
 
 ### D10 — the redo filter is deleted, and T6 is what says it was safe (P7)
 

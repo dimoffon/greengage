@@ -480,12 +480,27 @@ def _check_topology(rows):
     dispatch to production's segments, which is the single thing the DR contract
     must never allow, so a mismatch fails the build.
 
-    The coordinator is the node checked because the coordinator is what dispatches.
-    Every node got its own copy of the same file; a segment disagreeing with it
-    cannot be diagnosed from here anyway, and shows up as a failed gang.
+    Every node is checked for the provider, because gp_topology_source is exempt
+    from the QD/QE GUC-sync check: a segment left on 'catalog' would read the
+    catalog production's WAL keeps overwriting, and nothing else would report it.
+    The topology contents are compared on the coordinator only -- that is the node
+    that dispatches, and a segment disagreeing shows up as a failed gang.
 
     Returns 0 on a match, 1 otherwise.
     """
+    wrong = []
+    for r in rows:
+        src = _topology_source(r["port"])
+        if src != "file":
+            wrong.append("content %d: %s" % (r["content"], src or "unreachable"))
+    if wrong:
+        print("  topology check: FAILED -- not every node runs the file provider")
+        for w in wrong:
+            print("    %s" % w)
+        print("    a replica reading the catalog reads production's topology, which")
+        print("    arrives in the WAL it is replaying.")
+        return 1
+
     port = next(r["port"] for r in rows if r["content"] == -1)
     want = ",".join("%d:%d:%d:%s" % (r["dbid"], r["content"], r["port"], r["hostname"])
                     for r in sorted(rows, key=lambda r: r["content"]))
@@ -501,14 +516,13 @@ def _check_topology(rows):
     if out != want:
         print("  topology check: FAILED -- the coordinator does not describe this DR cluster")
         print("    expected (from the topology file): %s" % want)
-        print("    serving  (from %s):                %s"
-              % (_topology_source(port) or "the active store", out or "<none>"))
+        print("    serving:                           %s" % (out or "<none>"))
         print("    this replica would dispatch to the wrong cluster.")
         return 1
 
-    print("  topology check: coordinator serves %d DR-local entr%s from %s"
-          % (len(rows), "y" if len(rows) == 1 else "ies",
-             _topology_source(port) or "the active store"))
+    print("  topology check: all %d node(s) on the file provider; coordinator serves "
+          "%d DR-local entr%s"
+          % (len(rows), len(rows), "y" if len(rows) == 1 else "ies"))
     return 0
 
 

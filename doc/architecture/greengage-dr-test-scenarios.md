@@ -119,6 +119,13 @@ that tries to allocate a `gxid`.
 The question behind this group: *what does routine production housekeeping do to a DR
 replica?*
 
+**This group changed shape in P6/P7.** It used to be dominated by one answer: production must
+not touch the topology catalogs, because the replica's own topology lived in them and a
+rewrite halted it. The replica's topology now lives in `$PGDATA/gp_topology`, outside the WAL
+entirely, so those catalogs are ordinary relations again — production maintains them freely and
+the replica replays the result without reading it. V-13′ is the scenario that demonstrates it;
+V-5 is deleted because the frozen seed that caused it no longer exists.
+
 ### D.1 — `VACUUM` / `ANALYZE` (routine)
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
@@ -127,7 +134,6 @@ replica?*
 | **V-2** | Same, but the vacuum's WAL is replayed during an **advance** with a long query running | The prune records carry `latestRemovedXid`; a DR query whose snapshot predates it is cancelled after `max_standby_archive_delay` (snapshot conflict). **This is the single most likely real-world DR query failure.** | NEW | DEGRADE |
 | **V-3** | `VACUUM` that **truncates** trailing empty pages of a user table | `XLOG_SMGR_TRUNCATE` replays; any DR query holding a buffer pin / lock on that relation is subject to a lock conflict. Data correct afterwards. | NEW | PASS |
 | **V-4** | `ANALYZE` a table on production | `pg_statistic` rows (regular WAL) and `pg_class.reltuples/relpages` (`XLOG_HEAP_INPLACE`) replay onto the DR. **DR plans then match production's** — this is why you do *not* need (and cannot run) ANALYZE on the DR. | NEW | PASS |
-| **V-5** | `ANALYZE` on production for a relation whose `pg_class` row shares a page touched by the **frozen seed** | Documented bounded artefact: the seed's `VACUUM FREEZE` of `gp_segment_configuration` does in-place relstats updates on a few `pg_class` pages (`pg_class` is *not* protected). Production changes co-located on those pages inside the `(backup-LSN, seed-LSN]` window are **LSN-shadowed** until the next production full-page image heals them. Impact is planner statistics only — never data correctness. **Verify convergence**: after a checkpoint + FPI on production, the DR's `reltuples` catches up. | NEW `PREDICTED` | DEGRADE |
 | **V-6** | Autovacuum running normally on production for hours | DR keeps up; no DR-side vacuum ever runs (no autovacuum launcher below `PM_RUN`), so **the DR never diverges by vacuuming independently** — its heap is a byte-level image of production's. | NEW | PASS |
 
 ### D.2 — `VACUUM FULL` / `CLUSTER` / `REINDEX` (rewriting)
@@ -137,15 +143,15 @@ replica?*
 | **V-10** | `VACUUM FULL` a large **user** table on production | Correct on the DR, but with three costs: (1) the whole table is re-WAL'd (`wal_level = replica` forces it) → **archive burst and an RPO spike proportional to table size**; (2) the replayed **AccessExclusiveLock** cancels DR queries touching that table after `max_standby_archive_delay` — [measured](#appendix--c-7--v-10-measured-vacuum-full-under-a-live-reader); (3) transient **2× disk** on the DR while both relfilenodes exist. Schedule inside a paused window and advance afterwards. | NEW | DEGRADE |
 | **V-11** | `CLUSTER` a user table | Identical to V-10 — same rewrite mechanics. | NEW | DEGRADE |
 | **V-12** | `REINDEX` a user index | Index rebuilt via WAL on the DR; lock conflict for queries using that index during the advance. | NEW | DEGRADE |
-| **V-13** | **`VACUUM FULL` / `CLUSTER` / `REINDEX` / `TRUNCATE` on a protected topology catalog** (`gp_segment_configuration`, its indexes/TOAST, `gp_configuration_history`, `gp_id`, `gp_version_at_initdb`) | The DR **halts, deliberately and loudly**: `relmap_redo()` → `DRRejectForbiddenRemap()` raises `FATAL` *before* any on-disk write, so the replay LSN never advances past the offending record. The node's postmaster goes down. **Recovery is to rebuild that DR node from a fresh base backup + re-seed.** There is no preemptive block on production — treat these catalogs as immutable while a DR is attached. This is the sharpest operational contract in the feature and must be demonstrated, not just documented. | NEW | HALT (by design) |
+| **V-13′** | **`VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE` on the topology catalog** (`gp_segment_configuration_internal`, its indexes and TOAST) while a DR is attached | **Nothing happens to the DR, and that is the point.** The replica's topology lives in `$PGDATA/gp_topology`, which production's WAL cannot reach, so these rewrites replay onto its copy of the catalog like any other record and it does not read that copy. Until P7 this was the sharpest operational contract in the feature — `relmap_redo()` → `DRRejectForbiddenRemap()` raised `FATAL` before any on-disk write and took the node down, recoverable only by rebuilding it. That guard is deleted. Reproduced by `src/test/dr/docker-compose.maint.yml`, which runs all four operations one restore point at a time and asserts, per advance: same postmaster PID, seg0 hostname still `dr`, node count unchanged, **a distributed read still dispatches**, no `FATAL`, and the old guard's log line **zero** times — plus that production's relfilenode really moved, so a run that did nothing cannot pass. | **REWRITTEN (P8)** | PASS |
 | **V-14** | `VACUUM FULL pg_class` (or any *non*-protected mapped catalog) on production | Replays normally — `DRRejectForbiddenRemap` only rejects remaps of the protected set. | NEW | PASS |
 
-### D.3 — Known gap to confirm
+### D.3 — Confirmed by the maintenance fixture
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **V-20** | Production `VACUUM` **truncates trailing pages of a protected topology catalog**. Reproduced by `src/test/dr/docker-compose.dense.yml` | **Was a real defect; now fixed and verified end to end** ([results](#appendix--v-20-reproduced-and-fixed-end-to-end)): unguarded build → DR left with 0 topology rows; guarded build → 3 rows intact, guard log line on the real record. `XLOG_SMGR_TRUNCATE` is emitted with `XLogRegisterData` only, **no registered buffers** (`storage.c:315-326`), so it has zero block references, and `DRRedoShouldFilter()` deliberately applies any such record (unit-tested as `test_dr_mode_no_blocks_applies`) — correctly, since that is also a commit record's shape. The truncate branch of `smgr_redo` had no protected-relfilenode guard, and the seed never rewrites the relation (`DELETE` → `INSERT`s → `VACUUM FREEZE`, `ggseed_dr_topology:107-110`), so production's record named **the same `RelFileNode`** holding the DR's frozen topology. Confirmed reproducible: against a dense page the seed's rows land on a trailing block a later production truncation would discard (see [V-21 results](#appendix--v-21-measured-on-the-fixture)). **Fixed** by `DRRedoShouldFilterRelFileNode()` (`dr_redo_filter.c:207-217`), called from `smgr_redo` (`storage.c:698-715`), which **skips** the truncation and logs at `LOG`. Skip rather than `FATAL`: an ignored truncation has no lasting consequence, whereas halting would take every DR node down on a routine production autovacuum. Expected behaviour now: the DR keeps its own pages, replay continues, one `LOG` line per skipped truncation. | NEW | PASS (regression) |
-| **V-21** | Assert the DR's topology seed took, and where its rows physically landed | Now **wired into `ggdr create-replica` as step 7** (`_check_seeded_topology()`): it reads `gp_segment_configuration` back from the coordinator and requires it to match the topology file on `dbid`/`content`/`port`/`hostname` — a silent seed failure **fails the build**. It also reports the heap size and the block holding the live rows; above block 0 means this node's topology depends on the truncation guard. Verified in both fixtures: the default one reports `1 page(s), live rows on block 0` and stays quiet; the dense one reports `12 page(s), live rows on block 11` and emits the note. First measured manually — see [results](#appendix--v-21-measured-on-the-fixture). | **RUN + automated** | PASS |
+| **V-20′** | Production `VACUUM` **truncates trailing pages of the topology catalog** | Inverted by P7. The replica applies the truncation now, because its own topology is not in that relation. The `smgr_redo` guard that used to skip it (`DRRedoShouldFilterRelFileNode()`) is deleted along with the rest of the filter, and `docker-compose.maint.yml` asserts its log line appears **zero** times — a build that still skips the truncation fails the fixture. The original defect and its fix are kept under *Superseded* below: they are the record of a real bug, and deleting them would destroy the evidence. | **INVERTED (P8)** | PASS |
+| **V-21′** | Assert the replica describes **itself**, and is serving that from the file store | `ggdr create-replica` step 7 (`_check_topology()`) reads `gp_segment_configuration` back from the running coordinator — the view over whichever provider is active — and requires it to match the topology file on `dbid`/`content`/`port`/`hostname`; it also requires **every** node to report `gp_topology_source = file`, because that GUC is exempt from the QD/QE sync check and a segment left on `catalog` would read production's replayed rows with nothing else reporting it. The heap-page half of the old check is gone: `ctid` and `pg_relation_size` are heap concepts and mean nothing for a view. | **REWRITTEN (P8)** | PASS |
 
 ---
 
@@ -178,7 +184,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | **HA-1** | **Production segment fails over to its mirror** (FTS promotes; that content's timeline goes 1 → 2) while the DR is attached | **Failure, confirmed by code reading** (chain traced end to end — see [HA-1 analysis](#appendix--ha-1-verified-against-the-code) below). The DR node for that content replays every TLI-1 segment the *old* primary managed to archive, then requests the next TLI-1 segment — which either was never archived (the old primary died mid-segment) or exists only as `….partial`. `restore_command` misses, and because the timeline goal is `CONTROLFILE` the node **never rescans for `00000002.history`** and never switches to TLI 2 — even though the TLI-2 segments are sitting in the same archive directory it is already reading. It retries the same missing filename every `wal_retrieve_retry_interval` **forever**. The failed restore logs at **DEBUG2** — invisible at default `log_min_messages` — so the node is **indistinguishable from a healthy DR whose production is simply idle**. **Verify at runtime, then decide:** `recovery_target_timeline = 'latest'` (HA-2), or document mirror failover as "rebuild that DR node". | NEW | **GAP** |
 | **HA-1b** | **Detecting** the HA-1 stall from the shipped observability | **Second gap: you cannot.** `rpo_seconds` grows — but it grows identically when production is idle, because it is `now() - min(pg_last_xact_replay_timestamp())`. `replay_lsn` freezes — same ambiguity. **Neither `gg_stat_dr_replica` nor `gg_stat_dr_replica_summary` exposes a timeline id**, and `pg_last_wal_replay_lsn()` does not reveal one either; you have to reach `pg_control_checkpoint()` or the archive directory listing to see that production has forked onto TLI 2 while the DR is stuck on TLI 1. Consider adding a `timeline` column to `gg_stat_dr_replica` regardless of how HA-1 is resolved. | NEW | **GAP** |
 | **HA-2** | Same as HA-1 with `recovery_target_timeline = 'latest'` and the `.history` file archived | Should work, and the archive-only case is genuinely reachable: the WAL-source state machine advances to `XLOG_FROM_STREAM` **even with no `primary_conninfo`** ("Move to XLOG_FROM_STREAM state in either case… immediate failure if we didn't launch walreceiver", `xlog.c:13337`), which is where the rescan hook lives. So a slot-less archive-only DR does reach `rescanLatestTimeLine()`, reads `00000002.history` via `restore_command`, and follows the fork. Note `recovery_target_timeline` is **`PGC_POSTMASTER`** — flipping it costs a restart of each DR node, though a restart *after* a fork still recovers (startup runs `findNewestTimeLine()`, `xlog.c:5693`). **Also check the last pre-fork segment:** the old timeline's final partial segment is archived as `….partial`, which a plain `cp`-based `restore_command` will not find. Expect either clean continuation or a stall precisely at the fork LSN — determine which, and whether `restore_command` needs `.partial` handling. | NEW `PREDICTED` | to determine |
-| **HA-3** | The failover's `gp_segment_configuration` churn (role `p`↔`m` swap, mode/status updates, `gp_configuration_history` inserts) reaching the DR | **Filtered.** All those records reference only protected blocks, so the DR's topology stays DR-local through a production HA event. This half of the scenario should pass even when HA-1 fails — worth asserting separately so the two failure modes don't mask each other. | NEW | PASS |
+| **HA-3′** | The failover's topology churn (role `p`↔`m` swap, mode/status updates, `gp_configuration_history` inserts) reaching the DR | **Replayed, not filtered — and still harmless.** Those records land in the replica's `gp_segment_configuration_internal`, which nothing reads; the topology it serves comes from its own file. The scenario still passes, for the opposite reason it used to. `gp_configuration_history` in particular is now production's, which is why `ggdr promote` replaces it with a single promotion row. | **REWRITTEN (P8)** | PASS |
 | **HA-4** | `gprecoverseg` rebuilds the old primary as a mirror; later `gprecoverseg -r` rebalances back | The rebalance is a **second promotion** → another timeline increment for that content. Different contents legitimately sit on different timelines — harmless, because each content has its own independent WAL/LSN space. But it multiplies HA-1's exposure. | NEW | see HA-1/HA-2 |
 | **HA-5** | Production **coordinator** activated from its standby coordinator (`gpactivatestandby`) | Content `-1` forks its timeline — the HA-1/HA-2 analysis applies to the DR coordinator. The standby coordinator must also be archiving. | NEW `PREDICTED` | see HA-1 |
 | **HA-6** | `gpexpand` adds segments to production | The DR is **invalidated** — the content count no longer matches and the expansion redistributes data cluster-wide. Expect: rebuild the DR from scratch after the expansion completes. Demonstrate that it fails clearly rather than serving wrong results. | NEW | REFUSE / rebuild |
@@ -254,7 +260,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | **U-4** | `ggdr pause` — every node halts immediately; summary shows no consistent point | NEW | PASS |
 | **U-5** | `ggdr` against a **multi-host** DR | **Not supported in the PoC** — it reaches every node by local socket. Document the failure and the per-host workaround. | NEW (MANUAL) | DEGRADE |
 | **U-6** | `gg_walfilter` black-box suite (`src/test/dr/test_gg_walfilter.py`) against the installed binary | AUTO (gates the DR build) | PASS |
-| **U-7** | `gg_walfilter inspect --gp-dr-topology <segment>` on a real archived segment containing topology changes | Reports exactly the records the in-backend filter would skip — **both** rules: all-blocks-match (`DRRedoShouldFilter`) and the `XLOG_SMGR_TRUNCATE` payload target (`DRRedoShouldFilterRelFileNode`). Verified on the dense fixture's own archived WAL: the aligned tool flags `Storage` at the exact LSN the engine's guard logged, one more record than the pre-alignment binary. Covered by 7 cases in `test_gg_walfilter.py` (40/40), incl. `SMGR_CREATE` must *not* be filtered — the engine guards only the truncate branch. | AUTO | PASS |
+| **U-7′** | `gg_walfilter inspect --protect-mapped-oid <oid> --halt-on-remap <segment>` on a real archived segment | Reports exactly the records the caller's rules cover — **both** shapes: all-blocks-match, and the `XLOG_SMGR_TRUNCATE` payload target, which names its relation in the payload rather than in a block reference. The engine no longer has a counterpart to be aligned with (P7 deleted the redo filter), so the tool's rules stand on their own: whoever names a relation on the command line means it for truncations too. The `--gp-dr-topology` preset is gone; `--halt-on-remap` exposes the guard it used to enable implicitly. Covered by `test_gg_walfilter.py` (40/40), incl. `SMGR_CREATE` must *not* be filtered. | AUTO | PASS |
 | **U-8** | `gg_walfilter restore` used as the `restore_command` (opt-in out-of-engine filtering, ADR-0002 path) | Filtered segments install atomically; the DR reaches the same state as with the in-backend filter. Keeps the alternative path from bit-rotting. | NEW | PASS |
 
 ---
@@ -266,12 +272,13 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
    `….partial` question. This is the worst failure shape there is — no error, no log line at
    default verbosity, and no shipped view that can distinguish it from an idle production —
    and it decides whether the feature survives contact with a normal production HA event.
-2. **V-20** — the `XLOG_SMGR_TRUNCATE` hole in the topology filter. **Closed, fixed, and
-   verified end to end.** The dense fixture reproduces it (unguarded build: DR left with 0
-   topology rows after a routine production `VACUUM`) and confirms the guard
-   (`storage.c:698-715`) stops it. Unit tests 17/17, V-21 now runs automatically at the end of
-   every `create-replica`, and `gg_walfilter` has been aligned with the engine's second rule
-   (40/40). What remains is putting the dense fixture into CI.
+2. **V-13′** — production maintenance on the topology catalog. This was the sharpest
+   operational contract in the feature (`VACUUM FULL` on a topology catalog halted every DR
+   node) and it is now simply allowed: the replica's topology is not in that catalog.
+   `docker-compose.maint.yml` runs `VACUUM` → `VACUUM FULL` → `REINDEX` → `TRUNCATE`, one
+   restore point at a time, and asserts the replica does not notice. **The V-20 hole it
+   replaces no longer has a subject** — the guard that closed it is deleted with the rest of
+   the filter. What remains is putting this fixture into CI.
 3. **P-1 / P-2 / P-3** — re-enable the promotion block that is currently commented out in
    `dr-entrypoint.sh:378-436`. Promotion is the whole point of a DR replica and is presently
    not asserted by CI.
@@ -324,6 +331,21 @@ What remains genuinely unverified is only the *runtime* shape: exactly which seg
 stalls on (it depends on how much the dying primary had archived), and whether the promoted
 mirror's `….partial` segment leaves a data gap even once HA-2's `'latest'` is in place.
 That is what the HA-1/HA-2 test run has to establish.
+
+---
+
+## Superseded — the topology redo filter, and the bug it had
+
+The three appendices below are the record of a real defect (V-20), its diagnosis and its
+fix. **The code they describe no longer exists**: P6 moved the cluster topology out of the
+replicated catalog and into `$PGDATA/gp_topology`, and P7 deleted the apply-time redo filter,
+the `relmapper.c` remap guard and the `smgr_redo` truncate guard along with it. A replica now
+replays production's topology catalog in full and simply does not read it.
+
+They are kept, not deleted, for two reasons. They are evidence — a bug that a passing test
+masked, found by reasoning about the record shape rather than the test result — and the
+measurements in them are what the current design has to beat, not repeat. Read them as
+history; for what the code does today see V-13′, V-20′ and V-21′ above, and ADR-0007.
 
 ---
 
@@ -523,6 +545,9 @@ it is the right one.
 **Still outstanding**
 
 - The dense fixture is **not wired into CI**; it is run on demand against two images.
+
+*(End of the superseded material. The dense fixture referred to above became
+`docker-compose.maint.yml` in P8, and now asserts the opposite outcome: see V-13′.)*
 
 ---
 

@@ -1,0 +1,68 @@
+# Greengage 7 DR -- V-13' : production maintenance on the topology catalog.
+#
+# The inverse of the fixture this replaces.  That one (V-20) asked whether a DR
+# replica's frozen-seeded topology survived production's VACUUM truncating the
+# shared catalog it lived in.  The replica's topology no longer lives there: it
+# is in $PGDATA/gp_topology, which production's WAL cannot reach.  So the
+# question becomes the opposite one -- production runs the maintenance that used
+# to be forbidden, and the replica must simply not care.
+#
+# Four operations, each with its own restore point so the DR advances across them
+# one at a time and a failure attributes to one operation:
+#
+#   VACUUM  ->  VACUUM FULL  ->  REINDEX  ->  TRUNCATE + re-insert
+#
+# The last three rewrite the catalog's relfilenode and emit a shared relmap
+# update -- the exact record the old design halted the replica on (FATAL, "re-seed
+# this node").  Production publishes each post-op page count AND the new
+# relfilenode, so the DR side asserts the remap really happened rather than
+# quietly testing nothing.
+#
+# Requires the file topology provider, which is what ggdr create-replica arms.
+#
+#   docker-compose -p maint -f src/test/dr/docker-compose.maint.yml up -d
+#   docker-compose -p maint -f src/test/dr/docker-compose.maint.yml logs -f dr
+#   docker-compose -p maint -f src/test/dr/docker-compose.maint.yml down -v
+#
+# Build the base image first with the default fixture:
+#   docker-compose -f src/test/dr/docker-compose.yml build
+version: "3.8"
+
+x-gpdb: &gpdb
+  image: ${DR_IMAGE:-greengage-dr-test:latest}
+  privileged: true
+  init: true
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile: 65535
+  volumes:
+    - wal_archive:/archive
+    - ./scripts:/dr/scripts:ro
+
+services:
+  primary:
+    <<: *gpdb
+    hostname: primary
+    environment:
+      # Filler rows inserted+deleted in one transaction to fill the catalog's
+      # pages.  5000 narrow rows is ~11 pages at Greengage's 32 KB block size.
+      # Still needed: without them VACUUM has nothing to reclaim and would not
+      # truncate, so the first of the four operations would be a no-op and the
+      # run would prove nothing about it.
+      FILLER_ROWS: "5000"
+      # Every record carries a full-page image, so the replica compares its own
+      # page against production's after redo.  On this fixture that covers the
+      # relmap updates and the rewritten catalog itself.
+      WAL_CONSISTENCY_CHECKING: "all"
+    command: ["/dr/scripts/maint-primary-entrypoint.sh"]
+
+  dr:
+    <<: *gpdb
+    hostname: dr
+    depends_on:
+      - primary
+    command: ["/dr/scripts/maint-dr-entrypoint.sh"]
+
+volumes:
+  wal_archive:
