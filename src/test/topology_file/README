@@ -1,0 +1,41 @@
+src/test/topology_file
+======================
+
+End-to-end coverage for the file-backed cluster topology store
+($PGDATA/gp_topology, gp_topology_source = file).
+
+    ./run.sh /path/to/greengage/bin
+
+Deliberately free of gpMgmt.  Under file mode nothing writes
+gp_segment_configuration, so gpstart, gpstop, gpstate and gpconfig cannot read
+the topology and refuse to run -- see GpArray.initFromCatalog().  Everything
+here is driven with initdb, gg_topology, psql and a postmaster started
+directly, which is how a file-mode cluster is managed until
+gp_segment_configuration becomes a view over the active store.
+
+What it covers, in three groups:
+
+  format    initdb's bootstrap store; write and dump round trip; the
+            generation advancing; the refusals that belong to the format
+            (whitespace in a data directory, a standby coordinator) and to the
+            tool (bootstrap over a live store, writing while a server is up);
+            a flipped byte and a missing checksum line.
+
+  startup   what the postmaster does with each state of the store: catalog
+            mode ignoring it, a valid store serving, a bootstrap store
+            starting in utility mode but refusing a dispatcher, and a corrupt,
+            deleted or standby-bearing store refusing to start.
+
+  writes    the backend writing the store: gp_add_segment_primary and
+            gp_remove_segment going to the file and NOT to the catalog, the
+            generation advancing per write, and the documented divergence that
+            a rolled-back transaction still leaves the store advanced, because
+            the file provider renames at persist() time rather than at commit.
+
+Not covered here, and why:
+
+  - a real distributed query, an FTS failover rewriting the store, and a
+    kill -9 mid-write.  All need a multi-node cluster, which needs
+    gpinitsystem, which needs gpMgmt.  They arrive with the view.
+  - the recovery warning for a dispatcher serving reads under a store that is
+    not WAL-logged.  Only the disaster-recovery fixture reaches that path.
