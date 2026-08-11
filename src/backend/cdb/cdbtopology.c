@@ -778,12 +778,13 @@ GpTopoValidate(GpTopoWriteSet *ws, GpTopoValidateLevel level)
  * would make the view ERROR at exactly the moment an operator is using it to
  * find out why the topology is broken.
  *
- * Not marked EXECUTE ON COORDINATOR, and that is a decision rather than an
- * omission.  With the default execution location plus VOLATILE the planner
- * gives this the same Entry locus a scan of the shared catalog gets today, so
- * every plan that joins topology against segment data keeps its shape -- but
- * without the hard error EXECUTE ON COORDINATOR raises when a subquery
- * correlates into it, which one in-tree query already does.
+ * Marked EXECUTE ON COORDINATOR in pg_proc, and it has to be.  The default
+ * execution location gives the same Entry locus a shared-catalog scan gets in
+ * the simple shapes, but not inside a correlated subplan: there the planner
+ * runs the scan on the segments, where no topology is readable, and the query
+ * answers NULL rather than raising the error the catalog raises for exactly
+ * that shape.  See rpt.sql:650, and the note above oid 7201 in pg_proc.dat for
+ * what the marking costs.
  */
 Datum
 gp_get_segment_configuration(PG_FUNCTION_ARGS)
@@ -830,8 +831,16 @@ gp_get_segment_configuration(PG_FUNCTION_ARGS)
 	 * rows today into one that silently returns some.  Utility mode is
 	 * deliberately unaffected -- an operator can still ask a node what its own
 	 * store says.
+	 *
+	 * The entry db is excluded, and that exclusion is load-bearing rather than
+	 * defensive.  It runs as a QE (Gp_role is GP_ROLE_EXECUTE) but it is the
+	 * coordinator, and it is where an Entry-locus slice of a dispatched plan
+	 * executes.  Suppressing here would empty the topology out of every plan
+	 * that reads it from inside a slice -- an INSERT ... SELECT off
+	 * gp_segment_configuration silently inserts nothing -- while a bare SELECT,
+	 * which the QD backend runs itself, keeps working.
 	 */
-	if (Gp_role == GP_ROLE_EXECUTE)
+	if (Gp_role == GP_ROLE_EXECUTE && !IS_QUERY_DISPATCHER())
 		return (Datum) 0;
 
 	/*
