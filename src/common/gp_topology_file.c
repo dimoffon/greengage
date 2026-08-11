@@ -78,6 +78,8 @@ gp_topology_file_error_str(GpTopologyFileError err)
 			return "invalid entry";
 		case GP_TOPOFILE_UNSERIALIZABLE:
 			return "entry cannot be represented in the file format";
+		case GP_TOPOFILE_TOO_LARGE:
+			return "file is larger than a cluster topology can be";
 		case GP_TOPOFILE_SYSID_CONFLICT:
 			return "file belongs to a different database system";
 	}
@@ -141,6 +143,26 @@ topo_next_line(char **p, const char *end)
 }
 
 /*
+ * The last newline in the first `len` bytes, or NULL.
+ *
+ * Hand-rolled rather than memrchr(): that is a GNU extension, absent on macOS
+ * and the BSDs, and this file is linked into libpgcommon for every frontend as
+ * well as the backend.
+ */
+static const char *
+topo_last_newline(const char *buf, size_t len)
+{
+	while (len > 0)
+	{
+		if (buf[len - 1] == '\n')
+			return buf + len - 1;
+		len--;
+	}
+
+	return NULL;
+}
+
+/*
  * Split a header line as "<keyword> <value>", returning the value or NULL.
  */
 static char *
@@ -159,7 +181,11 @@ topo_parse_uint64(const char *s, uint64 *out)
 {
 	char	   *endptr;
 
-	if (s == NULL || *s == '\0')
+	/*
+	 * Digits only.  strtoul() negates a signed input in the return type and
+	 * sets no errno for it, so "-1" would otherwise parse as 2^64-1.
+	 */
+	if (s == NULL || *s < '0' || *s > '9')
 		return false;
 
 	errno = 0;
@@ -356,17 +382,22 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		if (len == 0 || buf[len - 1] != '\n')
 			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
 
-		last_nl = memrchr(buf, '\n', len - 1);
+		last_nl = topo_last_newline(buf, len - 1);
 		if (last_nl == NULL)
 			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
 
 		covered = (size_t) (last_nl + 1 - buf);
 		crc_line = copy + covered;
 
-		if (strncmp(buf + covered, "crc32c ", 7) != 0)
+		/*
+		 * Scan out of `copy`, which is NUL-terminated.  sscanf is a string API
+		 * and would run off the end of the caller's buffer, which carries only
+		 * a length -- as the header contract says it may.
+		 */
+		if (strncmp(crc_line, "crc32c ", 7) != 0)
 			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
 
-		if (sscanf(buf + covered + 7, "%8x", &recorded_crc) != 1)
+		if (sscanf(crc_line + 7, "%8x", &recorded_crc) != 1)
 			PARSE_FAIL(GP_TOPOFILE_BAD_CRC);
 
 		INIT_CRC32C(crc);
@@ -620,7 +651,7 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 	if (st.st_size < 0 || (uint64) st.st_size > GP_TOPOLOGY_MAX_SIZE)
 	{
 		close(fd);
-		return GP_TOPOFILE_IO;
+		return GP_TOPOFILE_TOO_LARGE;
 	}
 	bufsize = (size_t) st.st_size + 1024;
 

@@ -265,16 +265,21 @@ file_read_all(MemoryContext cxt, int *nentries, uint64 *gen)
 	 */
 	(void) file_read(&topo, ERROR);
 
+	/*
+	 * Never NULL: read_all's contract.  An empty topology is a real answer, and
+	 * getCdbComponentInfo() is what decides whether it is an acceptable one.
+	 * Allocated before the switch back, so it lands in the caller's context
+	 * like the rest of the result.
+	 */
+	if (topo.entries == NULL)
+		topo.entries = palloc0(sizeof(GpSegConfigEntry));
+
 	MemoryContextSwitchTo(oldcxt);
 
 	*nentries = topo.nentries;
 	*gen = topo.generation;
 
-	/*
-	 * Never NULL: read_all's contract.  An empty topology is a real answer, and
-	 * getCdbComponentInfo() is what decides whether it is an acceptable one.
-	 */
-	return topo.entries ? topo.entries : palloc0(sizeof(GpSegConfigEntry));
+	return topo.entries;
 }
 
 static void
@@ -341,6 +346,32 @@ file_persist(GpTopoWriteSet *ws)
 				 errmsg("cluster topology changed underneath this transaction"),
 				 errdetail("Topology is at generation " UINT64_FORMAT
 						   ", expected " UINT64_FORMAT ".", found, ws->gen)));
+	}
+
+	/*
+	 * And the watermark, which catches the case the CAS cannot: a store that
+	 * went backwards.  An operator dropping an older copy of the file onto a
+	 * running cluster leaves it consistent with itself and with any write set
+	 * opened after the swap, so nothing else notices -- but this postmaster has
+	 * already seen a higher generation, and writing on top of the older file
+	 * would destroy whatever the difference was.
+	 */
+	if (cur.generation < GpTopoGenerationSeen())
+	{
+		uint64		found = cur.generation;
+		uint64		seen = GpTopoGenerationSeen();
+
+		gp_topology_file_free(&cur);
+		LWLockRelease(GpTopologyLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster topology store has gone backwards"),
+				 errdetail("\"%s\" is at generation " UINT64_FORMAT
+						   ", but generation " UINT64_FORMAT
+						   " has already been served by this postmaster.",
+						   path, found, seen),
+				 errhint("An older copy of the file may have been restored over "
+						 "the current one.")));
 	}
 
 	gp_topology_file_free(&cur);

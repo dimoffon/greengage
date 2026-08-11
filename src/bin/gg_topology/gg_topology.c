@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "common/controldata_utils.h"
+#include "common/file_perm.h"
 #include "common/gp_topology_file.h"
 #include "common/logging.h"
 #include "getopt_long.h"
@@ -71,7 +72,10 @@ die_topofile(const char *what, const char *datadir, GpTopologyFileError err,
 }
 
 /*
- * Refuse to write while a postmaster owns the data directory.
+ * Everything that must be true before this tool writes anything.
+ *
+ * Adopt the data directory's permissions, so a group-readable cluster stays
+ * group-readable, and refuse to write while a postmaster owns the directory.
  *
  * This, and not the generation compare-and-set, is what keeps two writers
  * apart.  A CAS only excludes writers that can see each other's compare and
@@ -81,10 +85,17 @@ die_topofile(const char *what, const char *datadir, GpTopologyFileError err,
  * a precondition rather than a restriction, and --force does not lift it.
  */
 static void
-require_no_postmaster(const char *datadir)
+prepare_for_write(const char *datadir)
 {
 	char		path[MAXPGPATH];
 	struct stat st;
+
+	if (!GetDataDirectoryCreatePerm(datadir))
+	{
+		pg_log_error("could not read permissions of directory \"%s\": %m",
+					 datadir);
+		exit(1);
+	}
 
 	snprintf(path, sizeof(path), "%s/postmaster.pid", datadir);
 	if (stat(path, &st) == 0)
@@ -145,14 +156,6 @@ do_dump(const char *datadir)
 	gp_topology_file_free(&topo);
 }
 
-/*
- * Read entry lines from a stream.
- *
- * Deliberately the same ten-field grammar the store itself uses, so that
- * "psql -A -t -F' ' -c 'SELECT ... FROM gp_segment_configuration' | gg_topology
- * write -" is the migration path, and a data directory containing a space is
- * an eleven-token error here rather than a truncation later.
- */
 /*
  * Split one line into exactly GPSEGCONFIGNUMATTR single-space-separated
  * tokens, in place.
@@ -218,6 +221,14 @@ parse_field_char(const char *s, const char *what, int lineno)
 	return s[0];
 }
 
+/*
+ * Read entry lines from a stream.
+ *
+ * Deliberately the same ten-field grammar the store itself prints, so that
+ * piping a SELECT from gp_segment_configuration into this is the migration
+ * path, and a data directory containing a space is an eleven-token error here
+ * rather than a truncation later.
+ */
 static void
 read_entries(FILE *fp, GpTopologyFile *topo)
 {
@@ -354,7 +365,7 @@ do_write(const char *datadir, const char *infile, bool force,
 	FILE	   *fp;
 	int			errentry = 0;
 
-	require_no_postmaster(datadir);
+	prepare_for_write(datadir);
 
 	memset(&topo, 0, sizeof(topo));
 	topo.version = GP_TOPOLOGY_FORMAT_VERSION;
@@ -373,6 +384,15 @@ do_write(const char *datadir, const char *infile, bool force,
 	if (fp != stdin)
 		fclose(fp);
 
+	if (topo.nentries == 0)
+	{
+		pg_log_error("no entries read");
+		pg_log_info("Use \"gg_topology bootstrap\" to write an empty store; "
+					"writing zero entries here would leave a store that claims "
+					"to have been migrated into and describes no cluster.");
+		exit(1);
+	}
+
 	validate_topology(&topo);
 
 	/*
@@ -382,7 +402,24 @@ do_write(const char *datadir, const char *infile, bool force,
 	 * already recorded, whether or not we can otherwise read the store.
 	 */
 	if (generation != NULL)
-		topo.generation = strtoul(generation, NULL, 10);
+	{
+		char	   *endptr;
+
+		if (*generation < '0' || *generation > '9')
+		{
+			pg_log_error("invalid generation \"%s\"", generation);
+			exit(1);
+		}
+		errno = 0;
+		topo.generation = strtoul(generation, &endptr, 10);
+		if (errno != 0 || *endptr != '\0' || topo.generation == 0)
+		{
+			pg_log_error("invalid generation \"%s\"", generation);
+			pg_log_info("The generation must be a positive integer; 0 is "
+						"reserved for a store that has never been written.");
+			exit(1);
+		}
+	}
 	else if (gp_topology_read_file(datadir, &cur, NULL) == GP_TOPOFILE_OK)
 	{
 		topo.generation = cur.generation + 1;
@@ -429,7 +466,7 @@ do_bootstrap(const char *datadir, bool force)
 	GpTopologyFile cur;
 	GpTopologyFileError err;
 
-	require_no_postmaster(datadir);
+	prepare_for_write(datadir);
 
 	/*
 	 * This is the repair for a store that was deleted, so it must not quietly

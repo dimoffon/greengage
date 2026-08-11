@@ -125,6 +125,7 @@ typedef enum GpTopologyFileError
 	GP_TOPOFILE_BAD_COUNT,		/* nentries disagrees with the lines present */
 	GP_TOPOFILE_BAD_HEADER,		/* generation 0 with entries */
 	GP_TOPOFILE_BAD_SYNTAX,		/* an entry line; *errline names it */
+	GP_TOPOFILE_TOO_LARGE,		/* past the ceiling a topology can reach */
 	GP_TOPOFILE_UNSERIALIZABLE,	/* write: a field that could not be read back */
 	GP_TOPOFILE_SYSID_CONFLICT	/* write: would overwrite another cluster's */
 } GpTopologyFileError;
