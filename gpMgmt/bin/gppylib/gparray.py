@@ -953,25 +953,6 @@ class GpArray:
             if not version.isVersionCurrentRelease():
                 raise Exception("Cannot connect to GPDB version %s from installed version %s"%(version.getVersionRelease(), MAIN_VERSION[0]))
 
-            # Every gpMgmt utility reads the cluster topology through this one
-            # function, and it reads it from gp_segment_configuration. A cluster
-            # storing its topology somewhere else still has that catalog, but
-            # nothing writes it, so the rows are stale or absent -- and acting on
-            # them means starting the wrong segments or reporting a cluster that
-            # does not exist. Refuse once, here, rather than let every utility
-            # discover it differently.
-            #
-            # Delete this when gp_segment_configuration becomes a view over the
-            # active topology store; that is what makes these utilities work
-            # under any provider.
-            topology_source = dbconn.querySingleton(conn, "SHOW gp_topology_source")
-            if topology_source != 'catalog':
-                raise Exception(
-                    "this cluster stores its topology in the '%s' provider, not in "
-                    "gp_segment_configuration, and the gpMgmt utilities can only "
-                    "read the catalog. Use gp_topology_source=catalog, or manage "
-                    "this cluster with pg_ctl." % topology_source)
-
             config_rows = dbconn.query(conn, '''
             SELECT dbid, content, role, preferred_role, mode, status,
             hostname, address, port, datadir
