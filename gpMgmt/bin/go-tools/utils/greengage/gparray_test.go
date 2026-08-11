@@ -193,41 +193,13 @@ func Test_RegisterPrimaries(t *testing.T) {
 		}
 	})
 
-	t.Run("Succeeded in adding Primaries in pg_catalog table but failed to update contentid", func(t *testing.T) {
-		mockConnection, sqlMock, err := testutils.CreateAndConnectMockDB(1)
-		if err != nil {
-			t.Fatalf("unexpected error: %#v", err)
-		}
-
-		err = errors.New("Unexpected error")
-		sqlMock.ExpectExec(regexp.QuoteMeta("SELECT pg_catalog.gp_add_segment_primary( 'temp.com', 'temp.com', 7000, '/temp/seg/0');")).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-		sqlMock.ExpectExec("SET allow_system_table_mods=true; UPDATE gp_segment_configuration SET content = content - 1 where content > 0;").
-			WillReturnError(err)
-
-		var segs = []*idl.Segment{
-			{
-				Port:          7000,
-				HostName:      "temp.com",
-				HostAddress:   "temp.com",
-				DataDirectory: "/temp/seg/0",
-			},
-		}
-		err = greengage.RegisterPrimaries(segs, mockConnection)
-		if err == nil {
-			t.Fatalf("Unexpected error")
-		}
-	})
-
-	t.Run("Updated primaries in pg_catalog and updated contentid successfully", func(t *testing.T) {
+	t.Run("Registers primaries successfully", func(t *testing.T) {
 		mockConnection, sqlMock, err := testutils.CreateAndConnectMockDB(1)
 		if err != nil {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 
 		sqlMock.ExpectExec(regexp.QuoteMeta("SELECT pg_catalog.gp_add_segment_primary( 'temp.com', 'temp.com', 7000, '/temp/seg/0');")).
-			WillReturnResult(sqlmock.NewResult(1, 1))
-		sqlMock.ExpectExec("SET allow_system_table_mods=true; UPDATE gp_segment_configuration SET content = content - 1 where content > 0;").
 			WillReturnResult(sqlmock.NewResult(1, 1))
 
 		var segs = []*idl.Segment{

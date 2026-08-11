@@ -253,7 +253,18 @@ gp_add_segment_primary(PG_FUNCTION_ARGS)
 
 	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
 
-	new.segindex = GpTopoMaxContent(ws) + 1;
+	/*
+	 * The content id is derived from what is already there, so a topology with
+	 * no coordinator in it would hand out content 0 to a segment of a cluster
+	 * that does not exist yet.  Nothing above this point notices: the checks
+	 * read GpIdentity, which comes from the postmaster's command line.
+	 */
+	if (GpTopoFindByContentRole(ws, COORDINATOR_CONTENT_ID,
+								GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+								true) == NULL)
+		elog(ERROR, "gp_add_segment_primary requires a coordinator entry in the cluster topology");
+
+	new.segindex = GpTopoNextContent(ws);
 	new.dbid = GpTopoAvailableDbid(ws);
 	new.role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 	new.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;

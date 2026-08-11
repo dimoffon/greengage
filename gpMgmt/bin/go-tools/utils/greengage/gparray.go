@@ -115,14 +115,6 @@ func RegisterPrimaries(segs []*idl.Segment, conn *dbconn.DBConn) error {
 		}
 	}
 
-	// FIXME: gp_add_segment_primary() starts the content ID from 1,
-	// so manually update the correct values for now.
-	updateContentIdQuery := "SET allow_system_table_mods=true; UPDATE gp_segment_configuration SET content = content - 1 where content > 0;"
-	_, err := conn.Exec(updateContentIdQuery)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 

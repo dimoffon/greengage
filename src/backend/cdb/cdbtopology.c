@@ -457,24 +457,27 @@ GpTopoAvailableDbid(GpTopoWriteSet *ws)
 }
 
 /*
- * Highest content id in use, or 0 if the topology is empty.
+ * The content id the next primary should take: one past the highest in use,
+ * and 0 on a topology that holds no segment yet.
  *
- * Zero, not -1, on a topology holding only the coordinator: the coordinator's
- * content is -1 and Max(0, -1) is 0, so the first primary added this way gets
- * content 1 rather than 0.  That is a long-standing off-by-one which callers
- * compensate for; it is preserved here rather than fixed, because fixing it is
- * a separate change with its own blast radius.
+ * The floor is the coordinator's own content, -1, which is what makes the
+ * coordinator-only case come out at 0.  The predecessor of this function
+ * floored at 0 instead, so Max(0, -1) was 0 and its caller's +1 handed the
+ * first primary content 1 -- and gp init carried a raw
+ * "UPDATE gp_segment_configuration SET content = content - 1" ever after to
+ * undo it.  Folding the +1 in here is deliberate: there is exactly one
+ * caller, and "highest content in use" was never the question it was asking.
  */
 int16
-GpTopoMaxContent(GpTopoWriteSet *ws)
+GpTopoNextContent(GpTopoWriteSet *ws)
 {
-	int16		content = 0;
+	int16		content = COORDINATOR_CONTENT_ID;
 	int			i;
 
 	for (i = 0; i < ws->nwork; i++)
 		content = Max(content, ws->work[i].segindex);
 
-	return content;
+	return content + 1;
 }
 
 void

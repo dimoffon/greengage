@@ -247,7 +247,7 @@ extern GpSegConfigEntry *GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 conte
 												 char role, bool preferredNotCurrent);
 extern int16 GpTopoMaxDbid(GpTopoWriteSet *ws);
 extern int16 GpTopoAvailableDbid(GpTopoWriteSet *ws);
-extern int16 GpTopoMaxContent(GpTopoWriteSet *ws);
+extern int16 GpTopoNextContent(GpTopoWriteSet *ws);
 extern void GpTopoInsert(GpTopoWriteSet *ws, const GpSegConfigEntry *entry);
 extern void GpTopoUpdate(GpTopoWriteSet *ws, GpSegConfigEntry *entry);
 extern int	GpTopoDelete(GpTopoWriteSet *ws, int16 dbid);
