@@ -141,25 +141,67 @@ cluster (a refusal added in P4 and deleted here).
 Four sub-decisions inside it are worth recording, because each was tested and each could
 plausibly have gone the other way.
 
-**D7a — No `proexeclocation`.** The plan for this phase specified
-`proexeclocation => 'c'` (EXECUTE ON COORDINATOR). It cannot be used: it raises a hard
-error when a subquery correlates into the function, and one in-tree query already does
-exactly that (`src/test/regress/sql/qp_correlated_query.sql:978`). Omitting it and
-marking the function `provolatile => 'v'` reaches the *same* Entry locus through
-`create_functionscan_path`. Verified on a real two-segment cluster: byte-identical plans,
-the correlated shape plans without error, identical rows and column types.
+**D7a — `proexeclocation => 'c'`, because the alternative is silently wrong answers.**
+
+This was decided twice. The first answer was to omit it: with the default execution
+location plus `provolatile => 'v'` the function scan gets the same Entry locus a
+shared-catalog scan gets, and the plans in the tree came out byte-identical. That
+evidence was real but incomplete — every shape tested was uncorrelated.
+
+Inside a **correlated** subplan the planner does not give it Entry locus. It runs the
+scan on the segments, where no topology is readable, so the subquery yields NULL. The
+shared catalog raises `Passing parameters across motion is not supported` for exactly
+that shape; `src/test/regress/sql/rpt.sql:650` is in the tree to assert it. Measured on a
+three-segment cluster, with the topology holding dbids 2, 3, 4 at contents 0, 1, 2:
+
+| | result |
+|---|---|
+| shared catalog | `ERROR: Passing parameters across motion is not supported (cdbmutate.c:2052)` |
+| function scan, no `proexeclocation` | three rows, all NULL — **wrong**, the answer is 2, 3, 4 |
+| function scan, `proexeclocation => 'c'` | `ERROR: cannot execute EXECUTE ON COORDINATOR function in a subquery with arguments from outer query (pathnode.c:2968)` |
+
+So the marking is required. An error the catalog also raised beats an answer that is
+quietly wrong.
+
+**What the marking costs, stated plainly.** `pathnode.c`'s check is cruder than
+`cdbmutate.c`'s: it refuses *any* EXECUTE ON COORDINATOR function in a subquery carrying
+outer parameters, whether or not a motion is actually involved. So one shape that works
+against the catalog now errors — a correlated reference whose outer relation is *itself*
+coordinator-only, and therefore needs no motion:
+
+```sql
+SELECT (SELECT (SELECT dbid FROM gp_segment_configuration
+                 WHERE dbid = numsegments LIMIT 1)) FROM gp_distribution_policy;
+```
+
+`qp_correlated_query.sql` holds the only instance in the tree; its expected output records
+the error. This is a real, if narrow, regression against the catalog, and it is the price
+of not answering the `rpt.sql` shape wrongly.
+
+The earlier claim that `proexeclocation => 'c'` breaks `qp_correlated_query.sql:978` was
+simply wrong: that query errors identically either way, because the skip-level-correlation
+check fires first.
 
 **D7b — `prorows => 16` is load-bearing.** At the planner's default of 1000, the join
 order flips in every in-tree query that joins topology against segment data. 16 keeps the
 estimate in the range a real cluster occupies and the plans in the shape they had when
 this was a nearly-empty catalog.
 
-**D7c — The function returns no rows on a QE.** `Gp_role == GP_ROLE_EXECUTE` returns an
-empty tuplestore. Under the catalog provider the shared copy on a segment is empty
-anyway, so nothing changes; under a per-node store it is populated, and answering there
-would turn a query that silently returns nothing today into one that silently returns
-something. Utility mode is deliberately unaffected — an operator can still ask a single
-node what its own store says.
+**D7c — The function returns no rows on a segment, but the entry db is not a segment.**
+The guard is `Gp_role == GP_ROLE_EXECUTE && !IS_QUERY_DISPATCHER()`. Under the catalog
+provider the shared copy on a segment is empty anyway, so suppressing there changes
+nothing; under a per-node store it is populated, and answering would turn a query that
+silently returns nothing today into one that silently returns something. Utility mode is
+deliberately unaffected — an operator can still ask a single node what its own store says.
+
+The `IS_QUERY_DISPATCHER()` half is load-bearing and was found by test, not by reading.
+The entry db runs as a QE — `Gp_role` really is `GP_ROLE_EXECUTE` there — but it *is* the
+coordinator, and it is where an Entry-locus slice of a dispatched plan executes. Without
+the exclusion, a bare `SELECT` off `gp_segment_configuration` works (the QD backend runs
+it itself) while the same scan inside a slice returns nothing: `INSERT ... SELECT ... FROM
+gp_segment_configuration` silently inserts zero rows. That is the shape
+`src/test/regress/sql/query_finish_pending.sql:43` uses to size a table by segment count,
+and it went from 150000 rows to none.
 
 **D7d — The function is aliased back to the view's name.** The planner pulls a view this
 simple up, and the surviving range-table entry is what `EXPLAIN` prints and what
@@ -204,7 +246,17 @@ only SQL callers. But it cannot be dropped bare: `gp_stat_replication` and
 
 **`EXPLAIN` output changes for every plan that touches the topology.** `Seq Scan on
 gp_segment_configuration` becomes `Function Scan on gp_get_segment_configuration
-gp_segment_configuration`. Six in-tree expected files carry the change.
+gp_segment_configuration`. Six in-tree expected files carry that change, and two more
+(`rpt`, `qp_correlated_query`, with their `_optimizer` variants) record the error text
+that replaced a plan under D7a.
+
+**Anything reading the topology's *storage* rather than its *content* must say
+`_internal`.** The name now resolves to a relation with no relfilenode, no size and no
+rows of its own, and most of those operations fail quietly:
+`pg_relation_size('gp_segment_configuration')` answers 0, `VACUUM` warns and skips, and
+`gp_toolkit.gp_db_files_current` — which reports `pg_class.relname` for each file found on
+a segment — simply never lists it. Each of those was a live bug in this change until a
+test or a grep found it.
 
 **Position in `system_views.sql` is load-bearing.** `gp_stat_replication` and
 `pg_max_external_files` select from the view and `initdb` runs the file top to bottom, so
@@ -239,9 +291,11 @@ shared catalog is not a thing PostgreSQL 12 has.
 catalog's idiom, and it would have made every other provider read-modify-write the whole
 set behind the caller's back on each call, with no way to batch.
 
-**`proexeclocation => 'c'` on the SRF.** Rejected under D7a on evidence: it breaks a
-correlated-subquery shape that is already in the tree, and it buys nothing the default
-execution location plus `VOLATILE` does not already give.
+**Omitting `proexeclocation` on the SRF.** Adopted first, then reversed under D7a: the
+plans really are identical in the uncorrelated shapes, but a correlated subplan runs the
+scan on the segments and answers NULL instead of erroring. The reversal cost a catalog
+version and one narrower in-tree behaviour, and it is not negotiable — a topology read
+that returns nothing looks exactly like a topology with nothing in it.
 
 ---
 
@@ -258,7 +312,9 @@ execution location plus `VOLATILE` does not already give.
 3. **The view is created before `gp_stat_replication` in `system_views.sql`.**
 4. **`prorows` on `gp_get_segment_configuration` stays small.** Changing it changes plan
    shapes across the regression suite.
-5. **`generation` only ever increases,** and a writer that did not observe the current
+5. **Anything that suppresses a topology read on a QE excludes the entry db.** See D7c:
+   `Gp_role == GP_ROLE_EXECUTE` alone is not "is a segment", and the difference is silent.
+6. **`generation` only ever increases,** and a writer that did not observe the current
    generation must not rename over the store.
 
 ---
