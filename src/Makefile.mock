@@ -12,7 +12,11 @@ $(MOCK_DIR)/%_mock.c: $(abs_top_srcdir)/src/%.c
 # For some reason, mock.o files are intermediate files sometimes.
 # Mark them as secondary in order not to be deleted automatically.
 .SECONDARY:
-$(MOCK_DIR)/%_mock.o: CFLAGS+= -Wno-unused-function -Wno-unused-variable
+# mocker.py output is not held to -Werror.  It cannot be: a mock of a function
+# declared pg_attribute_noreturn() -- ExceptionalCondition() is the one every
+# suite links -- returns to its caller by construction, which GCC reports as
+# "'noreturn' function does return", and there is no narrower flag for it.
+$(MOCK_DIR)/%_mock.o: CFLAGS+= -Wno-unused-function -Wno-unused-variable -Wno-error
 $(MOCK_DIR)/%_mock.o: $(MOCK_DIR)/%_mock.c
 
 all: $(patsubst %,%.t,$(TARGETS))
