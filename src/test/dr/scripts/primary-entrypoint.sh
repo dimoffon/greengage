@@ -1,6 +1,6 @@
 #!/bin/bash
 # primary-entrypoint.sh -- bring up the production cluster, enable per-segment
-# WAL archiving to the shared volume, base-backup each instance for DR seeding,
+# WAL archiving to the shared volume, base-backup each instance for the DR to restore,
 # publish the DR-local topology, then keep running (and archiving).
 set -euo pipefail
 source /dr/scripts/lib.sh
@@ -47,7 +47,7 @@ psql -p "$PORT_BASE" -d postgres -q -c \
 	"drop table if exists dr_marker; create table dr_marker(id int, note text) distributed by (id);
 	 insert into dr_marker values (1,'created on production');" || true
 
-log "primary: base-backup each instance to $BASEBACKUP (for DR seeding)"
+log "primary: base-backup each instance to $BASEBACKUP (the DR restores these)"
 while IFS=$'\t' read -r datadir port dbid content; do
 	rm -rf "$BASEBACKUP/seg$content"
 	pg_basebackup -h localhost -p "$port" -X stream --no-sync \
@@ -57,7 +57,7 @@ done < <(list_instances)
 
 # Publish the DR-local topology: the primary's own layout (same dbids/ports/
 # datadirs -- the dr container mirrors the demo layout under the same $DEMO path)
-# but with hostname + address forced to 'dr', so the seeded DR catalog is
+# but with hostname + address forced to 'dr', so the DR's own topology store is
 # genuinely DR-local.  Generated from the live config, so it scales with the
 # segment count (coordinator + N segments) automatically.
 psql -p "$PORT_BASE" -d postgres -Atc \

@@ -45,18 +45,23 @@ a while; subsequent runs reuse the image.
    topology catalog.
    It also creates a user table (`dr_wal_applied`) *after* the base backup, so
    that table exists only in the WAL (not the backup).
-2. The **dr** container restores the coordinator's base backup; **frozen-seeds
-   DR-local topology** (`ggseed_dr_topology`, `DR_SEED=1`) while preserving the
-   recovery-start state (save/restore `backup_label` + `pg_control`, the M4 fix);
-   arms `hot_standby` + `standby.signal` +
+2. The **dr** container restores each instance's base backup; **writes the
+   DR-local topology** into every node's own `$PGDATA/gp_topology` (via
+   `gg_topology`, overwriting the copy of production's store that came in the base
+   backup); arms `gp_topology_source = file` + `hot_standby` + `standby.signal` +
    `restore_command`; and starts the coordinator as a **live, continuous
    hot-standby**. `hot_standby = on` *is* what puts a node in DR mode — there is
    no separate GUC or marker file. It then waits to replay past the recorded
    change LSN.
 3. **Assertions** (against the live coordinator, utility mode):
    - **M1** — `gp_segment_configuration` does **not** show production's change.
-   - **M4 seed** — seg0 has the DR-local hostname `dr` (genuine topology
-     independence, not merely "ignored production's change").
+   - **M4 topology store** — seg0 has the DR-local hostname `dr` (genuine
+     topology independence, not merely "ignored production's change"), and
+     `gp_topology_source` really is `file`.
+   - **P6 independence** — `gp_segment_configuration_internal` still holds
+     *production's* rows, because nothing seeds it any more, while the replica
+     serves `dr`. This is the assertion that shows the replica does not read the
+     catalog for its topology at all.
    - **M1 selective** — the post-backup user table `dr_wal_applied` **is** present
      (the filter applies non-topology changes; it only skips protected catalogs).
    - **M2 reads** — a coordinator-only catalog `SELECT` works in recovery.
@@ -138,12 +143,11 @@ of reporting a pass, so an inconclusive run can never look green.
   SR-1/SR-2, not yet implemented.
 - Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
-- **`DR_SEED`** (dr service env) defaults to `1`: the DR coordinator is
-  frozen-seeded with DR-local topology (`ggseed_dr_topology`) *and* its
-  recovery-start state (`backup_label` + `pg_control`) is preserved around the
-  seed (the M4 fix), so it resumes production's WAL from the archive instead of
-  forking the timeline. Set `DR_SEED=0` to skip the seed (the DR then mirrors
-  production's topology and the test verifies the filter via production's change
-  alone). One documented caveat remains in M4: `VACUUM FREEZE` bumps
-  `pg_class.relfrozenxid` for `gp_segment_configuration`, LSN-shadowing that one
-  page in the sub-second `(backup-LSN, seed-LSN]` window.
+- **The frozen seed is gone** (P6). The replica's topology lives in
+  `$PGDATA/gp_topology`, which production's WAL cannot reach, so there is nothing
+  to freeze and nothing to protect. With it went `ggseed_dr_topology`, the
+  `DR_SEED` knob, the `backup_label`/`pg_control` save-restore, the backup-tail
+  WAL re-fetch, the permanent-timeline-fork hazard those existed to contain, and
+  the `VACUUM FREEZE` `pg_class` LSN-shadowing caveat. The apply-time redo filter
+  is still compiled in and still fires; it now protects a catalog nobody reads,
+  and P7 deletes it.

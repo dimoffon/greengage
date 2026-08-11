@@ -1,8 +1,8 @@
 # ADR-0007: Cluster Topology Behind a Pluggable Store
 
-- **Status:** Accepted — implemented on branch `7.x-dr` through phase P5. P6–P8 (switching
-  DR to the file provider, deleting the redo filter, inverting the dense fixture) are
-  planned and not yet done; the sections that describe them say so.
+- **Status:** Accepted — implemented on branch `7.x-dr` through phase P6. P7 (deleting the
+  redo filter) and P8 (inverting the dense fixture) are planned and not yet done; the
+  sections that describe them say so.
 - **Date:** 2026-08-11
 - **Relates to:** [ADR-0006](0006-dr-read-replica.md) — this record is the reason several
   of ADR-0006's mechanisms are expected to be deleted rather than maintained.
@@ -34,6 +34,7 @@ replicated catalog:
 | Permanent-timeline-fork hazard | consequence of the seed | A frozen write in single-user mode is not replayable |
 
 None of that is about disaster recovery. It is about a catalog being in the wrong place.
+(The last two rows are gone as of P6 — see D9.)
 
 The same fact costs non-DR work too: topology cannot be inspected or repaired without a
 running coordinator, and any tool that wants to change it must be able to write a shared
@@ -329,6 +330,65 @@ that returns nothing looks exactly like a topology with nothing in it.
 | P3 | Remaining readers re-pointed | Done |
 | P4 | The `file` provider, `gg_topology`, `initdb` | Done |
 | P5 | The view, the catalog rename, `gp_update_segment_mode_status()` | Done |
-| P6 | DR switches to `file` | Not started |
-| P7 | Delete the redo filter and the seed | Not started |
+| P6 | DR switches to `file`; the frozen seed deleted | Done |
+| P7 | Delete the redo filter | Not started |
 | P8 | Invert the dense fixture | Not started |
+
+### D9 — the DR replica keeps its topology in a file, and the seed is gone (P6)
+
+`ggdr create-replica` now writes the DR-local topology into **every** node's
+`$PGDATA/gp_topology` and arms `gp_topology_source = file`, instead of running
+`ggseed_dr_topology` — a single-user `postgres --single` that DELETEd, re-INSERTed and
+`VACUUM FREEZE`d the shared catalog on the coordinator.
+
+Deleting the seed deleted its scaffolding with it: the `backup_label`/`pg_control`
+save-restore that existed because `postgres --single` consumes the first and advances the
+second, the backup-tail WAL re-fetch that existed because the seed appended its own WAL to
+the backup-end segment, and `--scratch-seed`, a reserved workaround for the seed's
+`VACUUM FREEZE` footprint on `pg_class`. **With them goes the permanent-timeline-fork
+hazard** the seed's own header documented at length: on an archive miss, recovery replayed
+the seed's forked WAL and the fork was unrecoverable.
+
+Three details are worth keeping:
+
+- **The base backup carries production's `gp_topology`.** P4 deliberately did not exclude
+  it from `basebackup.c`, on the grounds that a node needing a different topology has it
+  overwritten after the copy. A DR node is that node, and `create-replica` is that
+  overwrite. It happens before the first start, which matters: production never writes the
+  file, so it arrives at initdb's generation 0, and a coordinator armed with `file` refuses
+  to start in dispatch mode on a generation-0 store. Fail-closed in the right direction.
+- **Every node gets the file, not just the coordinator.** Only the coordinator's copy is
+  read while the replica serves. But `gp_topology_source` is exempt from the QD/QE GUC-sync
+  check (`unsync_guc_name.h`), so a half-armed cluster comes up silently, and a segment
+  left holding production's entries would start describing the wrong cluster the moment the
+  replica is promoted and FTS begins writing. Writing and arming happen in one loop.
+- **Nothing writes the store while the replica is in recovery.** `file_persist()` is
+  reachable only from segadmin and FTS, and FTS is a `BgWorkerStart_DtxRecovering` worker,
+  which `bgworker_should_start_now()` grants only in `PM_RUN` — never `PM_HOT_STANDBY`. The
+  store starts being maintained at promotion, which is exactly right.
+
+**What P6 proves, and what it does not.** The plan expected one green fixture pass with the
+filter still compiled in to show the DR no longer depends on it. It does not: a pass with
+the filter present and firing shows compatibility, not independence, and there is no switch
+to turn the filter off — `IsDRReplicaMode()` is `EnableHotStandby && RecoveryInProgress()`,
+and `hot_standby` also gates the read path, the frozen-snapshot serve, and promote-in-place.
+So the proof is made positively instead. Nothing seeds the catalog any more, so
+`gp_segment_configuration_internal` on the replica holds the rows that came in the base
+backup — production's — while the replica serves its own. Measured on the fixture:
+
+```
+what the promoted cluster serves    the catalog it no longer reads
+1|-1|p|n|u|dr                       1|-1|primary
+2| 0|p|n|u|dr                       2| 0|primary
+3| 1|p|n|u|dr                       3| 1|primary
+```
+
+That assertion does not change in P7; only the catalog's contents do, once production's
+updates stop being filtered out.
+
+**A cost that is now unpaid-for.** `DRRejectForbiddenRemap()` is `FATAL`: a replayed shared
+relmap update for a protected OID halts the DR postmaster. Under `file` that means a
+production `VACUUM FULL`, `CLUSTER` or `REINDEX` of the topology catalog still takes the
+replica down permanently — over a relation the replica no longer reads. The risk is
+unchanged from before P6, but from here it buys nothing. P7 removes it, and P8's V-13′ is
+precisely that scenario.

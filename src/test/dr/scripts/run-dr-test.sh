@@ -1,9 +1,9 @@
 #!/bin/bash
-# run-dr-test.sh -- the M1 assertion: production changed gp_segment_configuration
-# (seg0 port +1000) AFTER the base backup; the DR replica must NOT pick that up,
-# because the apply-time redo filter (hot standby in recovery) skips production's WAL for
-# the protected topology catalogs.  If frozen-seeded, the DR coordinator's
-# hostname should also be the DR-local 'dr'.
+# run-dr-test.sh -- the M1 assertion: production changed its topology (seg0 port
+# +1000) AFTER the base backup; the DR replica must NOT pick that up, because the
+# replica's topology lives in its own $PGDATA/gp_topology and production's WAL
+# carries only the catalog.  The DR coordinator's hostname should likewise be the
+# DR-local 'dr' that create-replica wrote.
 set -uo pipefail
 source /dr/scripts/lib.sh
 source "$GPHOME/greengage_path.sh" 2>/dev/null || true
@@ -31,22 +31,20 @@ if [ -z "$dr_seg0_port" ]; then
 	log "dr-test: FAIL -- could not read DR gp_segment_configuration"
 	fail=1
 elif [ "$dr_seg0_port" = "$PRODUCTION_SEG0_PORT" ]; then
-	log "dr-test: FAIL -- DR applied production's seg0 port change; the redo filter did NOT work"
+	log "dr-test: FAIL -- DR serves production's seg0 port; its topology is not its own"
 	fail=1
 else
-	log "dr-test: PASS -- DR did NOT apply production's seg0 port change (redo filter works)"
+	log "dr-test: PASS -- DR did NOT pick up production's seg0 port change"
 fi
 
-if [ "${DR_SEED:-1}" = 1 ]; then
-	[ "$dr_coord_host" = dr ] \
-		&& log "dr-test: PASS -- DR coordinator hostname is DR-local ('dr'); frozen seed survived replay" \
-		|| log "dr-test: NOTE -- DR coordinator hostname is '${dr_coord_host:-<none>}', expected 'dr' (frozen seed not reflected)"
-fi
+[ "$dr_coord_host" = dr ] \
+	&& log "dr-test: PASS -- DR coordinator hostname is DR-local ('dr'), from its own topology store" \
+	|| log "dr-test: NOTE -- DR coordinator hostname is '${dr_coord_host:-<none>}', expected 'dr'"
 
 if [ "$fail" = 0 ]; then
-	log "================ DR FILTER TEST: PASS ================"
+	log "================ DR TOPOLOGY TEST: PASS ================"
 else
-	log "================ DR FILTER TEST: FAIL ================"
+	log "================ DR TOPOLOGY TEST: FAIL ================"
 fi
 log "dr-test: containers stay up for inspection (e.g. docker compose exec dr bash)"
 exec sleep infinity

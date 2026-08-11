@@ -6,7 +6,7 @@
 # segment (using the GP %c = content-id escape); the dr cluster restores from
 # it. Layout on the shared volume:
 #   /archive/wal/seg<content>/      per-instance WAL archive (content -1 = QD)
-#   /archive/basebackup/seg<content>/  per-instance base backup for DR seeding
+#   /archive/basebackup/seg<content>/  per-instance base backup the DR restores
 #   /archive/dr_topology.tsv        DR-local topology (written by primary)
 #   /archive/primary_ready          marker: primary is up and base-backed up
 
@@ -31,7 +31,7 @@ die() { echo "[$(date +%H:%M:%S)] [$(hostname)] ERROR: $*" >&2; exit 1; }
 ensure_gpadmin() {
 	if [ "$(id -un)" = root ]; then
 		setup_container
-		exec su - gpadmin -c "exec env GPHOME=$GPHOME DR_SEED=${DR_SEED:-1} bash $0"
+		exec su - gpadmin -c "exec env GPHOME=$GPHOME bash $0"
 	fi
 	# As gpadmin from here on.
 	source "$GPHOME/greengage_path.sh"

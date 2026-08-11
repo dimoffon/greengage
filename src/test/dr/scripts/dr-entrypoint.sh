@@ -1,8 +1,8 @@
 #!/bin/bash
 # dr-entrypoint.sh -- build the DR cluster with `ggdr create-replica`
-# (restore base backups + frozen-seed DR-local topology + arm DR mode + start every
-# node in continuous archive recovery), then run the milestone regression suite:
-# M1 (redo filter) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
+# (restore base backups + write the DR-local topology store + arm DR mode + start
+# every node in continuous archive recovery), then run the milestone regression suite:
+# M1 (topology store) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
 # M5 (observability), the ggdr switch/pause/stats utility test, and finally
 # the SQL recovery-control test (gg_dr_switch / gg_dr_promote -> online read-write).
 set -euo pipefail
@@ -55,20 +55,20 @@ log "dr: waiting for production to create + archive the restore point ..."
 for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2; done
 
 # --- M4: build the whole DR cluster in one shot via the ggdr utility.
-#     create-replica restores each instance's base backup, frozen-seeds the
-#     DR-local topology into the coordinator (hostname 'dr'), gates on the WAL
-#     archive being complete enough to reach consistency, arms DR mode
-#     (hot_standby + restore_command + standby.signal) on
+#     create-replica restores each instance's base backup, writes the DR-local
+#     topology (hostname 'dr') into every node's own $PGDATA/gp_topology, gates on
+#     the WAL archive being complete enough to reach consistency, arms DR mode
+#     (gp_topology_source=file + hot_standby + restore_command + standby.signal) on
 #     every node with the M3 pause target dr_rp1, and starts each in archive
 #     recovery.  This exercises the SAME code path an operator would run, instead
-#     of open-coding the restore/seed/arm/start inline. ---
+#     of open-coding the restore/write/arm/start inline. ---
 GG="python3 $SRC/gpMgmt/bin/ggdr"
 export PGPORT="$PORT_BASE" PGDATABASE=postgres
 
 # --- auxiliary-tooling gate: gg_walfilter black-box tests (against the
-#     installed binary; no cluster needed).  The in-backend redo filter is
-#     what protects the DR topology, but the shipped filtering tool must
-#     still pass its own suite before we bless the build. ---
+#     installed binary; no cluster needed).  The DR's topology is protected by
+#     living outside the WAL now, not by the filter, but the shipped filtering
+#     tool must still pass its own suite before we bless the build. ---
 log "dr: running the gg_walfilter tests (black-box, installed binary) ..."
 if GG_WALFILTER="$(command -v gg_walfilter)" \
 	python3 "$SRC/src/test/dr/test_gg_walfilter.py" >/tmp/walfilter-test.log 2>&1; then
@@ -127,20 +127,41 @@ refused() {  # $1=label  $2=sql -- assert the statement is refused on the DR rep
 }
 
 echo "================ M1 + M2 assertions on the LIVE DR coordinator (in recovery) ================"
-# M1 (redo filter): production changed seg0 hostname to $PRODUCTION_SEG0_HOSTNAME; DR must not show it.
+# M1: production changed seg0 hostname to $PRODUCTION_SEG0_HOSTNAME; the DR must not
+# show it.  Under the file provider this is no longer the redo filter's doing -- the
+# topology the DR serves lives in $PGDATA/gp_topology, which production's WAL cannot
+# reach at all.
 drhost=$(q "select hostname from gp_segment_configuration where content=0;")
 if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
-	ok_ "M1 redo filter: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
+	ok_ "M1 topology store: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
 else
-	no_ "M1 redo filter: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
+	no_ "M1 topology store: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
 fi
-# M4 (seed): create-replica frozen-seeds the DR-local topology, so the DR carries a
-# genuinely DR-LOCAL hostname ('dr') -- proving topology independence, not merely
+# M4: create-replica writes the DR-local topology into every node's own store, so the
+# DR carries a genuinely DR-LOCAL hostname ('dr') -- topology independence, not merely
 # "ignored production's change".
 if [ "$drhost" = "dr" ]; then
-	ok_ "M4 seed: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
+	ok_ "M4 topology store: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
 else
-	no_ "M4 seed: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
+	no_ "M4 topology store: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
+fi
+# M4': and it is the FILE that says so.
+drsrc=$(q "show gp_topology_source;")
+if [ "$drsrc" = "file" ]; then
+	ok_ "M4' the DR coordinator is running the file topology provider"
+else
+	no_ "M4' gp_topology_source='$drsrc' on the DR coordinator (expected 'file')"
+fi
+# P6 PROOF: the DR no longer depends on the shared catalog for its topology.  Nothing
+# seeds gp_segment_configuration_internal any more, so it still holds the rows that
+# came in the base backup -- PRODUCTION's.  The replica serves DR-local topology
+# anyway, which is exactly the independence the redo filter used to buy.  When the
+# filter goes (P7) this assertion does not change; only the values in the catalog do.
+cathost=$(q "select hostname from gp_segment_configuration_internal where content=0;")
+if [ -n "$cathost" ] && [ "$cathost" != "dr" ]; then
+	ok_ "P6 independence: the catalog still says '$cathost' (production's) while the replica serves 'dr'"
+else
+	no_ "P6 independence: gp_segment_configuration_internal seg0 hostname='$cathost' (expected production's, not 'dr')"
 fi
 # M1 (selective): a user table created on production AFTER the base backup must
 # appear on the DR via WAL replay -- the filter only skips protected catalogs,
