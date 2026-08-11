@@ -11180,6 +11180,20 @@
 { oid => 5051, descr => 'Remove a primary segment from the system catalog',
    proname => 'gp_remove_segment', proisstrict => 'f', provolatile => 'v', proparallel => 'r', prorettype => 'bool', proargtypes => 'int2', prosrc => 'gp_remove_segment' },
 
+# Deliberately NOT proexeclocation => 'c'.  With the default 'a' plus VOLATILE
+# the planner gives this the same Entry locus a shared-catalog scan gets today,
+# but without the hard error EXECUTE ON COORDINATOR raises for a correlated
+# reference -- which qp_correlated_query.sql already makes.  prorows is 16, not
+# the 1000 the planner substitutes for 0: at 1000 the join order flips in every
+# in-tree query that joins topology against segment data.
+{ oid => 7201, descr => 'the cluster topology, from the active topology provider',
+   proname => 'gp_get_segment_configuration', prorows => '16', proretset => 't',
+   provolatile => 'v', proparallel => 'u', prorettype => 'record', proargtypes => '',
+   proallargtypes => '{int2,int2,char,char,char,char,int4,text,text,text}',
+   proargmodes => '{o,o,o,o,o,o,o,o,o,o}',
+   proargnames => '{dbid,content,role,preferred_role,mode,status,port,hostname,address,datadir}',
+   prosrc => 'gp_get_segment_configuration' },
+
 { oid => 5035, descr => 'Request a FTS probe scan and wait for response',
    proname => 'gp_request_fts_probe_scan', prorows => '1000', proretset => 't',
    proisstrict => 'f', provolatile => 'v', prorettype => 'bool', proargtypes => '', prosrc => 'gp_request_fts_probe_scan', proexeclocation => 'c' },

@@ -16,12 +16,16 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/gp_segment_configuration.h"
 #include "cdb/cdbtopology.h"
+#include "cdb/cdbvars.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/shmem.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
 
 int			gp_topology_source = GP_TOPOLOGY_SOURCE_CATALOG;
@@ -754,4 +758,122 @@ GpTopoValidate(GpTopoWriteSet *ws, GpTopoValidateLevel level)
 					 errdetail("Contents must be dense from 0 to %d.",
 							   maxcontent)));
 	}
+}
+
+
+/* ----------------------------------------------------------------
+ *				the topology, as rows
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * gp_get_segment_configuration() -- the whole topology, whatever holds it.
+ *
+ * Backs the pg_catalog.gp_segment_configuration view, which is how everything
+ * outside the backend -- gpMgmt above all -- reads topology.
+ *
+ * Deliberately GpTopologyGetAll() and not cdbcomponent_getCdbComponents():
+ * that applies the read-time structural checks getCdbComponentInfo() needs for
+ * itself (one or two entry databases, dense contents, this node present), and
+ * would make the view ERROR at exactly the moment an operator is using it to
+ * find out why the topology is broken.
+ *
+ * Not marked EXECUTE ON COORDINATOR, and that is a decision rather than an
+ * omission.  With the default execution location plus VOLATILE the planner
+ * gives this the same Entry locus a scan of the shared catalog gets today, so
+ * every plan that joins topology against segment data keeps its shape -- but
+ * without the hard error EXECUTE ON COORDINATOR raises when a subquery
+ * correlates into it, which one in-tree query already does.
+ */
+Datum
+gp_get_segment_configuration(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	GpSegConfigEntry *entries;
+	int			nentries;
+	int			i;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* the OUT parameters in pg_proc are the only definition of the row type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	Assert(tupdesc->natts == Natts_gp_segment_configuration);
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	tupdesc = CreateTupleDescCopy(tupdesc);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * A segment reads nothing.  Under the catalog provider its shared copy is
+	 * empty anyway, so this changes nothing; under a per-node store it is
+	 * populated, and answering here would turn a query that silently returns no
+	 * rows today into one that silently returns some.  Utility mode is
+	 * deliberately unaffected -- an operator can still ask a node what its own
+	 * store says.
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE)
+		return (Datum) 0;
+
+	/*
+	 * Into the current context rather than the per-query one: the values are
+	 * copied into the tuplestore, and one read per scan should not accumulate
+	 * for the length of the statement.
+	 */
+	entries = GpTopologyGetAll(CurrentMemoryContext, &nentries);
+
+	for (i = 0; i < nentries; i++)
+	{
+		GpSegConfigEntry *e = &entries[i];
+		Datum		values[Natts_gp_segment_configuration];
+		bool		nulls[Natts_gp_segment_configuration];
+
+		MemSet(nulls, false, sizeof(nulls));
+
+		values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(e->dbid);
+		values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(e->segindex);
+		values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(e->role);
+		values[Anum_gp_segment_configuration_preferred_role - 1] = CharGetDatum(e->preferred_role);
+		values[Anum_gp_segment_configuration_mode - 1] = CharGetDatum(e->mode);
+		values[Anum_gp_segment_configuration_status - 1] = CharGetDatum(e->status);
+		values[Anum_gp_segment_configuration_port - 1] = Int32GetDatum(e->port);
+
+		if (e->hostname)
+			values[Anum_gp_segment_configuration_hostname - 1] = CStringGetTextDatum(e->hostname);
+		else
+			nulls[Anum_gp_segment_configuration_hostname - 1] = true;
+		if (e->address)
+			values[Anum_gp_segment_configuration_address - 1] = CStringGetTextDatum(e->address);
+		else
+			nulls[Anum_gp_segment_configuration_address - 1] = true;
+		if (e->datadir)
+			values[Anum_gp_segment_configuration_datadir - 1] = CStringGetTextDatum(e->datadir);
+		else
+			nulls[Anum_gp_segment_configuration_datadir - 1] = true;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	tuplestore_donestoring(tupstore);
+
+	return (Datum) 0;
 }
