@@ -169,27 +169,60 @@ gp_topo_release(GpTopoWriteSet *ws, GpTopoWriteOutcome outcome)
 }
 
 /*
- * Transaction abort reached us before the caller's PG_CATCH did -- a FATAL, a
- * cancel between GpTopoBeginWrite() and the PG_TRY, or a caller that forgot
- * the bracket.  Under the catalog provider there is nothing left to release
- * here, which is exactly why the outcome is distinguished: see
- * GpTopoWriteOutcome.
+ * Release every write set opened at or below `nestlevel`.
+ *
+ * This is how an ERROR between GpTopoBeginWrite() and GpTopoCommitWrite() is
+ * cleaned up, and it is deliberately the only way, so that call sites are not
+ * seven copies of the same PG_TRY.  Under the catalog provider there is
+ * nothing left to release by the time we get here, which is exactly why the
+ * outcome is distinguished: see GpTopoWriteOutcome.
  */
+static void
+gp_topo_release_from(int nestlevel)
+{
+	GpTopoWriteSet **link = &gp_topo_live_writesets;
+
+	while (*link != NULL)
+	{
+		GpTopoWriteSet *ws = *link;
+
+		if (ws->nestlevel < nestlevel)
+		{
+			link = &ws->next_live;
+			continue;
+		}
+
+		*link = ws->next_live;
+		ws->next_live = NULL;
+
+		gp_topo_release(ws, GP_TOPO_WRITE_ABORTED);
+	}
+}
+
 static void
 gp_topo_xact_callback(XactEvent event, void *arg)
 {
 	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
 		return;
 
-	while (gp_topo_live_writesets != NULL)
-	{
-		GpTopoWriteSet *ws = gp_topo_live_writesets;
+	gp_topo_release_from(0);
+}
 
-		gp_topo_live_writesets = ws->next_live;
-		ws->next_live = NULL;
+/*
+ * A subtransaction rolling back is not the same event, and missing it is not
+ * cosmetic: ws->cxt is a child of the aborting subtransaction's context, so a
+ * write set left in the registry by, say, a gp_add_segment() inside a
+ * PL/pgSQL EXCEPTION block would be a dangling pointer for the rest of the
+ * transaction, and the next abort would walk it.
+ */
+static void
+gp_topo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						 SubTransactionId parentSubid, void *arg)
+{
+	if (event != SUBXACT_EVENT_ABORT_SUB)
+		return;
 
-		gp_topo_release(ws, GP_TOPO_WRITE_ABORTED);
-	}
+	gp_topo_release_from(GetCurrentTransactionNestLevel());
 }
 
 static char *
@@ -249,12 +282,14 @@ GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level)
 	if (!gp_topo_xact_callback_registered)
 	{
 		RegisterXactCallback(gp_topo_xact_callback, NULL);
+		RegisterSubXactCallback(gp_topo_subxact_callback, NULL);
 		gp_topo_xact_callback_registered = true;
 	}
 
 	ws = (GpTopoWriteSet *) MemoryContextAllocZero(cxt, sizeof(GpTopoWriteSet));
 	ws->cxt = AllocSetContextCreate(cxt, "GpTopoWriteSet", ALLOCSET_SMALL_SIZES);
 	ws->level = level;
+	ws->nestlevel = GetCurrentTransactionNestLevel();
 
 	ws->next_live = gp_topo_live_writesets;
 	gp_topo_live_writesets = ws;

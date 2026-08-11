@@ -108,6 +108,7 @@ typedef struct GpTopoWriteSet
 	int			workmax;
 
 	GpTopoWriteLevel level;
+	int			nestlevel;		/* transaction nest level it was opened at */
 	bool		dirty;			/* work differs from orig */
 	bool		persisted;		/* at most one persist() per write set */
 	void	   *provider_state; /* provider-private, e.g. an open Relation */
@@ -186,23 +187,24 @@ extern void writeGpSegConfigToFTSFiles(void);
  * Open a write set, edit ws->work, commit:
  *
  *		ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
- *		PG_TRY();
- *		{
- *			GpSegConfigEntry *e = GpTopoFindByDbid(ws, dbid);
- *			...
- *			GpTopoCommitWrite(ws);
- *		}
- *		PG_CATCH();
- *		{
- *			GpTopoEndWrite(ws, false);
- *			PG_RE_THROW();
- *		}
- *		PG_END_TRY();
+ *
+ *		e = GpTopoFindByDbid(ws, dbid);
+ *		if (e == NULL)
+ *			elog(ERROR, ...);		 -- fine; see below
+ *		e->status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+ *		GpTopoUpdate(ws, e);
+ *
+ *		GpTopoCommitWrite(ws);
  *
  * ws->work is the read-your-own-writes mechanism: once the write set is open,
  * every question about the topology is answered from it, so a caller that
  * checks a precondition and then mutates does both against one snapshot taken
  * under one lock.  Nothing is written until GpTopoPersist().
+ *
+ * An ERROR anywhere between begin and commit needs no handling at the call
+ * site: cdbtopology.c releases every write set open at the aborting
+ * (sub)transaction's nest level.  What a caller must do is call
+ * GpTopoEndWrite(ws, false) if it returns *normally* without committing.
  */
 extern GpTopoWriteSet *GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level);
 extern void GpTopoPersist(GpTopoWriteSet *ws);
