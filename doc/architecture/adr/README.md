@@ -8,6 +8,13 @@ One self-contained document: what the feature is, every decision that is live, w
 rejected and why, the costs accepted, and the invariants a developer must not break. It is
 the only ADR you need to understand or review the implementation.
 
+**[ADR-0007 — Cluster Topology Behind a Pluggable Store](0007-pluggable-cluster-topology.md)**
+
+Current and in progress. Topology moves out of a replicated catalog and behind a provider,
+which is why several of ADR-0006's mechanisms are on a path to deletion rather than
+maintenance. Read it before changing anything that reads or writes
+`gp_segment_configuration`.
+
 Companions, both current:
 
 - [`../greengage-dr-read-replica.md`](../greengage-dr-read-replica.md) — how the mechanisms
