@@ -167,9 +167,6 @@ extern bool *makeRandomSegMap(int total_primaries, int total_to_skip);
  */
 extern char *getDnsAddress(char *name, int port, int elevel);
 
-extern int16 coordinator_standby_dbid(void);
-extern GpSegConfigEntry *dbid_get_dbinfo(int16 dbid);
-extern int16 contentid_get_dbid(int16 contentid, char role, bool getPreferredRoleNotCurrentRole);
 
 extern int numsegmentsFromQD;
 /*
