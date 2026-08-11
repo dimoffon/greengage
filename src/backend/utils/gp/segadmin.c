@@ -537,6 +537,23 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 						   "gp_add_coordinator_standby");
 
 	/*
+	 * A standby coordinator learns the topology only because the coordinator's
+	 * writes reach it, and for a store that is not WAL-logged nothing carries
+	 * them.  Refuse rather than hand back a standby whose topology silently
+	 * goes stale.  gpinitstandby inherits this for free.
+	 */
+	if (!GpTopoActiveProvider()->allows_standby_coordinator)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("a standby coordinator cannot be added while the cluster "
+						"topology is stored by the \"%s\" provider",
+						GpTopoActiveProvider()->name),
+				 errdetail("That store is not WAL-logged, so the standby's copy "
+						   "of the topology could not be kept in step."),
+				 errhint("Use gp_topology_source = catalog, or an external "
+						 "topology store.")));
+
+	/*
 	 * Open the write set before checking whether a standby already exists.
 	 * The check used to run outside the lock that the insert then took, so two
 	 * callers could both find no standby and both add one.

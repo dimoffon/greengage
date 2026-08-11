@@ -98,13 +98,15 @@ GpTopoGenerationObserve(uint64 generation)
 }
 
 extern const GpTopologyRoutine gp_topology_catalog_routine;
+extern const GpTopologyRoutine gp_topology_file_routine;
 
 /*
  * Indexed by GpTopologySourceKind, in the smgrsw[] style: a fixed set of
  * backends selected by an enum, no dynamic registration, no catalog involved.
  */
 static const GpTopologyRoutine *const gp_topology_routines[] = {
-	&gp_topology_catalog_routine	/* GP_TOPOLOGY_SOURCE_CATALOG */
+	&gp_topology_catalog_routine,	/* GP_TOPOLOGY_SOURCE_CATALOG */
+	&gp_topology_file_routine		/* GP_TOPOLOGY_SOURCE_FILE */
 };
 
 #define NGpTopologyRoutines lengthof(gp_topology_routines)
