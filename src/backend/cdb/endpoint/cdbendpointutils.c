@@ -13,8 +13,6 @@
 
 #include "postgres.h"
 
-#include <sys/param.h>			/* for MAXHOSTNAMELEN */
-
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "utils/builtins.h"
@@ -40,7 +38,7 @@ typedef struct
 	EndpointState state;
 	char			userName[NAMEDATALEN];
 	int			sessionId;
-	char		hostname[MAXHOSTNAMELEN];	/* where segmentIndex's primary is */
+	char	   *hostname;		/* where segmentIndex's primary is */
 	int32		port;
 }			EndpointInfo;
 
@@ -397,7 +395,12 @@ gp_get_endpoints(PG_FUNCTION_ARGS)
 					elog(ERROR, "could not find a primary segment for content %d",
 						 info->segmentIndex);
 
-				StrNCpy(info->hostname, seg->hostname, MAXHOSTNAMELEN);
+				/*
+				 * Copied, not aliased: seg points into the topology array,
+				 * which is dropped below.  CurrentMemoryContext here is the
+				 * SRF's multi_call_memory_ctx, so the copy outlives it.
+				 */
+				info->hostname = pstrdup(seg->hostname);
 				info->port = seg->port;
 			}
 

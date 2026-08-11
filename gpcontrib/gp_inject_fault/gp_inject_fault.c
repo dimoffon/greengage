@@ -59,6 +59,7 @@ getHostnameAndPort(int dbid, char **hostname, int *port)
 	GpSegConfigEntry *configs;
 	GpSegConfigEntry *seg;
 	int			nconfigs;
+	bool		found;
 
 	topocxt = AllocSetContextCreate(CurrentMemoryContext,
 									"gp_inject_fault topology",
@@ -66,9 +67,10 @@ getHostnameAndPort(int dbid, char **hostname, int *port)
 
 	configs = GpTopologyGetAll(topocxt, &nconfigs);
 	seg = GpTopoArrayFindByDbid(configs, nconfigs, (int16) dbid);
+	found = (seg != NULL);
 
 	/* copy out while the caller's context is still current */
-	if (seg != NULL)
+	if (found)
 	{
 		*hostname = pstrdup(seg->hostname);
 		*port = seg->port;
@@ -76,7 +78,7 @@ getHostnameAndPort(int dbid, char **hostname, int *port)
 
 	MemoryContextDelete(topocxt);
 
-	if (seg == NULL)
+	if (!found)
 		elog(ERROR, "dbid %d not found", dbid);
 }
 

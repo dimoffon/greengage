@@ -167,7 +167,6 @@ extern bool *makeRandomSegMap(int total_primaries, int total_to_skip);
  */
 extern char *getDnsAddress(char *name, int port, int elevel);
 
-
 extern int numsegmentsFromQD;
 /*
  * Returns the number of segments
