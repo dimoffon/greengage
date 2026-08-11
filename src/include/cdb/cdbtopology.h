@@ -46,6 +46,42 @@ typedef enum GpTopologySourceKind
 extern int	gp_topology_source;		/* GpTopologySourceKind; int for the GUC machinery */
 
 /*
+ * How hard a writer needs to serialise.
+ *
+ * These are not interchangeable.  SERIALIZED reproduces what every segment
+ * add and remove path does today -- AccessExclusiveLock, held to end of
+ * transaction -- and that retention is what protects gpMgmt's multi-statement
+ * reconfiguration transactions.  ROW reproduces what FTS does:
+ * one or two rows per probe cycle, concurrent readers unaffected.  Raising FTS
+ * to SERIALIZED would block every reader of the topology on every probe cycle
+ * that changed anything.
+ */
+typedef enum GpTopoWriteLevel
+{
+	GP_TOPO_WRITE_ROW = 0,		/* a row or two; concurrent readers OK */
+	GP_TOPO_WRITE_SERIALIZED	/* whole-set exclusivity, held to commit */
+} GpTopoWriteLevel;
+
+/*
+ * How a write set ended, as the provider sees it.
+ *
+ * Callers only ever say commit or roll back (GpTopoEndWrite takes a bool).
+ * The third case is the one a provider must not confuse with the second: on
+ * transaction abort the resource manager has already taken back everything it
+ * knows about -- for the catalog provider, the relation and its lock -- so
+ * releasing them again is at best redundant and at worst a relcache access at
+ * a point where that is not safe.  A provider holding something the
+ * transaction machinery does *not* know about, such as an etcd lease or a
+ * cluster-wide mutex, must release it in this case and only in this case.
+ */
+typedef enum GpTopoWriteOutcome
+{
+	GP_TOPO_WRITE_COMMIT,		/* caller finished; persist() has run */
+	GP_TOPO_WRITE_ROLLBACK,		/* caller failed; transaction still live */
+	GP_TOPO_WRITE_ABORTED		/* transaction aborted underneath us */
+} GpTopoWriteOutcome;
+
+/*
  * A topology mutation in flight.
  *
  * Every writer reads the whole topology, edits an array, and commits.  That
@@ -71,8 +107,12 @@ typedef struct GpTopoWriteSet
 	int			nwork;
 	int			workmax;
 
-	bool		dirty;
+	GpTopoWriteLevel level;
+	bool		dirty;			/* work differs from orig */
+	bool		persisted;		/* at most one persist() per write set */
 	void	   *provider_state; /* provider-private, e.g. an open Relation */
+
+	struct GpTopoWriteSet *next_live;	/* cdbtopology.c's abort registry */
 } GpTopoWriteSet;
 
 typedef struct GpTopologyRoutine
@@ -98,9 +138,26 @@ typedef struct GpTopologyRoutine
 	/* Read the whole topology into `cxt`.  Never returns NULL. */
 	GpSegConfigEntry *(*read_all) (MemoryContext cxt, int *nentries, uint64 *gen);
 
+	/*
+	 * Take the store's mutex at `ws->level` and fill ws->orig/norig/gen.
+	 * ws->cxt is the current memory context throughout.  NULL means the
+	 * provider is read-only.
+	 */
 	void		(*begin_write) (GpTopoWriteSet *ws);
+
+	/*
+	 * Compare-and-set on ws->gen, then make ws->work durable.  Called only
+	 * when ws->dirty, and at most once per write set.
+	 */
 	void		(*persist) (GpTopoWriteSet *ws);
-	void		(*end_write) (GpTopoWriteSet *ws, bool commit);
+	void		(*end_write) (GpTopoWriteSet *ws, GpTopoWriteOutcome outcome);
+
+	/*
+	 * Refresh whatever out-of-transaction copy this provider keeps, if it
+	 * keeps one.  NULL for providers that are already readable without a
+	 * transaction, which is most of them -- the catalog is the exception.
+	 */
+	void		(*publish_snapshot) (void);
 } GpTopologyRoutine;
 
 extern const GpTopologyRoutine *GpTopoActiveProvider(void);
@@ -115,10 +172,82 @@ extern void GpTopologyProviderStartup(void);
 extern GpSegConfigEntry *GpTopologyGetAll(MemoryContext cxt, int *nentries);
 
 /*
- * Refresh the catalog provider's out-of-transaction dump file.  FTS-only; a
- * no-op under any other provider, which do not need one.
+ * Refresh the active provider's out-of-transaction copy of the topology.
+ * FTS-only, and a no-op under a provider that does not keep one.
  */
+extern void GpTopoPublishSnapshot(void);
+
+/* The catalog provider's implementation of the above.  FTS-only. */
 extern void writeGpSegConfigToFTSFiles(void);
+
+/*
+ * Mutating the topology
+ * ---------------------
+ * Open a write set, edit ws->work, commit:
+ *
+ *		ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+ *		PG_TRY();
+ *		{
+ *			GpSegConfigEntry *e = GpTopoFindByDbid(ws, dbid);
+ *			...
+ *			GpTopoCommitWrite(ws);
+ *		}
+ *		PG_CATCH();
+ *		{
+ *			GpTopoEndWrite(ws, false);
+ *			PG_RE_THROW();
+ *		}
+ *		PG_END_TRY();
+ *
+ * ws->work is the read-your-own-writes mechanism: once the write set is open,
+ * every question about the topology is answered from it, so a caller that
+ * checks a precondition and then mutates does both against one snapshot taken
+ * under one lock.  Nothing is written until GpTopoPersist().
+ */
+extern GpTopoWriteSet *GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level);
+extern void GpTopoPersist(GpTopoWriteSet *ws);
+extern void GpTopoEndWrite(GpTopoWriteSet *ws, bool commit);
+extern void GpTopoCommitWrite(GpTopoWriteSet *ws);
+
+/*
+ * Verbs over ws->work.  None of them touch storage.
+ *
+ * A caller that replaces one of the three string fields must allocate the
+ * replacement in ws->cxt; the entries handed out here point into the write
+ * set's own memory, which dies with it.
+ */
+extern GpSegConfigEntry *GpTopoFindByDbid(GpTopoWriteSet *ws, int16 dbid);
+extern GpSegConfigEntry *GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 content,
+												 char role, bool preferredNotCurrent);
+extern int16 GpTopoMaxDbid(GpTopoWriteSet *ws);
+extern int16 GpTopoAvailableDbid(GpTopoWriteSet *ws);
+extern int16 GpTopoMaxContent(GpTopoWriteSet *ws);
+extern void GpTopoInsert(GpTopoWriteSet *ws, const GpSegConfigEntry *entry);
+extern void GpTopoUpdate(GpTopoWriteSet *ws, GpSegConfigEntry *entry);
+extern int	GpTopoDelete(GpTopoWriteSet *ws, int16 dbid);
+
+/*
+ * Validation, in two tiers, because they have different audiences.
+ *
+ * KEYS is exactly what the two unique indexes on gp_segment_configuration
+ * enforce.  GpTopoPersist() applies it to every write set, so under the
+ * catalog provider it is redundant -- deliberately: it is how a store with no
+ * indexes of its own inherits the constraint instead of reinventing it.
+ *
+ * CLUSTER is what a *usable* cluster additionally requires.  It is NOT called
+ * from GpTopoPersist(), and wiring it in there would be a bug: gpexpand and
+ * gprecoverseg legitimately drive the topology through intermediate states
+ * that violate density and mirror pairing between statements of one
+ * transaction.  It exists for a provider whose store is rebuilt wholesale
+ * rather than edited in place, and for diagnostics.
+ */
+typedef enum GpTopoValidateLevel
+{
+	GP_TOPO_VALIDATE_KEYS = 0,
+	GP_TOPO_VALIDATE_CLUSTER
+} GpTopoValidateLevel;
+
+extern void GpTopoValidate(GpTopoWriteSet *ws, GpTopoValidateLevel level);
 
 /*
  * Writing another provider

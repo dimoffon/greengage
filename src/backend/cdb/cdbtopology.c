@@ -16,6 +16,8 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
+#include "catalog/gp_segment_configuration.h"
 #include "cdb/cdbtopology.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
@@ -88,4 +90,533 @@ GpTopologyGetAll(MemoryContext cxt, int *nentries)
 	routine = GpTopoActiveProvider();
 
 	return routine->read_all(cxt, nentries, &gen);
+}
+
+/*
+ * Refresh the provider's out-of-transaction copy, if it keeps one.
+ */
+void
+GpTopoPublishSnapshot(void)
+{
+	const GpTopologyRoutine *routine;
+
+	GpTopologyProviderStartup();
+	routine = GpTopoActiveProvider();
+
+	if (routine->publish_snapshot)
+		routine->publish_snapshot();
+}
+
+
+/* ----------------------------------------------------------------
+ *						write sets
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Write sets that have been opened and not yet ended.
+ *
+ * There is normally at most one -- a write set spans a single SQL-callable
+ * function or a single FTS probe pair -- but a list costs nothing and means
+ * the abort path never has to reason about how many there are.
+ */
+static GpTopoWriteSet *gp_topo_live_writesets = NULL;
+static bool gp_topo_xact_callback_registered = false;
+
+static void
+gp_topo_forget(GpTopoWriteSet *ws)
+{
+	GpTopoWriteSet **link = &gp_topo_live_writesets;
+
+	while (*link != NULL)
+	{
+		if (*link == ws)
+		{
+			*link = ws->next_live;
+			ws->next_live = NULL;
+			return;
+		}
+		link = &(*link)->next_live;
+	}
+}
+
+/*
+ * Close a write set out, whatever the reason.
+ *
+ * The provider is told which of the three endings this is; see
+ * GpTopoWriteOutcome.  Everything after that is generic: the write set's
+ * memory goes, and the struct is left inert rather than freed, because the
+ * caller allocated it and may still hold the pointer.
+ */
+static void
+gp_topo_release(GpTopoWriteSet *ws, GpTopoWriteOutcome outcome)
+{
+	const GpTopologyRoutine *routine = GpTopoActiveProvider();
+
+	if (routine->end_write)
+		routine->end_write(ws, outcome);
+
+	ws->provider_state = NULL;
+	ws->orig = ws->work = NULL;
+	ws->norig = ws->nwork = ws->workmax = 0;
+	ws->dirty = false;
+
+	if (ws->cxt != NULL)
+	{
+		MemoryContextDelete(ws->cxt);
+		ws->cxt = NULL;
+	}
+}
+
+/*
+ * Transaction abort reached us before the caller's PG_CATCH did -- a FATAL, a
+ * cancel between GpTopoBeginWrite() and the PG_TRY, or a caller that forgot
+ * the bracket.  Under the catalog provider there is nothing left to release
+ * here, which is exactly why the outcome is distinguished: see
+ * GpTopoWriteOutcome.
+ */
+static void
+gp_topo_xact_callback(XactEvent event, void *arg)
+{
+	if (event != XACT_EVENT_ABORT && event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+
+	while (gp_topo_live_writesets != NULL)
+	{
+		GpTopoWriteSet *ws = gp_topo_live_writesets;
+
+		gp_topo_live_writesets = ws->next_live;
+		ws->next_live = NULL;
+
+		gp_topo_release(ws, GP_TOPO_WRITE_ABORTED);
+	}
+}
+
+static char *
+topo_strdup(MemoryContext cxt, const char *str)
+{
+	return str != NULL ? MemoryContextStrdup(cxt, str) : NULL;
+}
+
+/*
+ * Deep-copy one entry.
+ *
+ * hostip and hostaddrs are read-side scratch filled in by cdbutil.c's DNS
+ * cache; they belong to a component array, not to the topology, and are left
+ * NULL here rather than copied.
+ */
+static void
+topo_copy_entry(MemoryContext cxt, GpSegConfigEntry *dst,
+				const GpSegConfigEntry *src)
+{
+	memset(dst, 0, sizeof(*dst));
+
+	dst->dbid = src->dbid;
+	dst->segindex = src->segindex;
+	dst->role = src->role;
+	dst->preferred_role = src->preferred_role;
+	dst->mode = src->mode;
+	dst->status = src->status;
+	dst->port = src->port;
+	dst->hostname = topo_strdup(cxt, src->hostname);
+	dst->address = topo_strdup(cxt, src->address);
+	dst->datadir = topo_strdup(cxt, src->datadir);
+}
+
+/*
+ * Open a write set: take the store's mutex, snapshot the topology, and hand
+ * the caller a private copy to edit.
+ *
+ * `cxt` is the caller's context and holds only the GpTopoWriteSet itself; the
+ * snapshot and the working copy go in a child of it, so an ERROR anywhere in
+ * between is cleaned up by ordinary transaction teardown.  Every caller passes
+ * a transaction-lifetime context for that reason.
+ */
+GpTopoWriteSet *
+GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level)
+{
+	const GpTopologyRoutine *routine;
+	GpTopoWriteSet *ws;
+	MemoryContext oldcxt;
+	int			i;
+
+	GpTopologyProviderStartup();
+	routine = GpTopoActiveProvider();
+
+	if (routine->begin_write == NULL)
+		elog(ERROR, "topology provider \"%s\" is read-only", routine->name);
+
+	if (!gp_topo_xact_callback_registered)
+	{
+		RegisterXactCallback(gp_topo_xact_callback, NULL);
+		gp_topo_xact_callback_registered = true;
+	}
+
+	ws = (GpTopoWriteSet *) MemoryContextAllocZero(cxt, sizeof(GpTopoWriteSet));
+	ws->cxt = AllocSetContextCreate(cxt, "GpTopoWriteSet", ALLOCSET_SMALL_SIZES);
+	ws->level = level;
+
+	ws->next_live = gp_topo_live_writesets;
+	gp_topo_live_writesets = ws;
+
+	oldcxt = MemoryContextSwitchTo(ws->cxt);
+
+	routine->begin_write(ws);
+
+	/*
+	 * The working copy is deep: the caller may edit it freely without any of
+	 * that reaching `orig`, which persist() diffs against.
+	 */
+	ws->workmax = Max(ws->norig + 4, 8);
+	ws->work = (GpSegConfigEntry *) palloc0(sizeof(GpSegConfigEntry) * ws->workmax);
+	for (i = 0; i < ws->norig; i++)
+		topo_copy_entry(ws->cxt, &ws->work[i], &ws->orig[i]);
+	ws->nwork = ws->norig;
+
+	MemoryContextSwitchTo(oldcxt);
+
+	return ws;
+}
+
+/*
+ * Make the working copy durable.  A no-op if nothing was edited.
+ */
+void
+GpTopoPersist(GpTopoWriteSet *ws)
+{
+	const GpTopologyRoutine *routine = GpTopoActiveProvider();
+	MemoryContext oldcxt;
+
+	Assert(!ws->persisted);
+	ws->persisted = true;
+
+	if (!ws->dirty)
+		return;
+
+	GpTopoValidate(ws, GP_TOPO_VALIDATE_KEYS);
+
+	oldcxt = MemoryContextSwitchTo(ws->cxt);
+	routine->persist(ws);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+void
+GpTopoEndWrite(GpTopoWriteSet *ws, bool commit)
+{
+	gp_topo_forget(ws);
+	gp_topo_release(ws, commit ? GP_TOPO_WRITE_COMMIT : GP_TOPO_WRITE_ROLLBACK);
+}
+
+void
+GpTopoCommitWrite(GpTopoWriteSet *ws)
+{
+	GpTopoPersist(ws);
+	GpTopoEndWrite(ws, true);
+}
+
+
+/* ----------------------------------------------------------------
+ *			verbs over the working copy
+ * ----------------------------------------------------------------
+ */
+
+GpSegConfigEntry *
+GpTopoFindByDbid(GpTopoWriteSet *ws, int16 dbid)
+{
+	int			i;
+
+	for (i = 0; i < ws->nwork; i++)
+	{
+		if (ws->work[i].dbid == dbid)
+			return &ws->work[i];
+	}
+
+	return NULL;
+}
+
+/*
+ * Find the one entry serving `content` in `role`, current or preferred.
+ *
+ * Keeps contentid_get_dbid()'s semantics exactly, including that a miss is not
+ * an error -- half of segadmin's callers test the result for zero and raise
+ * their own message.  The single-match assertion is the (content,
+ * preferred_role) unique index restated for the current-role lookup, which has
+ * no index behind it.
+ */
+GpSegConfigEntry *
+GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 content, char role,
+						bool preferredNotCurrent)
+{
+	GpSegConfigEntry *found = NULL;
+	int			i;
+
+	for (i = 0; i < ws->nwork; i++)
+	{
+		GpSegConfigEntry *e = &ws->work[i];
+		char		r = preferredNotCurrent ? e->preferred_role : e->role;
+
+		if (e->segindex == content && r == role)
+		{
+			Assert(found == NULL);
+			found = e;
+		}
+	}
+
+	return found;
+}
+
+/*
+ * Highest dbid in use, or 0 if the topology is empty.
+ */
+int16
+GpTopoMaxDbid(GpTopoWriteSet *ws)
+{
+	int16		dbid = 0;
+	int			i;
+
+	for (i = 0; i < ws->nwork; i++)
+		dbid = Max(dbid, ws->work[i].dbid);
+
+	return dbid;
+}
+
+/*
+ * Lowest dbid not in use, counting from 1.
+ *
+ * Deliberately the lowest free gap and not GpTopoMaxDbid() + 1: gpMgmt removes
+ * a segment and adds another in one transaction and expects the freed dbid
+ * back.  gp_add_coordinator_standby() is the one caller that wants max + 1.
+ */
+int16
+GpTopoAvailableDbid(GpTopoWriteSet *ws)
+{
+	int32		dbid;
+
+	for (dbid = 1;; dbid++)
+	{
+		if (dbid != (int16) dbid)
+			elog(ERROR, "unable to find available dbid");
+
+		if (GpTopoFindByDbid(ws, (int16) dbid) == NULL)
+			return (int16) dbid;
+	}
+}
+
+/*
+ * Highest content id in use, or 0 if the topology is empty.
+ *
+ * Zero, not -1, on a topology holding only the coordinator: the coordinator's
+ * content is -1 and Max(0, -1) is 0, so the first primary added this way gets
+ * content 1 rather than 0.  That is a long-standing off-by-one which callers
+ * compensate for; it is preserved here rather than fixed, because fixing it is
+ * a separate change with its own blast radius.
+ */
+int16
+GpTopoMaxContent(GpTopoWriteSet *ws)
+{
+	int16		content = 0;
+	int			i;
+
+	for (i = 0; i < ws->nwork; i++)
+		content = Max(content, ws->work[i].segindex);
+
+	return content;
+}
+
+void
+GpTopoInsert(GpTopoWriteSet *ws, const GpSegConfigEntry *entry)
+{
+	if (ws->nwork >= ws->workmax)
+	{
+		int			newmax = ws->workmax * 2;
+
+		ws->work = (GpSegConfigEntry *)
+			repalloc(ws->work, sizeof(GpSegConfigEntry) * newmax);
+		memset(&ws->work[ws->workmax], 0,
+			   sizeof(GpSegConfigEntry) * (newmax - ws->workmax));
+		ws->workmax = newmax;
+	}
+
+	topo_copy_entry(ws->cxt, &ws->work[ws->nwork], entry);
+	ws->nwork++;
+	ws->dirty = true;
+}
+
+/*
+ * Mark an entry the caller has already edited in place.
+ */
+void
+GpTopoUpdate(GpTopoWriteSet *ws, GpSegConfigEntry *entry)
+{
+	Assert(entry >= ws->work && entry < ws->work + ws->nwork);
+	ws->dirty = true;
+}
+
+/*
+ * Remove every entry with this dbid, and report how many there were, so a
+ * caller that knows there must have been one can still say so.
+ */
+int
+GpTopoDelete(GpTopoWriteSet *ws, int16 dbid)
+{
+	int			ndeleted = 0;
+	int			i;
+
+	for (i = 0; i < ws->nwork;)
+	{
+		if (ws->work[i].dbid != dbid)
+		{
+			i++;
+			continue;
+		}
+
+		memmove(&ws->work[i], &ws->work[i + 1],
+				sizeof(GpSegConfigEntry) * (ws->nwork - i - 1));
+		ws->nwork--;
+		ndeleted++;
+	}
+
+	if (ndeleted > 0)
+		ws->dirty = true;
+
+	return ndeleted;
+}
+
+
+/* ----------------------------------------------------------------
+ *						validation
+ * ----------------------------------------------------------------
+ */
+
+static const char *
+topo_role_name(char role)
+{
+	switch (role)
+	{
+		case GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY:
+			return "primary";
+		case GP_SEGMENT_CONFIGURATION_ROLE_MIRROR:
+			return "mirror";
+		default:
+			return "unknown";
+	}
+}
+
+void
+GpTopoValidate(GpTopoWriteSet *ws, GpTopoValidateLevel level)
+{
+	int			i,
+				j;
+	int			ncoordinator = 0;
+	int			nstandby = 0;
+	int16		maxcontent = -1;
+
+	/* Tier 1: what the two unique indexes enforce. */
+	for (i = 0; i < ws->nwork; i++)
+	{
+		GpSegConfigEntry *a = &ws->work[i];
+
+		for (j = i + 1; j < ws->nwork; j++)
+		{
+			GpSegConfigEntry *b = &ws->work[j];
+
+			if (a->dbid == b->dbid)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate dbid %d in cluster topology",
+								a->dbid)));
+
+			if (a->segindex == b->segindex &&
+				a->preferred_role == b->preferred_role)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate preferred %s for content %d in cluster topology",
+								topo_role_name(a->preferred_role),
+								a->segindex)));
+		}
+	}
+
+	if (level < GP_TOPO_VALIDATE_CLUSTER)
+		return;
+
+	/*
+	 * Tier 2: what a usable cluster additionally requires.  Not reached from
+	 * GpTopoPersist(); see the header for why.
+	 */
+	for (i = 0; i < ws->nwork; i++)
+	{
+		GpSegConfigEntry *e = &ws->work[i];
+
+		if (e->dbid <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("invalid dbid %d in cluster topology", e->dbid)));
+
+		if (e->role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY &&
+			e->role != GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("invalid role \"%c\" for dbid %d in cluster topology",
+							e->role, e->dbid)));
+
+		if (e->preferred_role != GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY &&
+			e->preferred_role != GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("invalid preferred role \"%c\" for dbid %d in cluster topology",
+							e->preferred_role, e->dbid)));
+
+		if (e->hostname == NULL || e->address == NULL || e->datadir == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("dbid %d in cluster topology has no hostname, address or data directory",
+							e->dbid)));
+
+		/*
+		 * The flat-file formats -- both this provider's dump and the
+		 * file-backed store -- are whitespace-separated, so a data directory
+		 * containing a space silently truncates on the way back in.  Refuse it
+		 * at the write instead.
+		 */
+		if (strpbrk(e->hostname, " \t\n\r") != NULL ||
+			strpbrk(e->address, " \t\n\r") != NULL ||
+			strpbrk(e->datadir, " \t\n\r") != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("dbid %d in cluster topology has whitespace in its hostname, address or data directory",
+							e->dbid)));
+
+		if (e->segindex == COORDINATOR_CONTENT_ID)
+		{
+			if (e->preferred_role == GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY)
+				ncoordinator++;
+			else
+				nstandby++;
+		}
+		maxcontent = Max(maxcontent, e->segindex);
+	}
+
+	if (ncoordinator != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("cluster topology has %d coordinators, expected exactly one",
+						ncoordinator)));
+	if (nstandby > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("cluster topology has %d coordinator standbys, expected at most one",
+						nstandby)));
+
+	/* Contents must be dense from 0 up to the highest one present. */
+	for (i = 0; i <= maxcontent; i++)
+	{
+		if (GpTopoFindByContentRole(ws, (int16) i,
+									GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+									true) == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("cluster topology has no segment for content %d", i),
+					 errdetail("Contents must be dense from 0 to %d.",
+							   maxcontent)));
+	}
 }
