@@ -45,7 +45,7 @@ SUBDIRS+=gpfdist
 endif
 
 # Greengage additions
-SUBDIRS += gpnetbench gg_walfilter
+SUBDIRS += gpnetbench gg_walfilter gg_topology
 
 $(recurse)
 $(recurse_always)
