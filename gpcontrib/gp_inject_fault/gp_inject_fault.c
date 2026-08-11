@@ -1,17 +1,15 @@
 #include "postgres.h"
 
-#include "access/heapam.h"
-#include "access/genam.h"
 #include "access/xlog.h"
-#include "catalog/indexing.h"
 #include "cdb/cdbdisp_query.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "libpq/ifaddr.h"
 #include "libpq-fe.h"
 #include "postmaster/fts.h"
 #include "utils/builtins.h"
 #include "utils/faultinjector.h"
-#include "utils/fmgroids.h"
+#include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
 
@@ -45,43 +43,41 @@ _PG_init(void)
 	MemoryContextSwitchTo(oldContext);
 }
 
+/*
+ * Where does this dbid live?
+ *
+ * Asked only about a dbid that is not our own -- gp_inject_fault() injects
+ * locally otherwise -- and the answer is spent immediately on a libpq connect,
+ * so the whole-topology read the provider hands out is not the cost on this
+ * path.  Going through the provider is what lets a node whose topology is not
+ * the catalog's resolve a dbid to a host in its own cluster.
+ */
 static void
 getHostnameAndPort(int dbid, char **hostname, int *port)
 {
-	HeapTuple	tuple;
-	Relation    configrel;
-	ScanKeyData scankey[1];
-	SysScanDesc scan;
-	Datum       attr;
-	bool        isNull;
+	MemoryContext topocxt;
+	GpSegConfigEntry *configs;
+	GpSegConfigEntry *seg;
+	int			nconfigs;
 
-	configrel = table_open(GpSegmentConfigRelationId, AccessShareLock);
-	ScanKeyInit(&scankey[0],
-				Anum_gp_segment_configuration_dbid,
-				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(dbid));
-	scan = systable_beginscan(configrel, GpSegmentConfigDbidIndexId, true,
-							  NULL, 1, scankey);
+	topocxt = AllocSetContextCreate(CurrentMemoryContext,
+									"gp_inject_fault topology",
+									ALLOCSET_SMALL_SIZES);
 
-	tuple = systable_getnext(scan);
+	configs = GpTopologyGetAll(topocxt, &nconfigs);
+	seg = GpTopoArrayFindByDbid(configs, nconfigs, (int16) dbid);
 
-	if (HeapTupleIsValid(tuple))
+	/* copy out while the caller's context is still current */
+	if (seg != NULL)
 	{
-		attr = heap_getattr(tuple, Anum_gp_segment_configuration_hostname,
-							RelationGetDescr(configrel), &isNull);
-		Assert(!isNull);
-		*hostname = TextDatumGetCString(attr);
-
-		attr = heap_getattr(tuple, Anum_gp_segment_configuration_port,
-							RelationGetDescr(configrel), &isNull);
-		Assert(!isNull);
-		*port = DatumGetInt32(attr);
+		*hostname = pstrdup(seg->hostname);
+		*port = seg->port;
 	}
-	else
-		elog(ERROR, "dbid %d not found", dbid);
 
-	systable_endscan(scan);
-	table_close(configrel, NoLock);
+	MemoryContextDelete(topocxt);
+
+	if (seg == NULL)
+		elog(ERROR, "dbid %d not found", dbid);
 }
 
 PG_FUNCTION_INFO_V1(gp_inject_fault);
