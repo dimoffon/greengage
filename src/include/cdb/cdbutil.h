@@ -18,6 +18,7 @@
 #define CDBUTIL_H
 
 #include "catalog/gp_segment_configuration.h"
+#include "common/gp_topology_file.h"
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
 
@@ -27,39 +28,6 @@ extern MemoryContext CdbComponentsContext;
 
 typedef struct CdbComponentDatabaseInfo CdbComponentDatabaseInfo;
 typedef struct CdbComponentDatabases CdbComponentDatabases;
-
-/* --------------------------------------------------------------------------------------------------
- * Structure for MPP 2.0 database information
- *
- * The information contained in this structure represents logically a row from
- * gp_configuration.  It is used to describe either an entry
- * database or a segment database.
- *
- * Storage for instances of this structure are palloc'd.  Storage for the values
- * pointed to by non-NULL char*'s are also palloc'd.
- *
- */
-#define COMPONENT_DBS_MAX_ADDRS (8)
-typedef struct GpSegConfigEntry 
-{
-	/* copy of entry in gp_segment_configuration */
-	int16		dbid;			/* the dbid of this database */
-	int16		segindex;		/* content indicator: -1 for entry database,
-								 * 0, ..., n-1 for segment database */
-
-	char		role;			/* primary, coordinator, mirror, coordinator-standby */
-	char		preferred_role; /* what role would we "like" to have this segment in ? */
-	char		mode;
-	char		status;
-	int32		port;			/* port that instance is listening on */
-	char		*hostname;		/* name or ip address of host machine */
-	char		*address;		/* ip address of host machine */
-	char		*datadir;		/* absolute path to data directory on the host. */
-
-	/* additional cached info */
-	char		*hostip;	/* cached lookup of name */
-	char		*hostaddrs[COMPONENT_DBS_MAX_ADDRS];	/* cached lookup of names */	
-} GpSegConfigEntry;
 
 struct CdbComponentDatabaseInfo
 {
@@ -183,8 +151,6 @@ bool cdbcomponent_qesExist(void);
 bool cdbcomponent_activeQEsExist(void);
 
 List *cdbcomponent_getCdbComponentsList(void);
-
-extern void writeGpSegConfigToFTSFiles(void);
 
 /*
  * Given total number of primary segment databases and a number of segments

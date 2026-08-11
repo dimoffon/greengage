@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
+#include "cdb/cdbtopology.h"
 #include "access/reloptions.h"
 #include "access/transam.h"
 #include "access/url.h"
@@ -443,6 +444,16 @@ double		optimizer_jit_optimize_above_cost;
 
 /* Switch to toggle block-directory based sampling for AO/CO tables */
 bool		gp_enable_blkdir_sampling;
+
+/*
+ * "file" is deliberately absent until the file-backed provider is registered in
+ * gp_topology_routines[]; listing it here first would let an operator select a
+ * provider that does not exist.
+ */
+static const struct config_enum_entry gp_topology_source_options[] = {
+	{"catalog", GP_TOPOLOGY_SOURCE_CATALOG},
+	{NULL, 0}
+};
 
 static const struct config_enum_entry gp_log_format_options[] = {
 	{"text", 0},
@@ -4767,6 +4778,19 @@ struct config_enum ConfigureNamesEnum_gp[] =
 		},
 		&gp_sessionstate_loglevel,
 		DEBUG1, server_message_level_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"gp_topology_source", PGC_POSTMASTER, PRESET_OPTIONS,
+			gettext_noop("Where this node reads the cluster topology from."),
+			gettext_noop("Currently only \"catalog\" is available: the shared "
+						 "gp_segment_configuration. Must be identical on every node, "
+						 "and is fixed at postmaster start because backends cache the "
+						 "topology per transaction.")
+		},
+		&gp_topology_source,
+		GP_TOPOLOGY_SOURCE_CATALOG, gp_topology_source_options,
 		NULL, NULL, NULL
 	},
 

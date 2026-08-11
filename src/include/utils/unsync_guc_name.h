@@ -200,6 +200,7 @@
 		"gp_max_system_slices",
 		"gp_max_scan_on_shmem",
 		"gp_motion_cost_per_row",
+		"gp_topology_source",
 		"gp_pause_on_restore_point_replay",
 		"gp_postmaster_address_family",
 		"gp_print_create_gang_time",

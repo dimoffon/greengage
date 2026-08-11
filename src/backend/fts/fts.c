@@ -37,6 +37,7 @@
 #include "cdb/cdbvars.h"
 #include "libpq-int.h"
 #include "cdb/cdbfts.h"
+#include "cdb/cdbtopology.h"
 #include "pgstat.h"
 #include "postmaster/fts.h"
 #include "postmaster/ftsprobe.h"
