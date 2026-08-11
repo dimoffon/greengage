@@ -11180,6 +11180,13 @@
 { oid => 5051, descr => 'Remove a primary segment from the system catalog',
    proname => 'gp_remove_segment', proisstrict => 'f', provolatile => 'v', proparallel => 'r', prorettype => 'bool', proargtypes => 'int2', prosrc => 'gp_remove_segment' },
 
+# Not strict: a NULL mode or status means "leave that column alone", which is
+# what lets the gprecoverseg backout script set only the mode.
+{ oid => 7202, descr => 'Set the mode and status of one segment in the cluster topology',
+   proname => 'gp_update_segment_mode_status', proisstrict => 'f', provolatile => 'v',
+   proparallel => 'r', prorettype => 'bool', proargtypes => 'int2 char char',
+   proargnames => '{dbid,mode,status}', prosrc => 'gp_update_segment_mode_status' },
+
 # Deliberately NOT proexeclocation => 'c'.  With the default 'a' plus VOLATILE
 # the planner gives this the same Entry locus a shared-catalog scan gets today,
 # but without the hard error EXECUTE ON COORDINATOR raises for a correlated

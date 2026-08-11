@@ -721,6 +721,71 @@ gp_activate_standby(void)
 	return true;
 }
 
+/*
+ * Set the mode and status of one segment.
+ *
+ *		gp_update_segment_mode_status(dbid, mode, status)
+ *
+ * A NULL mode or status leaves that column alone.
+ *
+ * This exists because gpMgmt used to do it with a raw
+ *		UPDATE gp_segment_configuration SET mode = ?, status = ? WHERE dbid = ?
+ * under allow_system_table_mods.  That wrote the catalog and nothing else,
+ * which is invisible to every provider but one, and it went round the write
+ * set every other topology mutation goes through.
+ *
+ * It does not touch gp_configuration_history: the caller writes that itself,
+ * as it always has.
+ */
+Datum
+gp_update_segment_mode_status(PG_FUNCTION_ARGS)
+{
+	int16		dbid;
+	char		mode;
+	char		status;
+	GpTopoWriteSet *ws;
+	GpSegConfigEntry *config;
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "dbid cannot be NULL");
+	dbid = PG_GETARG_INT16(0);
+
+	mode = PG_ARGISNULL(1) ? '\0' : PG_GETARG_CHAR(1);
+	status = PG_ARGISNULL(2) ? '\0' : PG_GETARG_CHAR(2);
+
+	if (mode != '\0' &&
+		mode != GP_SEGMENT_CONFIGURATION_MODE_INSYNC &&
+		mode != GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC)
+		elog(ERROR, "invalid mode '%c' for dbid %d", mode, dbid);
+
+	if (status != '\0' &&
+		status != GP_SEGMENT_CONFIGURATION_STATUS_UP &&
+		status != GP_SEGMENT_CONFIGURATION_STATUS_DOWN)
+		elog(ERROR, "invalid status '%c' for dbid %d", status, dbid);
+
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER,
+						   "gp_update_segment_mode_status");
+
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	/*
+	 * get_segconfig() errors when the dbid is absent, which is what preserves
+	 * the caller's old assertion that the UPDATE affected exactly one row.
+	 */
+	config = get_segconfig(ws, dbid);
+
+	if (mode != '\0')
+		config->mode = mode;
+	if (status != '\0')
+		config->status = status;
+
+	GpTopoUpdate(ws, config);
+
+	GpTopoCommitWrite(ws);
+
+	PG_RETURN_BOOL(true);
+}
+
 Datum
 gp_request_fts_probe_scan(PG_FUNCTION_ARGS)
 {
