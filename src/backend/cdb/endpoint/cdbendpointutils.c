@@ -13,6 +13,8 @@
 
 #include "postgres.h"
 
+#include <sys/param.h>			/* for MAXHOSTNAMELEN */
+
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "utils/builtins.h"
@@ -22,6 +24,7 @@
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbendpoint.h"
 #include "cdbendpoint_private.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
 #include "utils/timeout.h"
@@ -37,6 +40,8 @@ typedef struct
 	EndpointState state;
 	char			userName[NAMEDATALEN];
 	int			sessionId;
+	char		hostname[MAXHOSTNAMELEN];	/* where segmentIndex's primary is */
+	int32		port;
 }			EndpointInfo;
 
 typedef struct
@@ -360,6 +365,45 @@ gp_get_endpoints(PG_FUNCTION_ARGS)
 		}
 		LWLockRelease(ParallelCursorEndpointLock);
 
+		/*
+		 * Resolve each endpoint's content to the host and port serving it,
+		 * from one read of the topology.
+		 *
+		 * Outside the lock above on purpose: reading the topology can ereport,
+		 * and it has nothing to do with endpoint shared memory.  The read is
+		 * also what used to be two catalog probes per output row, in the
+		 * per-call loop below.
+		 */
+		{
+			MemoryContext topocxt;
+			GpSegConfigEntry *topo;
+			int			ntopo;
+
+			topocxt = AllocSetContextCreate(CurrentMemoryContext,
+											"gp_get_endpoints topology",
+											ALLOCSET_SMALL_SIZES);
+			topo = GpTopologyGetAll(topocxt, &ntopo);
+
+			for (int i = 0; i < all_info->total_num; i++)
+			{
+				EndpointInfo *info = &all_info->infos[i];
+				GpSegConfigEntry *seg;
+
+				seg = GpTopoArrayFindByContentRole(topo, ntopo,
+												   (int16) info->segmentIndex,
+												   GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+												   false);
+				if (seg == NULL)
+					elog(ERROR, "could not find a primary segment for content %d",
+						 info->segmentIndex);
+
+				StrNCpy(info->hostname, seg->hostname, MAXHOSTNAMELEN);
+				info->port = seg->port;
+			}
+
+			MemoryContextDelete(topocxt);
+		}
+
 		/* return to original context when allocating transient memory */
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -372,8 +416,6 @@ gp_get_endpoints(PG_FUNCTION_ARGS)
 		Datum		result;
 		char		tokenStr[ENDPOINT_TOKEN_STR_LEN + 1];
 		EndpointInfo *info = &all_info->infos[all_info->cur_idx++];
-		int16 dbid = contentid_get_dbid(info->segmentIndex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false);
-		GpSegConfigEntry *segCnfInfo = dbid_get_dbinfo(dbid);
 
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, 0, sizeof(nulls));
@@ -383,8 +425,8 @@ gp_get_endpoints(PG_FUNCTION_ARGS)
 		values[1] = CStringGetTextDatum(tokenStr);
 		values[2] = CStringGetTextDatum(info->cursorName);
 		values[3] = Int32GetDatum(info->sessionId);
-		values[4] = CStringGetTextDatum(segCnfInfo->hostname);
-		values[5] = Int32GetDatum(segCnfInfo->port);
+		values[4] = CStringGetTextDatum(info->hostname);
+		values[5] = Int32GetDatum(info->port);
 		values[6] = CStringGetTextDatum(info->userName);
 		values[7] = CStringGetTextDatum(state_enum_to_string(info->state));
 		values[8] = CStringGetTextDatum(info->name);
