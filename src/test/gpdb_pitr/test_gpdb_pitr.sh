@@ -100,6 +100,44 @@ for segment_role in MASTER PRIMARY1 PRIMARY2 PRIMARY3; do
   pg_basebackup -h localhost -p ${!PORT_VAR} -X stream -D ${!REPLICA_VAR} --target-gp-dbid ${!REPLICA_DBID_VAR}
 done
 
+# Build the cluster topology the PITR cluster will run with.
+#
+# A restored cluster is a different cluster: same contents and ports, but its own
+# dbids and data directories.  Something has to say so before it can dispatch.
+#
+# This used to be done after the fact, by UPDATEing gp_segment_configuration on
+# the restored coordinator under allow_system_table_mods -- which only worked
+# because that catalog happened to be where topology lived.  It is now written to
+# each node's own $PGDATA/gp_topology before the node ever starts, so the cluster
+# describes itself from its first boot rather than being corrected afterwards.
+# This is the first non-DR user of the file topology provider, and the case it
+# was designed for.
+#
+# Derived from the source cluster while it is still up: same content, role, mode,
+# status, port, hostname and address, with the replica's dbid and datadir
+# substituted.  Mirrors are dropped -- the PITR cluster has none.
+declare -A PITR_DBID PITR_DATADIR
+PITR_DBID["-1"]=$REPLICA_MASTER_DBID;  PITR_DATADIR["-1"]=$REPLICA_MASTER
+PITR_DBID["0"]=$REPLICA_PRIMARY1_DBID; PITR_DATADIR["0"]=$REPLICA_PRIMARY1
+PITR_DBID["1"]=$REPLICA_PRIMARY2_DBID; PITR_DATADIR["1"]=$REPLICA_PRIMARY2
+PITR_DBID["2"]=$REPLICA_PRIMARY3_DBID; PITR_DATADIR["2"]=$REPLICA_PRIMARY3
+
+PITR_TOPOLOGY=$TEMP_DIR/gp_topology.txt
+echo "Building the PITR cluster's topology..."
+psql -p $MASTER_PORT -d postgres -Atc \
+  "select content||' '||role||' '||preferred_role||' '||mode||' '||status||' '||port||' '||hostname||' '||address
+     from gp_segment_configuration where role = 'p' order by content;" \
+| while read -r content rest; do
+    echo "${PITR_DBID[$content]} $content $rest ${PITR_DATADIR[$content]}"
+  done > $PITR_TOPOLOGY
+
+if [ "$(wc -l < $PITR_TOPOLOGY)" != 4 ]; then
+  echo "FAIL: expected 4 primaries in the source topology, got:"
+  cat $PITR_TOPOLOGY
+  exit 1
+fi
+cat $PITR_TOPOLOGY | sed 's/^/  topology: /'
+
 # Run setup test. This will create the tables, create the restore
 # points, and demonstrate the commit blocking.
 run_test_isolation2 gpdb_pitr_setup
@@ -124,6 +162,19 @@ recovery_target_name = 'test_restore_point'
 recovery_target_action = 'promote'
 recovery_end_command = 'touch ${!REPLICA_VAR}/recovery_finished'" >> ${!REPLICA_VAR}/postgresql.conf
 echo "" > ${!REPLICA_VAR}/postgresql.auto.conf
+
+  # Point this node at its own topology store and write it, before it starts.
+  # Both halves have to happen here: gp_topology_source is PGC_POSTMASTER, and
+  # gg_topology refuses to write a store while a postmaster owns the directory.
+  # The base backup brought production's copy of the file along; this overwrites
+  # it, which is exactly what it is there for.
+  echo "gp_topology_source = file" >> ${!REPLICA_VAR}/postgresql.conf
+  gg_topology write -D ${!REPLICA_VAR} - < $PITR_TOPOLOGY
+  if [ $? != 0 ]; then
+    echo "FAIL: could not write the topology store for ${!REPLICA_VAR}"
+    exit 1
+  fi
+
   touch ${!REPLICA_VAR}/recovery.signal
   pg_ctl start -D ${!REPLICA_VAR} -l /dev/null
 done
@@ -144,17 +195,20 @@ while true; do
   fi
 done
 
-# Reconfigure the segment configuration on the replica master so that
-# the other replicas are recognized as primary segments.
-echo "Configuring replica master's gp_segment_configuration..."
-PGOPTIONS="-c gp_role=utility" psql postgres -c "
-SET allow_system_table_mods=true;
-DELETE FROM gp_segment_configuration_internal WHERE preferred_role='m';
-UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_MASTER_DBID}, datadir='${REPLICA_MASTER}' WHERE content = -1;
-UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY1_DBID}, datadir='${REPLICA_PRIMARY1}' WHERE content = 0;
-UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY2_DBID}, datadir='${REPLICA_PRIMARY2}' WHERE content = 1;
-UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY3_DBID}, datadir='${REPLICA_PRIMARY3}' WHERE content = 2;
-"
+# No catalog surgery here any more.  The topology was written into each node's
+# store before it started, so the restored cluster has described itself correctly
+# from its first boot -- check that it does, since a wrong answer here is the one
+# failure that would send queries to the cluster this one was restored from.
+echo "Verifying the restored cluster describes itself..."
+PGOPTIONS="-c gp_role=utility" psql postgres -Atc \
+  "select dbid||':'||content||':'||datadir from gp_segment_configuration order by content;" \
+  | sed 's/^/  serving: /'
+PITR_SERVED=$(PGOPTIONS="-c gp_role=utility" psql postgres -Atc \
+  "select count(*) from gp_segment_configuration where dbid = ${REPLICA_MASTER_DBID} and datadir = '${REPLICA_MASTER}';")
+if [ "$PITR_SERVED" != 1 ]; then
+  echo "FAIL: the restored coordinator does not describe itself (dbid ${REPLICA_MASTER_DBID}, ${REPLICA_MASTER})."
+  exit 1
+fi
 
 # Restart the cluster to get the MPP parts working.
 echo "Restarting cluster now that the new cluster is properly configured..."
