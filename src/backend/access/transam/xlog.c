@@ -86,6 +86,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "cdb/cdbtm.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "postmaster/postmaster.h"
 #include "replication/syncrep.h"
@@ -8744,6 +8745,23 @@ CheckRecoveryConsistency(void)
 		SpinLockRelease(&XLogCtl->info_lck);
 
 		LocalHotStandbyActive = true;
+
+		/*
+		 * A query dispatcher about to start serving reads out of recovery, from
+		 * a topology store that WAL does not carry.  That is the disaster-
+		 * recovery replica's normal state and the entire point of the file
+		 * store, so this is a warning and not a refusal -- but it is worth
+		 * saying once, at the moment the node opens for reads, because it is
+		 * also what an operator sees if they armed the wrong provider on a node
+		 * that was meant to follow its primary's topology.
+		 */
+		if (IS_QUERY_DISPATCHER() && !GpTopoActiveProvider()->wal_logged)
+			ereport(WARNING,
+					(errmsg("serving reads in recovery with the cluster topology "
+							"in the \"%s\" store, which is not WAL-logged",
+							GpTopoActiveProvider()->name),
+					 errdetail("This node describes itself rather than the "
+							   "cluster whose WAL it replays.")));
 
 		SendPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY);
 	}
