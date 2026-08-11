@@ -281,16 +281,6 @@ add_segment_config(GpSegConfigEntry *i)
 }
 
 /*
- * Coordinator function for adding a new segment
- */
-static void
-add_segment_config_entry(GpSegConfigEntry *i)
-{
-	/* Add gp_segment_configuration entry */
-	add_segment_config(i);
-}
-
-/*
  * Remove a gp_segment_configuration entry
  */
 static void
@@ -360,7 +350,7 @@ add_segment(GpSegConfigEntry *new_segment_information)
 		}
 	}
 
-	add_segment_config_entry(new_segment_information);
+	add_segment_config(new_segment_information);
 }
 
 /*
@@ -481,12 +471,12 @@ gp_add_segment(PG_FUNCTION_ARGS)
  * Coordinator function to remove a segment from all catalogs
  */
 static void
-remove_segment(int16 pridbid, int16 mirdbid)
+remove_segment(int16 dbid)
 {
-	/* Check that we're removing a mirror, not a primary */
-	get_segconfig(mirdbid);
+	/* Check that the segment exists at all */
+	get_segconfig(dbid);
 
-	remove_segment_config(mirdbid);
+	remove_segment_config(dbid);
 }
 
 /*
@@ -512,7 +502,7 @@ gp_remove_segment(PG_FUNCTION_ARGS)
 
 	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER | UTILITY_MODE,
 						   "gp_remove_segment");
-	remove_segment(dbid, dbid);
+	remove_segment(dbid);
 
 	PG_RETURN_BOOL(true);
 }
@@ -526,6 +516,8 @@ Datum
 gp_add_segment_mirror(PG_FUNCTION_ARGS)
 {
 	GpSegConfigEntry new;
+
+	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "contentid cannot be NULL");
@@ -602,7 +594,7 @@ gp_remove_segment_mirror(PG_FUNCTION_ARGS)
 	if (!mirdbid)
 		elog(ERROR, "no mirror dbid for contentid %i", contentid);
 
-	remove_segment(pridbid, mirdbid);
+	remove_segment(mirdbid);
 
 	heap_close(rel, NoLock);
 
@@ -681,7 +673,7 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 	if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
 		config->port = PG_GETARG_INT32(3);
 
-	add_segment_config_entry(config);
+	add_segment_config(config);
 	
 	heap_close(gprel, NoLock);
 
@@ -707,7 +699,7 @@ gp_remove_coordinator_standby(PG_FUNCTION_ARGS)
 	if (!dbid)
 		elog(ERROR, "no coordinator standby defined");
 
-	remove_segment(GpIdentity.dbid, dbid);
+	remove_segment(dbid);
 
 	PG_RETURN_BOOL(true);
 }
@@ -765,15 +757,6 @@ segment_config_activate_standby(int16 standby_dbid, int16 coordinator_dbid)
 }
 
 /*
- * Update gp_segment_configuration to activate a standby.
- */
-static void
-catalog_activate_standby(int16 standby_dbid, int16 coordinator_dbid)
-{
-	segment_config_activate_standby(standby_dbid, coordinator_dbid);
-}
-
-/*
  * Activate a standby. To do this, we need to update gp_segment_configuration.
  *
  * Returns:
@@ -816,7 +799,7 @@ gp_activate_standby(void)
 	mirroring_sanity_check(SUPERUSER | UTILITY_MODE | STANDBY_ONLY,
 						   PG_FUNCNAME_MACRO);
 
-	catalog_activate_standby(standby_dbid, coordinator_dbid);
+	segment_config_activate_standby(standby_dbid, coordinator_dbid);
 
 	/* done */
 	return true;
