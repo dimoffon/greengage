@@ -742,7 +742,7 @@ explain update tsplit_entry set c = s.a from (select count(*) as a from gp_segme
                      ->  Materialize  (cost=1.00..1.03 rows=1 width=40)
                            ->  Subquery Scan on s  (cost=1.00..1.02 rows=1 width=40)
                                  ->  Aggregate  (cost=1.00..1.01 rows=1 width=8)
-                                       ->  Seq Scan on gp_segment_configuration  (cost=0.00..1.00 rows=1 width=0)
+                                       ->  Function Scan on gp_get_segment_configuration gp_segment_configuration  (cost=0.00..0.16 rows=16 width=0)
  Optimizer: Postgres query optimizer
 (11 rows)
 

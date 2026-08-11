@@ -3405,7 +3405,7 @@ with cte as (
  Aggregate
    ->  Hash Right Join
          Hash Cond: (gp_segment_configuration.port = share0_ref1.i)
-         ->  Seq Scan on gp_segment_configuration
+         ->  Function Scan on gp_get_segment_configuration gp_segment_configuration
          ->  Hash
                ->  Explicit Gather Motion 3:1  (slice1; segments: 3)
                      ->  Shared Scan (share slice:id 1:0)

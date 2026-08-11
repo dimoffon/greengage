@@ -4319,7 +4319,7 @@ DETAIL:  Falling back to Postgres-based planner because GPORCA does not support 
      ->  Result
            InitPlan 1 (returns $1)
              ->  Limit
-                   ->  Seq Scan on gp_segment_configuration
+                   ->  Function Scan on gp_get_segment_configuration gp_segment_configuration
                          Filter: (dbid = gp_distribution_policy.numsegments)
  Optimizer: Postgres-based planner
 (8 rows)
