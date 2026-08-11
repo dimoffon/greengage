@@ -4312,18 +4312,7 @@ SELECT (
 ) FROM gp_distribution_policy;
 INFO:  GPORCA failed to produce a plan, falling back to Postgres-based planner
 DETAIL:  Falling back to Postgres-based planner because GPORCA does not support the following feature: Queries on coordinator-only tables
-                                 QUERY PLAN                                  
------------------------------------------------------------------------------
- Seq Scan on gp_distribution_policy
-   SubPlan 2
-     ->  Result
-           InitPlan 1 (returns $1)
-             ->  Limit
-                   ->  Function Scan on gp_get_segment_configuration gp_segment_configuration
-                         Filter: (dbid = gp_distribution_policy.numsegments)
- Optimizer: Postgres-based planner
-(8 rows)
-
+ERROR:  cannot execute EXECUTE ON COORDINATOR function in a subquery with arguments from outer query (pathnode.c:2968)
 DROP TABLE skip_correlated_distributed;
 DROP TABLE skip_correlated_random;
 DROP TABLE skip_correlated_replicated;

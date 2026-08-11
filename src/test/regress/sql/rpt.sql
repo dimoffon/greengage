@@ -7,6 +7,8 @@
 
 -- m/ERROR:  Passing parameters across motion is not supported. \([a-z]+\.c:\d+\)/
 -- s/\d+/XXX/g
+-- m/ERROR:  cannot execute EXECUTE ON COORDINATOR function in a subquery with arguments from outer query \([a-z]+\.c:\d+\)/
+-- s/\d+/XXX/g
 -- end_matchsubs
 create schema rpt;
 set search_path to rpt;

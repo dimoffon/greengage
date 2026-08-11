@@ -6,6 +6,8 @@
 -- s/\(cost=.*\)//
 -- m/ERROR:  Passing parameters across motion is not supported. \([a-z]+\.c:\d+\)/
 -- s/\d+/XXX/g
+-- m/ERROR:  cannot execute EXECUTE ON COORDINATOR function in a subquery with arguments from outer query \([a-z]+\.c:\d+\)/
+-- s/\d+/XXX/g
 -- end_matchsubs
 create schema rpt;
 set search_path to rpt;
@@ -1786,7 +1788,7 @@ select count(distinct(rand)) from cte join d on cte.a = d.a;
 
 -- prohibit adding motion on late stage when subplan has external parameters
 select (select dbid from gp_segment_configuration join d as d2 on a = dbid where content = d1.b) from d as d1;
-ERROR:  Passing parameters across motion is not supported. (cdbmutate.c:2052)
+ERROR:  cannot execute EXECUTE ON COORDINATOR function in a subquery with arguments from outer query (pathnode.c:2968)
 drop table t1;
 drop table t2;
 drop table r;
