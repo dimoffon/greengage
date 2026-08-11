@@ -336,8 +336,13 @@ gp_get_endpoints(PG_FUNCTION_ARGS)
 				/*
 				 * Only allow current user to get own endpoints. Or let
 				 * superuser get all endpoints.
+				 *
+				 * The database test has to match the counting loop above
+				 * exactly: the array was sized from that count, so a wider
+				 * filter here writes past its end.
 				 */
-				if (!entry->empty && (superuser() || entry->userID == GetUserId()))
+				if (!entry->empty && entry->databaseID == MyDatabaseId &&
+					(superuser() || entry->userID == GetUserId()))
 				{
 					EndpointInfo *info = &all_info->infos[idx];
 
