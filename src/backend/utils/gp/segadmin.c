@@ -18,20 +18,15 @@
 #include "miscadmin.h"
 #include "pqexpbuffer.h"
 
-#include "access/genam.h"
-#include "access/table.h"
 #include "catalog/gp_segment_configuration.h"
 #include "catalog/pg_proc.h"
-#include "catalog/indexing.h"
 #include "cdb/cdbdisp_query.h"
-#include "cdb/cdbutil.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbfts.h"
-#include "common/hashfn.h"
 #include "postmaster/startup.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/rel.h"
+#include "utils/memutils.h"
 
 #define COORDINATOR_ONLY 0x1
 #define UTILITY_MODE 0x2
@@ -41,26 +36,62 @@
 #define STANDBY_ONLY 0x20
 #define SINGLE_USER_MODE 0x40
 
+/*
+ * Everything below reads and writes the cluster topology through a write set
+ * (cdbtopology.h) rather than through gp_segment_configuration directly.  The
+ * catalog is still where it lands -- that is the provider's business -- but
+ * the questions these functions ask and the changes they make are answered
+ * from, and applied to, one snapshot taken under one lock.
+ *
+ * That is also why the helpers below take the write set: a check that reads
+ * the catalog while the mutation edits an array is a check of something else.
+ */
+
 /* look up a particular segment */
 static GpSegConfigEntry *
-get_segconfig(int16 dbid)
+get_segconfig(GpTopoWriteSet *ws, int16 dbid)
 {
-	return dbid_get_dbinfo(dbid);
+	GpSegConfigEntry *config = GpTopoFindByDbid(ws, dbid);
+
+	if (config == NULL)
+		elog(ERROR, "could not find configuration entry for dbid %i", dbid);
+
+	return config;
+}
+
+/* Convenience routine to look up the primary for a given segment index */
+static int16
+content_get_primary_dbid(GpTopoWriteSet *ws, int16 contentid)
+{
+	GpSegConfigEntry *config;
+
+	config = GpTopoFindByContentRole(ws, contentid,
+									 GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+									 false /* false == current, not preferred,
+											* role */ );
+
+	return config ? config->dbid : 0;
 }
 
 /* Convenience routine to look up the mirror for a given segment index */
 static int16
-content_get_mirror_dbid(int16 contentid)
+content_get_mirror_dbid(GpTopoWriteSet *ws, int16 contentid)
 {
-	return contentid_get_dbid(contentid, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR, false /* false == current, not
-							    * preferred, role */ );
+	GpSegConfigEntry *config;
+
+	config = GpTopoFindByContentRole(ws, contentid,
+									 GP_SEGMENT_CONFIGURATION_ROLE_MIRROR,
+									 false /* false == current, not preferred,
+											* role */ );
+
+	return config ? config->dbid : 0;
 }
 
 /* Tell the caller whether a mirror exists at a given segment index */
 static bool
-segment_has_mirror(int16 contentid)
+segment_has_mirror(GpTopoWriteSet *ws, int16 contentid)
 {
-	return content_get_mirror_dbid(contentid) != 0;
+	return content_get_mirror_dbid(ws, contentid) != 0;
 }
 
 /*
@@ -68,9 +99,9 @@ segment_has_mirror(int16 contentid)
  * standby coordinator.
  */
 static bool
-dbid_is_coordinator_standby(int16 dbid)
+dbid_is_coordinator_standby(GpTopoWriteSet *ws, int16 dbid)
 {
-	int16		standbydbid = content_get_mirror_dbid(COORDINATOR_CONTENT_ID);
+	int16		standbydbid = content_get_mirror_dbid(ws, COORDINATOR_CONTENT_ID);
 
 	return (standbydbid == dbid);
 }
@@ -79,121 +110,19 @@ dbid_is_coordinator_standby(int16 dbid)
  * Tell the caller whether a standby coordinator is defined in the system.
  */
 static bool
-standby_exists()
+standby_exists(GpTopoWriteSet *ws)
 {
-	return segment_has_mirror(COORDINATOR_CONTENT_ID);
-}
-
-/*
- * Get the highest dbid defined in the system. We AccessExclusiveLock
- * gp_segment_configuration to prevent races but no one should be calling
- * this code concurrently if we've done our job right.
- */
-static int16
-get_maxdbid()
-{
-	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-	int16		dbid = 0;
-	HeapTuple	tuple;
-	SysScanDesc sscan;
-
-	sscan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
-	while ((tuple = systable_getnext(sscan)) != NULL)
-	{
-		dbid = Max(dbid,
-				   ((Form_gp_segment_configuration) GETSTRUCT(tuple))->dbid);
-	}
-	systable_endscan(sscan);
-	table_close(rel, NoLock);
-
-	return dbid;
-}
-
-/**
- * Get an available dbid value. We AccessExclusiveLock
- * gp_segment_configuration to prevent races but no one should be calling
- * this code concurrently if we've done our job right.
- */
-static int16
-get_availableDbId()
-{
-	/*
-	 * Set up hash of used dbids.  We use int32 here because int16 doesn't
-	 * have a convenient hash and we can use casting below to check for
-	 * overflow of int16
-	 */
-	HASHCTL		hash_ctl;
-
-	memset(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(int32);
-	hash_ctl.entrysize = sizeof(int32);
-	hash_ctl.hash = int32_hash;
-	HTAB	   *htab = hash_create("Temporary table of dbids",
-								   1024,
-								   &hash_ctl,
-								   HASH_ELEM | HASH_FUNCTION);
-
-	/* scan GpSegmentConfigRelationId */
-	Relation	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-	HeapTuple	tuple;
-	SysScanDesc sscan;
-
-	sscan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
-	while ((tuple = systable_getnext(sscan)) != NULL)
-	{
-		int32		dbid = (int32) ((Form_gp_segment_configuration) GETSTRUCT(tuple))->dbid;
-
-		(void) hash_search(htab, (void *) &dbid, HASH_ENTER, NULL);
-	}
-	systable_endscan(sscan);
-
-	heap_close(rel, NoLock);
-
-	/* search for available dbid */
-	for (int32 dbid = 1;; dbid++)
-	{
-		if (dbid != (int16) dbid)
-			elog(ERROR, "unable to find available dbid");
-
-		if (hash_search(htab, (void *) &dbid, HASH_FIND, NULL) == NULL)
-		{
-			hash_destroy(htab);
-			return dbid;
-		}
-	}
-}
-
-
-/*
- * Get the highest contentid defined in the system. As above, we
- * AccessExclusiveLock gp_segment_configuration to prevent races but no
- * one should be calling this code concurrently if we've done our job right.
- */
-static int16
-get_maxcontentid()
-{
-	Relation	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-	int16		contentid = 0;
-	HeapTuple	tuple;
-	SysScanDesc sscan;
-
-	sscan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
-	while ((tuple = systable_getnext(sscan)) != NULL)
-	{
-		contentid = Max(contentid,
-						((Form_gp_segment_configuration) GETSTRUCT(tuple))->content);
-	}
-	systable_endscan(sscan);
-	heap_close(rel, NoLock);
-
-	return contentid;
+	return segment_has_mirror(ws, COORDINATOR_CONTENT_ID);
 }
 
 /*
  * Check that the code is being called in right context.
+ *
+ * `ws` may be NULL unless STANDBY_ONLY is asked for; that is the one check
+ * here that needs to know what the topology says.
  */
 static void
-mirroring_sanity_check(int flags, const char *func)
+mirroring_sanity_check(GpTopoWriteSet *ws, int flags, const char *func)
 {
 	if ((flags & COORDINATOR_ONLY) == COORDINATOR_ONLY)
 	{
@@ -236,96 +165,22 @@ mirroring_sanity_check(int flags, const char *func)
 		if (GpIdentity.dbid == UNINITIALIZED_GP_IDENTITY_VALUE)
 			elog(ERROR, "%s requires valid GpIdentity dbid", func);
 
-		if (!dbid_is_coordinator_standby(GpIdentity.dbid))
+		Assert(ws != NULL);
+		if (!dbid_is_coordinator_standby(ws, GpIdentity.dbid))
 			elog(ERROR, "%s can only be run on the standby coordinator", func);
 	}
 }
 
-/*
- * Add a new row to gp_segment_configuration.
- */
 static void
-add_segment_config(GpSegConfigEntry *i)
+add_segment(GpTopoWriteSet *ws, GpSegConfigEntry *new_segment_information)
 {
-	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-	Datum		values[Natts_gp_segment_configuration];
-	bool		nulls[Natts_gp_segment_configuration];
-	HeapTuple	tuple;
-
-	MemSet(nulls, false, sizeof(nulls));
-
-	values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(i->dbid);
-	values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(i->segindex);
-	values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(i->role);
-	values[Anum_gp_segment_configuration_preferred_role - 1] =
-		CharGetDatum(i->preferred_role);
-	values[Anum_gp_segment_configuration_mode - 1] =
-		CharGetDatum(i->mode);
-	values[Anum_gp_segment_configuration_status - 1] =
-		CharGetDatum(i->status);
-	values[Anum_gp_segment_configuration_port - 1] =
-		Int32GetDatum(i->port);
-	values[Anum_gp_segment_configuration_hostname - 1] =
-		CStringGetTextDatum(i->hostname);
-	values[Anum_gp_segment_configuration_address - 1] =
-		CStringGetTextDatum(i->address);
-	values[Anum_gp_segment_configuration_datadir - 1] =
-		CStringGetTextDatum(i->datadir);
-
-	tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
-
-	/* insert a new tuple */
-	CatalogTupleInsert(rel, tuple);
-
-	table_close(rel, NoLock);
-}
-
-/*
- * Remove a gp_segment_configuration entry
- */
-static void
-remove_segment_config(int16 dbid)
-{
-#ifdef USE_ASSERT_CHECKING
-	int			numDel = 0;
-#endif
-	ScanKeyData scankey;
-	SysScanDesc sscan;
-	HeapTuple	tuple;
-	Relation	rel;
-
-	rel = table_open(GpSegmentConfigRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&scankey,
-				Anum_gp_segment_configuration_dbid,
-				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(dbid));
-
-	sscan = systable_beginscan(rel, GpSegmentConfigDbidIndexId, true,
-							   NULL, 1, &scankey);
-	while ((tuple = systable_getnext(sscan)) != NULL)
-	{
-		CatalogTupleDelete(rel, &tuple->t_self);
-#ifdef USE_ASSERT_CHECKING
-		numDel++;
-#endif
-	}
-	systable_endscan(sscan);
-
-	Assert(numDel > 0);
-
-	table_close(rel, NoLock);
-}
-
-static void
-add_segment(GpSegConfigEntry *new_segment_information)
-{
-	int16		primary_dbid = new_segment_information->dbid;
-
 	if (new_segment_information->role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
 	{
-		primary_dbid = contentid_get_dbid(new_segment_information->segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false	/* false == current, not
-										    * preferred, role */ );
+		int16		primary_dbid;
+		GpSegConfigEntry *preferred_primary;
+
+		primary_dbid = content_get_primary_dbid(ws,
+												new_segment_information->segindex);
 		if (!primary_dbid)
 			elog(ERROR, "contentid %i does not point to an existing segment",
 				 new_segment_information->segindex);
@@ -333,7 +188,7 @@ add_segment(GpSegConfigEntry *new_segment_information)
 		/*
 		 * no mirrors should be defined
 		 */
-		if (segment_has_mirror(new_segment_information->segindex))
+		if (segment_has_mirror(ws, new_segment_information->segindex))
 			elog(ERROR, "segment already has a mirror defined");
 
 		/*
@@ -341,16 +196,19 @@ add_segment(GpSegConfigEntry *new_segment_information)
 		 * or mirror (no preferred primary -- make this one the preferred
 		 * primary)
 		 */
-		int			preferredPrimaryDbId = contentid_get_dbid(new_segment_information->segindex, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true /* preferred role */ );
+		preferred_primary = GpTopoFindByContentRole(ws,
+													new_segment_information->segindex,
+													GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+													true /* preferred role */ );
 
-		if (preferredPrimaryDbId == 0 && new_segment_information->preferred_role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
+		if (preferred_primary == NULL && new_segment_information->preferred_role == GP_SEGMENT_CONFIGURATION_ROLE_MIRROR)
 		{
 			elog(NOTICE, "override preferred_role of this mirror as primary to support rebalance operation.");
 			new_segment_information->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 		}
 	}
 
-	add_segment_config(new_segment_information);
+	GpTopoInsert(ws, new_segment_information);
 }
 
 /*
@@ -370,6 +228,7 @@ Datum
 gp_add_segment_primary(PG_FUNCTION_ARGS)
 {
 	GpSegConfigEntry	new;
+	GpTopoWriteSet	   *ws;
 
 	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
@@ -389,16 +248,21 @@ gp_add_segment_primary(PG_FUNCTION_ARGS)
 		elog(ERROR, "datadir cannot be NULL");
 	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(3));
 
-	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER, "gp_add_segment_primary");
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER,
+						   "gp_add_segment_primary");
 
-	new.segindex = get_maxcontentid() + 1;
-	new.dbid = get_availableDbId();
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	new.segindex = GpTopoMaxContent(ws) + 1;
+	new.dbid = GpTopoAvailableDbid(ws);
 	new.role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 	new.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
 	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
 	new.status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
 
-	add_segment(&new);
+	add_segment(ws, &new);
+
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_INT16(new.dbid);
 }
@@ -414,6 +278,7 @@ Datum
 gp_add_segment(PG_FUNCTION_ARGS)
 {
 	GpSegConfigEntry new;
+	GpTopoWriteSet *ws;
 
 	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
@@ -457,12 +322,16 @@ gp_add_segment(PG_FUNCTION_ARGS)
 		elog(ERROR, "datadir cannot be NULL");
 	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(9));
 
-	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER, "gp_add_segment");
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER, "gp_add_segment");
 
 	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
 	elog(NOTICE, "mode is changed to GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC under walrep.");
 
-	add_segment(&new);
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	add_segment(ws, &new);
+
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_INT16(new.dbid);
 }
@@ -471,12 +340,15 @@ gp_add_segment(PG_FUNCTION_ARGS)
  * Coordinator function to remove a segment from all catalogs
  */
 static void
-remove_segment(int16 dbid)
+remove_segment(GpTopoWriteSet *ws, int16 dbid)
 {
-	/* Check that the segment exists at all */
-	get_segconfig(dbid);
+	int			numDel PG_USED_FOR_ASSERTS_ONLY;
 
-	remove_segment_config(dbid);
+	/* Check that the segment exists at all */
+	get_segconfig(ws, dbid);
+
+	numDel = GpTopoDelete(ws, dbid);
+	Assert(numDel > 0);
 }
 
 /*
@@ -494,15 +366,21 @@ Datum
 gp_remove_segment(PG_FUNCTION_ARGS)
 {
 	int16		dbid;
+	GpTopoWriteSet *ws;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "dbid cannot be NULL");
 
 	dbid = PG_GETARG_INT16(0);
 
-	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER | UTILITY_MODE,
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER | UTILITY_MODE,
 						   "gp_remove_segment");
-	remove_segment(dbid);
+
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	remove_segment(ws, dbid);
+
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_BOOL(true);
 }
@@ -516,6 +394,7 @@ Datum
 gp_add_segment_mirror(PG_FUNCTION_ARGS)
 {
 	GpSegConfigEntry new;
+	GpTopoWriteSet *ws;
 
 	MemSet(&new, 0, sizeof(GpSegConfigEntry));
 
@@ -539,15 +418,20 @@ gp_add_segment_mirror(PG_FUNCTION_ARGS)
 		elog(ERROR, "datadir cannot be NULL");
 	new.datadir = TextDatumGetCString(PG_GETARG_DATUM(4));
 	
-	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER, "gp_add_segment_mirror");
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER,
+						   "gp_add_segment_mirror");
 
-	new.dbid = get_availableDbId();
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	new.dbid = GpTopoAvailableDbid(ws);
 	new.mode = GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
 	new.status = GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
 	new.role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
 	new.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
 
-	add_segment(&new);
+	add_segment(ws, &new);
+
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_INT16(new.dbid);
 }
@@ -567,36 +451,35 @@ Datum
 gp_remove_segment_mirror(PG_FUNCTION_ARGS)
 {
 	int16		contentid = 0;
-	Relation	rel;
 	int16		pridbid;
 	int16		mirdbid;
+	GpTopoWriteSet *ws;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "dbid cannot be NULL");
 	contentid = PG_GETARG_INT16(0);
 
-	mirroring_sanity_check(COORDINATOR_ONLY | SUPERUSER, "gp_remove_segment_mirror");
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | SUPERUSER,
+						   "gp_remove_segment_mirror");
 
-	/* avoid races */
-	rel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
+	/* the write set's lock is what avoids races here */
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
 
-	pridbid = contentid_get_dbid(contentid, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false /* false == current, not
-								   * preferred, role */ );
+	pridbid = content_get_primary_dbid(ws, contentid);
 
 	if (!pridbid)
 		elog(ERROR, "no dbid for contentid %i", contentid);
 
-	if (!segment_has_mirror(contentid))
+	if (!segment_has_mirror(ws, contentid))
 		elog(ERROR, "segment does not have a mirror");
 
-	mirdbid = contentid_get_dbid(contentid, GP_SEGMENT_CONFIGURATION_ROLE_MIRROR, false	/* false == current, not
-								   * preferred, role */ );
+	mirdbid = content_get_mirror_dbid(ws, contentid);
 	if (!mirdbid)
 		elog(ERROR, "no mirror dbid for contentid %i", contentid);
 
-	remove_segment(mirdbid);
+	remove_segment(ws, mirdbid);
 
-	heap_close(rel, NoLock);
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_BOOL(true);
 }
@@ -623,10 +506,9 @@ gp_add_coordinator_standby_port(PG_FUNCTION_ARGS)
 Datum
 gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 {
-	int			maxdbid;
 	int16		coordinator_dbid;
-	Relation	gprel;
-	GpSegConfigEntry	*config;
+	GpTopoWriteSet *ws;
+	GpSegConfigEntry standby;
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "host name cannot be NULL");
@@ -635,17 +517,19 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(2))
 		elog(ERROR, "datadir cannot be NULL");
 
-	mirroring_sanity_check(COORDINATOR_ONLY | UTILITY_MODE,
+	mirroring_sanity_check(NULL, COORDINATOR_ONLY | UTILITY_MODE,
 						   "gp_add_coordinator_standby");
 
+	/*
+	 * Open the write set before checking whether a standby already exists.
+	 * The check used to run outside the lock that the insert then took, so two
+	 * callers could both find no standby and both add one.
+	 */
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
 	/* Check if the system is ok */
-	if (standby_exists())
+	if (standby_exists(ws))
 		elog(ERROR, "only a single coordinator standby may be defined");
-
-	/* Lock exclusively to avoid concurrent changes */
-	gprel = heap_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-
-	maxdbid = get_maxdbid();
 
 	/*
 	 * Don't reference GpIdentity.dbid, as it is legitimate to set -1 for -b
@@ -653,31 +537,36 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 	 * GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY is the definition of primary
 	 * coordinator.
 	 */
-	coordinator_dbid = contentid_get_dbid(COORDINATOR_CONTENT_ID,
-									 GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, false);
-	config = get_segconfig(coordinator_dbid);
+	coordinator_dbid = content_get_primary_dbid(ws, COORDINATOR_CONTENT_ID);
 
-	config->dbid = maxdbid + 1;
-	config->role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
-	config->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
-	config->mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
-	config->status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
+	/*
+	 * The standby starts as a copy of the coordinator's entry -- by value.
+	 * Editing the coordinator's own entry in place would make the diff rewrite
+	 * the coordinator's row as well as adding the standby's.
+	 */
+	standby = *get_segconfig(ws, coordinator_dbid);
 
-	config->hostname = TextDatumGetCString(PG_GETARG_TEXT_P(0));
+	standby.dbid = GpTopoMaxDbid(ws) + 1;
+	standby.role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	standby.preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_MIRROR;
+	standby.mode = GP_SEGMENT_CONFIGURATION_MODE_INSYNC;
+	standby.status = GP_SEGMENT_CONFIGURATION_STATUS_UP;
 
-	config->address = TextDatumGetCString(PG_GETARG_TEXT_P(1));
+	standby.hostname = TextDatumGetCString(PG_GETARG_TEXT_P(0));
 
-	config->datadir = TextDatumGetCString(PG_GETARG_TEXT_P(2));
-	
+	standby.address = TextDatumGetCString(PG_GETARG_TEXT_P(1));
+
+	standby.datadir = TextDatumGetCString(PG_GETARG_TEXT_P(2));
+
 	/* Use the new port number if specified */
 	if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
-		config->port = PG_GETARG_INT32(3);
+		standby.port = PG_GETARG_INT32(3);
 
-	add_segment_config(config);
-	
-	heap_close(gprel, NoLock);
+	GpTopoInsert(ws, &standby);
 
-	PG_RETURN_INT16(config->dbid);
+	GpTopoCommitWrite(ws);
+
+	PG_RETURN_INT16(standby.dbid);
 }
 
 /*
@@ -691,69 +580,46 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 Datum
 gp_remove_coordinator_standby(PG_FUNCTION_ARGS)
 {
-	int16		dbid = coordinator_standby_dbid();
+	int16		dbid;
+	GpTopoWriteSet *ws;
 
-	mirroring_sanity_check(SUPERUSER | COORDINATOR_ONLY | UTILITY_MODE,
+	mirroring_sanity_check(NULL, SUPERUSER | COORDINATOR_ONLY | UTILITY_MODE,
 						   "gp_remove_coordinator_standby");
+
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	dbid = content_get_mirror_dbid(ws, COORDINATOR_CONTENT_ID);
 
 	if (!dbid)
 		elog(ERROR, "no coordinator standby defined");
 
-	remove_segment(dbid);
+	remove_segment(ws, dbid);
+
+	GpTopoCommitWrite(ws);
 
 	PG_RETURN_BOOL(true);
 }
 
 static void
-segment_config_activate_standby(int16 standby_dbid, int16 coordinator_dbid)
+segment_config_activate_standby(GpTopoWriteSet *ws, int16 standby_dbid,
+								int16 coordinator_dbid)
 {
-	/* we use AccessExclusiveLock to prevent races */
-	Relation	rel = table_open(GpSegmentConfigRelationId, AccessExclusiveLock);
-	HeapTuple	tuple;
-	ScanKeyData scankey;
-	SysScanDesc sscan;
-	int			numDel = 0;
+	GpSegConfigEntry *standby;
 
 	/* first, delete the old coordinator */
-	ScanKeyInit(&scankey,
-				Anum_gp_segment_configuration_dbid,
-				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(coordinator_dbid));
-	sscan = systable_beginscan(rel, GpSegmentConfigDbidIndexId, true,
-							   NULL, 1, &scankey);
-	while ((tuple = systable_getnext(sscan)) != NULL)
-	{
-		CatalogTupleDelete(rel, &tuple->t_self);
-		numDel++;
-	}
-	systable_endscan(sscan);
-
-	if (0 == numDel)
+	if (GpTopoDelete(ws, coordinator_dbid) == 0)
 		elog(ERROR, "cannot find old coordinator, dbid %i", coordinator_dbid);
 
 	/* now, set out rows for old standby. */
-	ScanKeyInit(&scankey,
-				Anum_gp_segment_configuration_dbid,
-				BTEqualStrategyNumber, F_INT2EQ,
-				Int16GetDatum(standby_dbid));
-	sscan = systable_beginscan(rel, GpSegmentConfigDbidIndexId, true,
-							   NULL, 1, &scankey);
+	standby = GpTopoFindByDbid(ws, standby_dbid);
 
-	tuple = systable_getnext(sscan);
-
-	if (!HeapTupleIsValid(tuple))
+	if (standby == NULL)
 		elog(ERROR, "cannot find standby, dbid %i", standby_dbid);
 
-	tuple = heap_copytuple(tuple);
 	/* old standby keeps its previous dbid. */
-	((Form_gp_segment_configuration) GETSTRUCT(tuple))->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-	((Form_gp_segment_configuration) GETSTRUCT(tuple))->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
-
-	CatalogTupleUpdate(rel, &tuple->t_self, tuple);
-
-	systable_endscan(sscan);
-
-	table_close(rel, NoLock);
+	standby->role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	standby->preferred_role = GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY;
+	GpTopoUpdate(ws, standby);
 }
 
 /*
@@ -767,8 +633,21 @@ gp_activate_standby(void)
 {
 	int16		standby_dbid = GpIdentity.dbid;
 	int16		coordinator_dbid;
+	GpTopoWriteSet *ws;
+	GpSegConfigEntry *coordinator;
 
-	coordinator_dbid = contentid_get_dbid(COORDINATOR_CONTENT_ID, GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY, true);
+	/*
+	 * Runs in the startup process on the promotion path, where the write set
+	 * is the whole of what this function may touch: no dispatcher, no FTS, and
+	 * a relcache with only what UpdateCatalogForStandbyPromotion()'s
+	 * transaction has opened.
+	 */
+	ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_SERIALIZED);
+
+	coordinator = GpTopoFindByContentRole(ws, COORDINATOR_CONTENT_ID,
+										  GP_SEGMENT_CONFIGURATION_ROLE_PRIMARY,
+										  true);
+	coordinator_dbid = coordinator ? coordinator->dbid : 0;
 
 	/*
 	 * This call comes from Startup process post checking state in pg_control
@@ -793,13 +672,16 @@ gp_activate_standby(void)
 		ereport(LOG,
 				(errmsg("standby activation: dbid %d is already the coordinator in gp_segment_configuration; nothing to do",
 						standby_dbid)));
+		GpTopoEndWrite(ws, false);
 		return true;
 	}
 
-	mirroring_sanity_check(SUPERUSER | UTILITY_MODE | STANDBY_ONLY,
+	mirroring_sanity_check(ws, SUPERUSER | UTILITY_MODE | STANDBY_ONLY,
 						   PG_FUNCNAME_MACRO);
 
-	segment_config_activate_standby(standby_dbid, coordinator_dbid);
+	segment_config_activate_standby(ws, standby_dbid, coordinator_dbid);
+
+	GpTopoCommitWrite(ws);
 
 	/* done */
 	return true;
