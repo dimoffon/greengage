@@ -183,6 +183,22 @@ extern void GpTopologyProviderStartup(void);
 extern GpSegConfigEntry *GpTopologyGetAll(MemoryContext cxt, int *nentries);
 
 /*
+ * Lookups over an array of entries, as returned by GpTopologyGetAll().  A
+ * reader that never opens a write set uses these directly; the write-set verbs
+ * further down are these same two applied to ws->work.
+ *
+ * The array is scanned linearly.  Topologies are tens of entries, and the
+ * alternative -- an index probe -- is the thing that ties a caller to one
+ * storage backend.
+ */
+extern GpSegConfigEntry *GpTopoArrayFindByDbid(GpSegConfigEntry *entries,
+											   int nentries, int16 dbid);
+extern GpSegConfigEntry *GpTopoArrayFindByContentRole(GpSegConfigEntry *entries,
+													  int nentries, int16 content,
+													  char role,
+													  bool preferredNotCurrent);
+
+/*
  * Refresh the active provider's out-of-transaction copy of the topology.
  * FTS-only, and a no-op under a provider that does not keep one.
  */
@@ -219,7 +235,8 @@ extern void GpTopoEndWrite(GpTopoWriteSet *ws, bool commit);
 extern void GpTopoCommitWrite(GpTopoWriteSet *ws);
 
 /*
- * Verbs over ws->work.  None of them touch storage.
+ * Verbs over ws->work.  None of them touch storage.  The two find verbs are
+ * the array lookups above, applied to the working copy.
  *
  * A caller that replaces one of the three string fields must allocate the
  * replacement in ws->cxt; the entries handed out here point into the write

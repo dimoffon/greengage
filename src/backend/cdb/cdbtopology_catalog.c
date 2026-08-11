@@ -354,20 +354,6 @@ catalog_begin_write(GpTopoWriteSet *ws)
 	ws->gen = 0;
 }
 
-static GpSegConfigEntry *
-catalog_find_dbid(GpSegConfigEntry *entries, int nentries, int16 dbid)
-{
-	int			i;
-
-	for (i = 0; i < nentries; i++)
-	{
-		if (entries[i].dbid == dbid)
-			return &entries[i];
-	}
-
-	return NULL;
-}
-
 static bool
 catalog_str_differs(const char *a, const char *b)
 {
@@ -543,7 +529,7 @@ catalog_persist(GpTopoWriteSet *ws)
 
 	for (i = 0; i < ws->norig; i++)
 	{
-		if (catalog_find_dbid(ws->work, ws->nwork, ws->orig[i].dbid) == NULL)
+		if (GpTopoArrayFindByDbid(ws->work, ws->nwork, ws->orig[i].dbid) == NULL)
 			catalog_delete_dbid(rel, ws->orig[i].dbid);
 	}
 
@@ -551,14 +537,14 @@ catalog_persist(GpTopoWriteSet *ws)
 	{
 		GpSegConfigEntry *work;
 
-		work = catalog_find_dbid(ws->work, ws->nwork, ws->orig[i].dbid);
+		work = GpTopoArrayFindByDbid(ws->work, ws->nwork, ws->orig[i].dbid);
 		if (work != NULL)
 			catalog_update_entry(rel, &ws->orig[i], work);
 	}
 
 	for (i = 0; i < ws->nwork; i++)
 	{
-		if (catalog_find_dbid(ws->orig, ws->norig, ws->work[i].dbid) == NULL)
+		if (GpTopoArrayFindByDbid(ws->orig, ws->norig, ws->work[i].dbid) == NULL)
 			catalog_insert_entry(rel, &ws->work[i]);
 	}
 

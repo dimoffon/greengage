@@ -351,19 +351,19 @@ GpTopoCommitWrite(GpTopoWriteSet *ws)
 
 
 /* ----------------------------------------------------------------
- *			verbs over the working copy
+ *				lookups over a topology array
  * ----------------------------------------------------------------
  */
 
 GpSegConfigEntry *
-GpTopoFindByDbid(GpTopoWriteSet *ws, int16 dbid)
+GpTopoArrayFindByDbid(GpSegConfigEntry *entries, int nentries, int16 dbid)
 {
 	int			i;
 
-	for (i = 0; i < ws->nwork; i++)
+	for (i = 0; i < nentries; i++)
 	{
-		if (ws->work[i].dbid == dbid)
-			return &ws->work[i];
+		if (entries[i].dbid == dbid)
+			return &entries[i];
 	}
 
 	return NULL;
@@ -372,22 +372,21 @@ GpTopoFindByDbid(GpTopoWriteSet *ws, int16 dbid)
 /*
  * Find the one entry serving `content` in `role`, current or preferred.
  *
- * Keeps contentid_get_dbid()'s semantics exactly, including that a miss is not
- * an error -- half of segadmin's callers test the result for zero and raise
- * their own message.  The single-match assertion is the (content,
+ * A miss is not an error -- half of segadmin's callers test the result and
+ * raise their own message.  The single-match assertion is the (content,
  * preferred_role) unique index restated for the current-role lookup, which has
  * no index behind it.
  */
 GpSegConfigEntry *
-GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 content, char role,
-						bool preferredNotCurrent)
+GpTopoArrayFindByContentRole(GpSegConfigEntry *entries, int nentries,
+							 int16 content, char role, bool preferredNotCurrent)
 {
 	GpSegConfigEntry *found = NULL;
 	int			i;
 
-	for (i = 0; i < ws->nwork; i++)
+	for (i = 0; i < nentries; i++)
 	{
-		GpSegConfigEntry *e = &ws->work[i];
+		GpSegConfigEntry *e = &entries[i];
 		char		r = preferredNotCurrent ? e->preferred_role : e->role;
 
 		if (e->segindex == content && r == role)
@@ -398,6 +397,26 @@ GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 content, char role,
 	}
 
 	return found;
+}
+
+
+/* ----------------------------------------------------------------
+ *			verbs over the working copy
+ * ----------------------------------------------------------------
+ */
+
+GpSegConfigEntry *
+GpTopoFindByDbid(GpTopoWriteSet *ws, int16 dbid)
+{
+	return GpTopoArrayFindByDbid(ws->work, ws->nwork, dbid);
+}
+
+GpSegConfigEntry *
+GpTopoFindByContentRole(GpTopoWriteSet *ws, int16 content, char role,
+						bool preferredNotCurrent)
+{
+	return GpTopoArrayFindByContentRole(ws->work, ws->nwork, content, role,
+										preferredNotCurrent);
 }
 
 /*
