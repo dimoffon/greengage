@@ -67,6 +67,4 @@ CATALOG(gp_segment_configuration,5036,GpSegmentConfigRelationId) BKI_SHARED_RELA
  */
 typedef FormData_gp_segment_configuration *Form_gp_segment_configuration;
 
-extern bool gp_segment_config_has_mirrors(void);
-
 #endif /*_GP_SEGMENT_CONFIGURATION_H_*/

@@ -23,7 +23,7 @@ OBJS = catalog.o dependency.o heap.o index.o indexing.o namespace.o aclchk.o \
 
 OBJS += pg_extprotocol.o \
        pg_proc_callback.o \
-       aoseg.o aoblkdir.o gp_fastsequence.o gp_segment_config.o \
+       aoseg.o aoblkdir.o gp_fastsequence.o \
        pg_attribute_encoding.o pg_compression.o aovisimap.o \
        pg_appendonly.o \
        oid_dispatch.o aocatalog.o storage_tablespace.o storage_database.o \

@@ -376,8 +376,6 @@ void FtsLoop()
 
 		cdbs = readCdbComponentInfoAndUpdateStatus();
 
-		/* Check here gp_segment_configuration if has mirror's */
-
 		/* close the transaction we started above */
 		CommitTransactionCommand();
 
