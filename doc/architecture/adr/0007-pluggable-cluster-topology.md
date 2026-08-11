@@ -1,8 +1,7 @@
 # ADR-0007: Cluster Topology Behind a Pluggable Store
 
-- **Status:** Accepted — implemented on branch `7.x-dr` through phase P6. P7 (deleting the
-  redo filter) and P8 (inverting the dense fixture) are planned and not yet done; the
-  sections that describe them say so.
+- **Status:** Accepted — implemented on branch `7.x-dr` through phase P7. P8 (inverting the
+  dense fixture) is planned and not yet done; the section that describes it says so.
 - **Date:** 2026-08-11
 - **Relates to:** [ADR-0006](0006-dr-read-replica.md) — this record is the reason several
   of ADR-0006's mechanisms are expected to be deleted rather than maintained.
@@ -331,8 +330,47 @@ that returns nothing looks exactly like a topology with nothing in it.
 | P4 | The `file` provider, `gg_topology`, `initdb` | Done |
 | P5 | The view, the catalog rename, `gp_update_segment_mode_status()` | Done |
 | P6 | DR switches to `file`; the frozen seed deleted | Done |
-| P7 | Delete the redo filter | Not started |
+| P7 | Delete the redo filter | Done |
 | P8 | Invert the dense fixture | Not started |
+
+### D10 — the redo filter is deleted, and T6 is what says it was safe (P7)
+
+`dr_redo_filter.{c,h}` and its test are gone, the redo hook in `xlog.c` collapses back to an
+unconditional `rm_redo()` + `checkXLogConsistency()`, and the `relmapper.c` remap guard and
+`storage.c` truncate guard go with them. The replica now replays production's WAL in full —
+including `gp_segment_configuration_internal` and `gp_configuration_history`.
+
+**The two halves are true at once, and that is the design.** The fixture asserts both: the
+replica serves `dr` (T1, T2) *and* its catalog carries production's replayed change (T3).
+Under P6 the second was false, because the filter was still blocking that record.
+
+**T6 is the acceptance test.** Production runs `wal_consistency_checking = 'all'`, so every
+record carries a full-page image and the replica compares its own page against production's
+after redo; a mismatch is a `FATAL` naming the relation and block (`xlog.c:1545`). Measured:
+1043 full-page images in the first WAL segment alone, zero inconsistencies across all three
+nodes. This could not be run before — the filter skipped the consistency check alongside
+redo, so agreement proved nothing about the records being skipped. That is why the deletion
+needed its own acceptance test rather than a green suite.
+
+**What was deliberately kept.** `IsDRReplicaMode()` and every non-filter consumer:
+read-only enforcement, the served-snapshot capture, the DTM backstop, the visibility-map
+bypass, promote-in-place. `gg_walfilter` keeps its generic rules, `wf_apply_relmap_update()`
+and `wf_truncate_*()`; only the Greengage-specific `--gp-dr-topology` preset goes. That
+preset was the sole setter of `rules.remap_guard`, so deleting it would have made the guard
+unreachable — it is now `--halt-on-remap`, and the two test classes that exercised it are
+repointed rather than deleted.
+
+**`gp_id` no longer needs protection, and nobody should re-add it.** It was on the protected
+list because a replica whose `gp_id` was overwritten would report production's dbid. Nothing
+reads `gp_id` for topology any more — `gg_stat_dr_replica` uses it only through
+`gp_dist_random('gp_id')`, which relies on the "exactly one row per node" contract, and that
+contract is a property of the relation, not of who wrote it last.
+
+**What the new design does not protect.** After promotion the replica's
+`gp_segment_configuration_internal` holds production's replayed rows, so anyone flipping a
+promoted DR back to `gp_topology_source = catalog` gets a cluster describing production.
+`create-replica` arms `file` in `postgresql.conf` so it survives promotion, which is the
+mitigation; the failure needs a deliberate configuration change to reach.
 
 ### D9 — the DR replica keeps its topology in a file, and the seed is gone (P6)
 
@@ -362,10 +400,26 @@ Three details are worth keeping:
   check (`unsync_guc_name.h`), so a half-armed cluster comes up silently, and a segment
   left holding production's entries would start describing the wrong cluster the moment the
   replica is promoted and FTS begins writing. Writing and arming happen in one loop.
-- **Nothing writes the store while the replica is in recovery.** `file_persist()` is
-  reachable only from segadmin and FTS, and FTS is a `BgWorkerStart_DtxRecovering` worker,
-  which `bgworker_should_start_now()` grants only in `PM_RUN` — never `PM_HOT_STANDBY`. The
-  store starts being maintained at promotion, which is exactly right.
+- **Nothing writes the store while the replica is in recovery — but that had to be made
+  true, it was not.** FTS is fine on its own: it is a `BgWorkerStart_DtxRecovering` worker,
+  which `bgworker_should_start_now()` grants only in `PM_RUN`, never `PM_HOT_STANDBY`. The
+  first version of this record stopped there and was wrong. `file_persist()` is also
+  reachable from segadmin's SQL functions, and those are plain `CMD_SELECT`s that
+  `ExecCheckXactReadOnly()` lets through — so `SELECT gp_update_segment_mode_status(...)`
+  on a read-only replica durably rewrote `$PGDATA/gp_topology`.
+
+  The catalog provider had refused it, but only as a side effect: writing a catalog needs
+  an XID and `GetNewTransactionId()` refuses one during recovery. A file needs no XID, so
+  moving the topology out of the catalog silently dropped a safety property nobody had
+  written down. `GpTopoBeginWrite()` now refuses outright when `RecoveryInProgress()`, which
+  puts the rule where it covers every provider and every caller instead of falling out of
+  one implementation. It does not block promotion: `gp_activate_standby()` runs from
+  `UpdateCatalogForStandbyPromotion()` (`xlog.c:8568`), after `SharedRecoveryState` becomes
+  `RECOVERY_STATE_DONE` (`xlog.c:8505`).
+
+  Found by adversarial review, not by writing this paragraph — which is the point of
+  running one. The fixture now asserts both halves: the write is refused, *and* the store
+  is still at generation 1 afterwards.
 
 **What P6 proves, and what it does not.** The plan expected one green fixture pass with the
 filter still compiled in to show the DR no longer depends on it. It does not: a pass with

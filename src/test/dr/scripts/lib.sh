@@ -31,7 +31,10 @@ die() { echo "[$(date +%H:%M:%S)] [$(hostname)] ERROR: $*" >&2; exit 1; }
 ensure_gpadmin() {
 	if [ "$(id -un)" = root ]; then
 		setup_container
-		exec su - gpadmin -c "exec env GPHOME=$GPHOME bash $0"
+		# su - starts a login shell with a clean environment, so anything the
+		# entrypoints read has to be listed here or it silently arrives unset.
+		exec su - gpadmin -c "exec env GPHOME=$GPHOME \
+			WAL_CONSISTENCY_CHECKING='${WAL_CONSISTENCY_CHECKING:-all}' bash $0"
 	fi
 	# As gpadmin from here on.
 	source "$GPHOME/greengage_path.sh"

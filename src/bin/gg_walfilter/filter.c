@@ -251,13 +251,18 @@ wf_truncate_target(WfSegment *seg, const WfRecord *rec, RelFileNode *rnode,
 /*
  * Does this XLOG_SMGR_TRUNCATE target a relation the rules protect?
  *
- * This mirrors the backend's DRRedoShouldFilterRelFileNode(), which smgr_redo()
- * consults for exactly this record (src/backend/access/transam/dr_redo_filter.c).
- * Without it, an upstream VACUUM that truncates a protected topology catalog
- * would truncate the replica's own copy -- which holds the replica's seeded rows
- * and legitimately has a different page count, so upstream's truncation point
- * does not apply to it.  Keeping this tool's decision identical to the backend's
- * is the point of the tool, so the rule is mirrored rather than approximated.
+ * XLOG_SMGR_TRUNCATE names its relation in the payload rather than in a block
+ * reference, so the block-reference rules cannot see it.  Without this, an
+ * upstream VACUUM that truncates a protected relation would truncate the
+ * replica's copy -- which the rules exist to keep different, and which
+ * legitimately has its own page count, so upstream's truncation point does not
+ * apply to it.
+ *
+ * The backend had the same rule until P7, in smgr_redo() via
+ * DRRedoShouldFilterRelFileNode(); it went with the rest of the DR redo filter
+ * once the cluster topology stopped living in a replicated catalog.  This tool
+ * keeps it because its rules are caller-supplied and may still name a relation
+ * the caller wants left alone.
  */
 static bool
 wf_truncate_matches(WfSegment *seg, const WfRules *rules, const WfRecord *rec)

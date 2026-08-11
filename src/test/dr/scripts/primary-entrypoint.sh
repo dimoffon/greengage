@@ -35,6 +35,14 @@ wal_level = replica
 archive_mode = on
 archive_timeout = 30
 archive_command = 'test ! -f $WAL_ARCHIVE/seg%c/%f && cp %p $WAL_ARCHIVE/seg%c/%f'
+# T6, the acceptance test for deleting the DR redo filter.  Every record carries
+# a full-page image, and the replica compares its own page against production's
+# after redo -- so the whole run is a byte-level proof that the DR applies
+# production's WAL in full.  This was uninterpretable while the filter existed:
+# it skipped checkXLogConsistency() alongside redo, so agreement proved nothing
+# about the records it was skipping.  Costs WAL volume, which on a fixture this
+# size is not worth optimising.
+wal_consistency_checking = '${WAL_CONSISTENCY_CHECKING:-all}'
 EOF
 	fi
 done < <(list_instances)
@@ -68,16 +76,17 @@ touch "$READY_MARKER"
 log "primary: ready (base backups + topology published, archiving live)"
 
 # Create a user table AFTER the base backup, so it exists only in the WAL the DR
-# replays -- proving the redo filter is SELECTIVE: valid (non-topology) changes
-# ARE applied on the DR; only the protected topology catalogs are skipped.
+# replays -- half of T3, which asserts the DR applies production's WAL in full.
 sleep 3
 psql -p "$PORT_BASE" -d postgres -q -c \
 	"create table dr_wal_applied (id int, note text) distributed by (id);
 	 insert into dr_wal_applied values (1, 'created on production AFTER the base backup');" || true
 log "primary: created table dr_wal_applied (post-base-backup; DR must replay it via WAL)"
 
-# --- generate WAL that changes the protected topology catalog, to exercise the
-#     DR redo filter. The DR replica must NOT pick this change up. ---
+# --- generate WAL that changes the topology CATALOG.  The DR replays that record
+#     like any other (nothing filters it as of P7) and so its catalog carries
+#     production's value -- while the topology it actually serves, which lives in
+#     its own $PGDATA/gp_topology, does not.  T1 and T3 assert both halves. ---
 #
 # We change seg0's *hostname*, NOT its port/address.  The coordinator connects to
 # a segment by `address` (resolved to hostaddr) + `port` (cdbconn.c); `hostname`
@@ -85,7 +94,7 @@ log "primary: created table dr_wal_applied (post-base-backup; DR must replay it 
 # -- an earlier version bumped the port, which pointed the coordinator at a port
 # the segment wasn't listening on and broke production's own query dispatch.
 sleep 5
-log "primary: changing gp_segment_configuration (seg0 hostname) to test the DR filter"
+log "primary: changing the topology catalog (seg0 hostname) -- the DR must replay it and still not serve it"
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q -c \
 	"update gp_segment_configuration_internal set hostname = 'prod-seg0-CHANGED' where content = 0;" || true
@@ -93,6 +102,16 @@ PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	echo "PRODUCTION_SEG0_HOSTNAME=$(psql -p "$PORT_BASE" -d postgres -Atc "select hostname from gp_segment_configuration where content=0;")"
 	echo "PRODUCTION_CHANGE_LSN=$(psql -p "$PORT_BASE" -d postgres -Atc "select pg_current_wal_lsn();")"
 } > "$ARCHIVE/primary_expected.env"
+
+# T5: write a row to gp_configuration_history, the other shared catalog the old
+# design protected.  Nothing protects it now, and nothing needs to: the DR does
+# not read it, and carrying production's history across is the more useful
+# behaviour.  The DR asserts it sees this exact row, which is what catches anyone
+# re-adding protection out of habit.
+PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
+	psql -p "$PORT_BASE" -d postgres -q -c \
+	"insert into gp_configuration_history values (now(), 0, 'T5 marker: written on production after the base backup');" || true
+log "primary: wrote a gp_configuration_history marker row (the DR must replay it)"
 
 # Prove production still dispatches after the change (the point of using hostname).
 if psql -p "$PORT_BASE" -d postgres -Atc "select count(*) from dr_marker;" >/dev/null 2>&1; then

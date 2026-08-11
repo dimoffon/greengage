@@ -1,9 +1,10 @@
 # Greengage DR — docker test environment
 
 A minimal, dependency-light test for the disaster-recovery (DR) read-replica
-feature — milestones **M1** (apply-time topology redo filter), **M2** (read-only
-enforcement on a live, in-recovery DR coordinator), and **M4** (frozen seed of
-DR-local topology that survives resuming production's WAL). Two single-host
+feature — **T1–T6** (the replica's topology is its own, and its replay of
+production's WAL is unrestricted), **M2** (read-only enforcement on a live,
+in-recovery DR coordinator), and **M4** (building the replica with
+`ggdr create-replica`). Two single-host
 Greengage demo clusters run in separate containers that share a `/archive`
 volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
 `archive_command`, the DR cluster reads it back with `restore_command`.
@@ -13,7 +14,7 @@ volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
  ┌─ primary ───────────────┐                         ┌─ dr ──────────────────────────┐
  │ demo cluster            │   archive_command  cp    │ restored from primary's base  │
  │ (coordinator + 1 seg)   │ ───────────────────────▶ │ backup; hot_standby=on;       │
- │ archive_mode=on         │   /archive/wal/seg%c/    │ frozen-seeded topology;       │
+ │ archive_mode=on         │   /archive/wal/seg%c/    │ own gp_topology store;        │
  │ base-backups itself ───▶│   /archive/basebackup/   │ restore_command  cp  ◀────────│
  │ then changes topology   │                          │ continuous recovery           │
  └─────────────────────────┘                          └───────────────────────────────┘
@@ -132,9 +133,9 @@ of reporting a pass, so an inconclusive run can never look green.
 
 ## Notes / status
 
-- This is a PoC fixture. It verifies **M1** (topology redo filter), **M2**
-  (read-only enforcement + coordinator-only reads in recovery), and **M4** (the
-  frozen seed surviving WAL resume). The DR coordinator serves only
+- This is a PoC fixture. It verifies **T1–T6** (topology independence and
+  unrestricted replay), **M2** (read-only enforcement + coordinator-only reads in
+  recovery), and **M4** (building the replica). The DR coordinator serves only
   *coordinator-only* (catalog / entry-DB-singleton) reads; dispatching a
   distributed read-only query to reader-only gangs is the separate **M2′**
   milestone, and consistent as-of reads are **M3** — neither is exercised here.
@@ -148,6 +149,18 @@ of reporting a pass, so an inconclusive run can never look green.
   to freeze and nothing to protect. With it went `ggseed_dr_topology`, the
   `DR_SEED` knob, the `backup_label`/`pg_control` save-restore, the backup-tail
   WAL re-fetch, the permanent-timeline-fork hazard those existed to contain, and
-  the `VACUUM FREEZE` `pg_class` LSN-shadowing caveat. The apply-time redo filter
-  is still compiled in and still fires; it now protects a catalog nobody reads,
-  and P7 deletes it.
+  the `VACUUM FREEZE` `pg_class` LSN-shadowing caveat.
+- **The apply-time redo filter is gone too** (P7). `dr_redo_filter.{c,h}`, the
+  redo hook, the `relmapper.c` remap guard and the `storage.c` truncate guard are
+  deleted: with the topology outside the WAL there is nothing left to protect.
+  The replica now replays production's WAL in full, including
+  `gp_segment_configuration_internal` and `gp_configuration_history` — T3 and T5
+  assert exactly that. `gg_walfilter` keeps its generic rules and its remap guard,
+  now reachable as `--halt-on-remap` rather than through the deleted
+  `--gp-dr-topology` preset.
+- **T6 is the acceptance test for that deletion.** Production runs with
+  `wal_consistency_checking` (env `WAL_CONSISTENCY_CHECKING`, default `all`), so
+  every record carries a full-page image and the replica compares its own page
+  against production's after redo. It could not be run before: the filter skipped
+  the consistency check alongside redo, so agreement proved nothing about the
+  records being skipped.

@@ -30,6 +30,12 @@ services:
   primary:
     <<: *gpdb
     hostname: primary
+    environment:
+      # T6: production stamps a full-page image into every WAL record and the DR
+      # compares its own page against it after redo.  With the topology redo
+      # filter gone (P7) that makes the whole run a byte-level proof that the
+      # replica applies production's WAL in full.  Set to '' to turn it off.
+      WAL_CONSISTENCY_CHECKING: "all"
     command: ["/dr/scripts/primary-entrypoint.sh"]
 
   dr:

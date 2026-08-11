@@ -2,7 +2,8 @@
 # dr-entrypoint.sh -- build the DR cluster with `ggdr create-replica`
 # (restore base backups + write the DR-local topology store + arm DR mode + start
 # every node in continuous archive recovery), then run the milestone regression suite:
-# M1 (topology store) / M2 (read-only) / M2' (distributed read) / M3 (stop-and-go) /
+# T1-T6 (topology store + unrestricted replay) / M2 (read-only) / M2' (distributed
+# read) / M3 (stop-and-go) /
 # M5 (observability), the ggdr switch/pause/stats utility test, and finally
 # the SQL recovery-control test (gg_dr_switch / gg_dr_promote -> online read-write).
 set -euo pipefail
@@ -126,50 +127,89 @@ refused() {  # $1=label  $2=sql -- assert the statement is refused on the DR rep
 	fi
 }
 
-echo "================ M1 + M2 assertions on the LIVE DR coordinator (in recovery) ================"
-# M1: production changed seg0 hostname to $PRODUCTION_SEG0_HOSTNAME; the DR must not
-# show it.  Under the file provider this is no longer the redo filter's doing -- the
-# topology the DR serves lives in $PGDATA/gp_topology, which production's WAL cannot
-# reach at all.
+echo "================ T1-T6 + M2 assertions on the LIVE DR coordinator (in recovery) ================"
+# T1 topology independence: production changed seg0's hostname to
+# $PRODUCTION_SEG0_HOSTNAME after the base backup.  The DR must not show it -- not
+# because anything filters that record (nothing does, as of P7), but because the
+# topology the DR serves lives in $PGDATA/gp_topology, which production's WAL
+# cannot reach.
 drhost=$(q "select hostname from gp_segment_configuration where content=0;")
 if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
-	ok_ "M1 topology store: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
+	ok_ "T1 topology independence: DR seg0 hostname still '$drhost' (production changed it to '$PRODUCTION_SEG0_HOSTNAME')"
 else
-	no_ "M1 topology store: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
+	no_ "T1 topology independence: DR seg0 hostname='$drhost', production='$PRODUCTION_SEG0_HOSTNAME'"
 fi
-# M4: create-replica writes the DR-local topology into every node's own store, so the
-# DR carries a genuinely DR-LOCAL hostname ('dr') -- topology independence, not merely
-# "ignored production's change".
+# T2 topology is DR-local: not merely "ignored production's change" -- the value is
+# one only this cluster ever had.
 if [ "$drhost" = "dr" ]; then
-	ok_ "M4 topology store: DR seg0 has DR-LOCAL hostname 'dr' (independent of production)"
+	ok_ "T2 topology is DR-local: DR seg0 hostname is 'dr'"
 else
-	no_ "M4 topology store: DR seg0 hostname='$drhost' (expected DR-local 'dr')"
+	no_ "T2 topology is DR-local: DR seg0 hostname='$drhost' (expected 'dr')"
 fi
-# M4': and it is the FILE that says so.
-drsrc=$(q "show gp_topology_source;")
-if [ "$drsrc" = "file" ]; then
-	ok_ "M4' the DR coordinator is running the file topology provider"
-else
-	no_ "M4' gp_topology_source='$drsrc' on the DR coordinator (expected 'file')"
-fi
-# P6 PROOF: the DR no longer depends on the shared catalog for its topology.  Nothing
-# seeds gp_segment_configuration_internal any more, so it still holds the rows that
-# came in the base backup -- PRODUCTION's.  The replica serves DR-local topology
-# anyway, which is exactly the independence the redo filter used to buy.  When the
-# filter goes (P7) this assertion does not change; only the values in the catalog do.
+# T3 replay is unrestricted, part 1: the catalog production's WAL writes is the one
+# the DR now ignores, so it holds PRODUCTION's rows -- including, as of P7, the
+# change T1 just proved the DR does not serve.  Both statements are true at once,
+# and that is the whole point: replay is complete, and topology is separate.
 cathost=$(q "select hostname from gp_segment_configuration_internal where content=0;")
-if [ -n "$cathost" ] && [ "$cathost" != "dr" ]; then
-	ok_ "P6 independence: the catalog still says '$cathost' (production's) while the replica serves 'dr'"
+if [ "$cathost" = "$PRODUCTION_SEG0_HOSTNAME" ]; then
+	ok_ "T3 replay is unrestricted: the catalog replayed production's change to '$cathost' while the replica serves '$drhost'"
+elif [ -n "$cathost" ] && [ "$cathost" != "dr" ]; then
+	no_ "T3 replay is unrestricted: catalog seg0 hostname='$cathost', expected production's '$PRODUCTION_SEG0_HOSTNAME' (was the record filtered?)"
 else
-	no_ "P6 independence: gp_segment_configuration_internal seg0 hostname='$cathost' (expected production's, not 'dr')"
+	no_ "T3 replay is unrestricted: catalog seg0 hostname='$cathost' (expected production's, not 'dr')"
 fi
-# M1 (selective): a user table created on production AFTER the base backup must
-# appear on the DR via WAL replay -- the filter only skips protected catalogs,
-# it applies everything else.
+# T3, part 2: a user table created on production AFTER the base backup must appear
+# on the DR via WAL replay.
 if [ "$(q "select count(*) from pg_class where relname = 'dr_wal_applied';")" = 1 ]; then
-	ok_ "M1 selective: user table 'dr_wal_applied' (created post-backup on production) replayed onto the DR catalog"
+	ok_ "T3 replay is unrestricted: user table 'dr_wal_applied' (created post-backup) replayed onto the DR"
 else
-	no_ "M1 selective: user table 'dr_wal_applied' NOT present on the DR (valid change not applied)"
+	no_ "T3 replay is unrestricted: user table 'dr_wal_applied' NOT present on the DR"
+fi
+# T4: every node -- not just the coordinator -- runs the file provider.  A node left
+# on 'catalog' would describe production, and gp_topology_source is exempt from the
+# QD/QE GUC-sync check, so nothing else would say so.
+t4_bad=
+for content in $ALL_CONTENTS; do
+	src=$(PGOPTIONS='-c gp_role=utility' psql -p "${DR_PORT[$content]}" -d postgres -Atc "show gp_topology_source;" 2>/dev/null)
+	[ "$src" = "file" ] || t4_bad="$t4_bad content=$content:'${src:-<unreachable>}'"
+done
+if [ -z "$t4_bad" ]; then
+	ok_ "T4 every node reports gp_topology_source=file"
+else
+	no_ "T4 nodes not on the file provider:$t4_bad"
+fi
+# T5: gp_configuration_history IS replayed now.  It used to be protected alongside
+# gp_segment_configuration, and nothing needs it to be: the DR does not read it, and
+# keeping production's history is the more useful behaviour.  Asserting it here
+# catches anyone re-adding protection out of habit.
+if [ "$(q "select count(*) from gp_configuration_history where description like 'T5 marker:%';")" = 1 ]; then
+	t5_rows=$(q "select count(*) from gp_configuration_history;")
+	ok_ "T5 gp_configuration_history is replayed, not protected (production's marker row is here; $t5_rows row(s) total)"
+else
+	no_ "T5 production's gp_configuration_history marker row did NOT reach the DR (is something still filtering it?)"
+fi
+# T6 is the acceptance test for deleting the redo filter: production runs with
+# wal_consistency_checking, so every record carries a full-page image and redo
+# compares the DR's own page against production's.  A mismatch is a PANIC naming the
+# rmgr and block, so the proof is simply that recovery got this far without one.
+# While the filter existed this could not be run: it skipped checkXLogConsistency()
+# alongside redo, so silence proved nothing about the records it skipped.
+#
+# Match the failure precisely.  checkXLogConsistency() says "inconsistent page
+# found, rel .../..., forknum N, blkno N" (xlog.c:1545) and a corrupt record is a
+# PANIC.  A blanket FATAL sweep does NOT work here: the loop above polls the
+# coordinator for connections while it is still starting, and every one of those
+# attempts logs FATAL 57P03 "the database system is starting up".
+t6_pat='inconsistent page found|PANIC'
+t6_hits=$(cat "$COORD"/log/*.csv 2>/dev/null | grep -cE "$t6_pat" || true)
+# It is PRODUCTION's setting that stamps the full-page images into the WAL; the
+# replica checks whenever a record carries XLR_CHECK_CONSISTENCY, whatever its own
+# GUC says.  So report what production was told to do, not what this node reports.
+if [ "${t6_hits:-0}" -eq 0 ]; then
+	ok_ "T6 wal_consistency_checking='${WAL_CONSISTENCY_CHECKING:-all}' on production: replayed with no page inconsistency"
+else
+	no_ "T6 wal_consistency_checking: $t6_hits page-inconsistency/PANIC line(s) on the DR coordinator"
+	grep -hE "$t6_pat" "$COORD"/log/*.csv 2>/dev/null | head -3 | cut -c1-300 | sed 's/^/    T6: /'
 fi
 # M2 (reads work): coordinator-only catalog read while in recovery.
 if [ "$(q "select count(*) > 0 from gp_segment_configuration;")" = t ]; then
@@ -182,11 +222,40 @@ fi
 refused "M2 SELECT ... FOR UPDATE" "select id from dr_marker for update;"
 refused "M2 DML (INSERT)"          "insert into dr_marker values (99, 'must be refused');"
 refused "M2 DDL (CREATE TABLE)"    "create table dr_should_not_exist (x int);"
+# The check above deliberately locks a real table: over a view there is no rowmark,
+# so the DR executor gate never runs and the assertion would pass while testing
+# nothing.  Assert separately that FOR UPDATE on the topology view fails at all --
+# it does, but in the parser ("cannot be applied to a function"), which is a
+# different guarantee and worth stating as one.
+# M2'' a topology WRITE must be refused too, and this one is not covered by the
+# read-only executor gate: the segadmin functions are plain CMD_SELECTs, and under
+# the file provider persisting needs no XID, so nothing else would stop a superuser
+# durably rewriting $PGDATA/gp_topology on a replica in recovery.  The catalog
+# provider used to refuse it only as a side effect of needing a transaction id.
+tw_out=$(qfail "select gp_update_segment_mode_status(2::int2, 'n'::\"char\", 'd'::\"char\");")
+if echo "$tw_out" | grep -qi "during recovery"; then
+	ok_ "M2'' topology write refused -> $(echo "$tw_out" | grep -iE 'ERROR' | head -1)"
+else
+	no_ "M2'' topology write NOT refused -> ${tw_out:-<no output>}"
+fi
+# and the store on disk is untouched by the attempt
+tw_gen=$(gg_topology dump -D "$COORD" 2>/dev/null | awk '/^generation/{print $2}')
+if [ "${tw_gen:-0}" = 1 ]; then
+	ok_ "M2'' the topology store is still at generation 1 (the refused write left no trace)"
+else
+	no_ "M2'' the topology store is at generation '${tw_gen:-<unreadable>}' (expected 1)"
+fi
+fu_out=$(qfail "select dbid from gp_segment_configuration for update;")
+if echo "$fu_out" | grep -qiE "ERROR"; then
+	ok_ "M2' FOR UPDATE on the topology view is rejected -> $(echo "$fu_out" | grep -iE 'ERROR' | head -1)"
+else
+	no_ "M2' FOR UPDATE on the topology view was NOT rejected -> ${fu_out:-<no output>}"
+fi
 echo "============================================================================================"
 if [ "$fail" -eq 0 ]; then
-	log "================ DR M1+M2 TEST: PASS ($pass/$((pass+fail)) checks) ================"
+	log "================ DR T1-T6 + M2 TEST: PASS ($pass/$((pass+fail)) checks) ================"
 else
-	log "================ DR M1+M2 TEST: FAIL ($fail of $((pass+fail)) failed) ================"
+	log "================ DR T1-T6 + M2 TEST: FAIL ($fail of $((pass+fail)) failed) ================"
 fi
 log "dr: DR coordinator left RUNNING in recovery (utility-mode reads). Connect with:"
 log "dr:   sudo docker-compose -f src/test/dr/docker-compose.yml exec dr \\"
@@ -492,9 +561,17 @@ commit;")
 	[ "$r" = 7 ] && ok7 "data as-of dr_rp_promote is visible (gg_promote=7)" \
 				 || no7 "gg_promote = '$r' (expected 7)"
 
-	r=$(dsp "select gg_dr_promote();")
+	# dsp() folds stderr in so assertions can grep for ERROR, which means server
+	# NOTICEs land in the value too.  gg_dr_promote() emits one (production's
+	# gp_configuration_history is now replayed onto the replica, and this SQL path
+	# -- unlike `ggdr promote` -- cannot tidy it up), so take the result line.
+	r_raw=$(dsp "select gg_dr_promote();")
+	r=$(printf '%s\n' "$r_raw" | grep -vE '^(NOTICE|HINT|DETAIL|CONTEXT|WARNING):' | tail -1)
 	[ "$r" = t ] && ok7 "gg_dr_promote() returned true (cluster promoted at dr_rp_promote)" \
 				 || no7 "gg_dr_promote returned '$r' (expected t)"
+	printf '%s\n' "$r_raw" | grep -q 'gp_configuration_history still holds' \
+		&& ok7 "gg_dr_promote() warns that gp_configuration_history came from production" \
+		|| no7 "gg_dr_promote() did not warn about the replayed gp_configuration_history"
 
 	# every node must now be OUT of recovery -- and DR mode lifts with it, no restart.
 	# Poll: promotion is asynchronous per node, and the coordinator additionally

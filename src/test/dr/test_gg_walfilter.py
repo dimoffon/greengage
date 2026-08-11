@@ -532,6 +532,23 @@ def make_filenode_map(mappings, slots=126):
     return bytes(raw)
 
 
+# The rule set the retired --gp-dr-topology preset used to install, spelled out.
+#
+# The preset is gone (P7): the backend stopped keeping cluster topology in a
+# replicated catalog, so there is nothing Greengage-specific left for this tool
+# to preset.  What remains is generic -- caller-supplied rules plus the
+# --halt-on-remap guard the preset used to turn on implicitly.  These tests keep
+# using the same eight catalogs so they go on testing the same behaviour.
+DR_TOPOLOGY_OIDS = ["5036", "7139", "7140", "6092", "6093", "5106", "5101", "5103"]
+
+
+def dr_topology_args():
+    args = []
+    for oid in DR_TOPOLOGY_OIDS:
+        args += ["--protect-mapped-oid", oid]
+    return args + ["--halt-on-remap"]
+
+
 PROTECTED = (1664, 0, 5036)          # a protected relfilenode (global spc)
 USER_REL = (1663, 16384, 24576)      # an ordinary user relation
 
@@ -785,7 +802,7 @@ class TestRelmapGuard(WfTempDir):
         w.add_relmap_update(0, 1664, [(1262, 99999), (5036, 5036)])
         w.add_record(blocks=[PROTECTED + (0, b"p" * 16)])
         p = self.write_segments(w)[0]
-        proc = run_wf(["filter", "--gp-dr-topology",
+        proc = run_wf(["filter", *dr_topology_args(),
                        "-D", self.make_datadir(), p], expect=0)
         # protected write still caught
         self.assertIn("1 rewritten to NOOP", proc.stdout)
@@ -805,7 +822,7 @@ class TestRelmapGuard(WfTempDir):
         w = WalWriter(n_segments=1)
         w.add_relmap_update(0, 1664, [(5036, 424242)])
         p = self.write_segments(w)[0]
-        proc = run_wf(["filter", "--gp-dr-topology",
+        proc = run_wf(["filter", *dr_topology_args(),
                        "-D", self.make_datadir(), p], expect=1)
         self.assertIn("rebuilt upstream", proc.stderr)
 
@@ -813,7 +830,7 @@ class TestRelmapGuard(WfTempDir):
         w = WalWriter(n_segments=1)
         w.add_relmap_update(16384, 1663, [(5036, 424242)])  # not the shared map
         p = self.write_segments(w)[0]
-        proc = run_wf(["filter", "--gp-dr-topology",
+        proc = run_wf(["filter", *dr_topology_args(),
                        "-D", self.make_datadir(), p], expect=0)
         self.assertIn("0 rewritten to NOOP", proc.stdout)
 
@@ -824,10 +841,12 @@ class TestSmgrTruncate(WfTempDir):
     upstream VACUUM truncating a protected catalog would then truncate the
     replica's own copy of it, whose page count legitimately differs.
 
-    The backend closes this in smgr_redo() via DRRedoShouldFilterRelFileNode().
-    The tool's decision is meant to be identical to the backend's, so these
-    tests pin that equivalence: if the two ever diverge, `inspect` starts
-    mispredicting what a DR node actually does with the WAL.
+    The backend closed this in smgr_redo() via DRRedoShouldFilterRelFileNode()
+    until P7, when the DR redo filter was deleted -- the cluster topology stopped
+    living in a replicated catalog, so the backend has nothing left to protect.
+    The tool keeps the rule because its rules are caller-supplied: whoever names a
+    relation on the command line means it for truncations too, and a rule that
+    silently did not cover XLOG_SMGR_TRUNCATE would be a trap.
     """
 
     def test_truncate_of_protected_relation_is_filtered(self):
@@ -867,7 +886,7 @@ class TestSmgrTruncate(WfTempDir):
         w = WalWriter(n_segments=1)
         w.add_smgr_truncate(*PROTECTED, blkno=1)
         p = self.write_segments(w)[0]
-        proc = run_wf(["filter", "--gp-dr-topology", "-D", datadir, p],
+        proc = run_wf(["filter", *dr_topology_args(), "-D", datadir, p],
                       expect=0)
         self.assertIn("1 rewritten to NOOP", proc.stdout)
 
@@ -1060,7 +1079,7 @@ class TestRestoreCli(WfTempDir):
     def restore(self, name, expect=0):
         dest = os.path.join(self.walout, "RECOVERYXLOG")
         proc = run_wf(["restore", "--archive-dir", self.archive,
-                       "--gp-dr-topology", "-D", self.datadir, name, dest],
+                       *dr_topology_args(), "-D", self.datadir, name, dest],
                       expect=expect)
         return dest, proc
 
@@ -1120,7 +1139,7 @@ class TestRestoreCli(WfTempDir):
         with open(os.path.join(self.archive, "00000002.history"), "w") as f:
             f.write("1\t0/1000000\tno reason\n")
         dest = os.path.join(self.walout, "RECOVERYHISTORY")
-        run_wf(["restore", "--archive-dir", self.archive, "--gp-dr-topology",
+        run_wf(["restore", "--archive-dir", self.archive, *dr_topology_args(),
                 "-D", self.datadir, "00000002.history", dest], expect=0)
         self.assertIn("no reason", readf(dest, "r"))
 

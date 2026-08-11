@@ -2,7 +2,7 @@ subdir=src/backend/access/transam
 top_builddir=../../../../..
 include $(top_builddir)/src/Makefile.global
 
-TARGETS=xact distributedlog xlog varsup dr_redo_filter
+TARGETS=xact distributedlog xlog varsup
 
 include $(top_srcdir)/src/backend/mock.mk
 
@@ -37,8 +37,3 @@ varsup.t: \
 	$(MOCK_DIR)/backend/access/hash/hash_mock.o \
 	$(MOCK_DIR)/backend/utils/fmgr/fmgr_mock.o
 
-dr_redo_filter.t: \
-	$(MOCK_DIR)/backend/access/transam/xlog_mock.o \
-	$(MOCK_DIR)/backend/utils/cache/relmapper_mock.o \
-	$(MOCK_DIR)/backend/access/hash/hash_mock.o \
-	$(MOCK_DIR)/backend/utils/fmgr/fmgr_mock.o

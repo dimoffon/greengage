@@ -43,7 +43,7 @@ Subcommands
         paused? served restore point, replay LSN, replay age, and whether there is
         a consistent serve point (all nodes paused at the same restore point).
 
-  promote [--at <rp>] [--yes] [--timeout <secs>]
+  promote [--at <rp>] [--yes] [--timeout <secs>] [--keep-history]
         Promote the DR cluster to a normal ONLINE read-write cluster, cutting every
         node at the SAME restore point.  Refuses unless all nodes are paused at one
         consistent restore point (== --at, if given).  pg_promote() + resume on
@@ -51,6 +51,11 @@ Subcommands
         exactly after that point.  DR behaviour is keyed on "in recovery with hot
         standby", so it disengages with recovery itself -- no restart.
         IRREVERSIBLE (recovery only moves forward).
+
+        gp_configuration_history arrives from production like any other catalog, so
+        a promoted replica would otherwise carry production's history into a cluster
+        that is about to write its own.  It is replaced with a single 'DR promoted
+        at <rp>' row; --keep-history leaves production's rows for forensics.
 
   create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir>
                  [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]
@@ -314,7 +319,7 @@ def _wait_out_of_recovery(node_tuples, timeout):
     return False
 
 
-def cmd_promote(at=None, assume_yes=False, timeout=300):
+def cmd_promote(at=None, assume_yes=False, timeout=300, keep_history=False):
     nodes = get_nodes()
     # --- precondition: every node paused at ONE consistent restore point (computed
     #     client-side over utility-mode reads, since the dispatched summary view
@@ -371,10 +376,47 @@ def cmd_promote(at=None, assume_yes=False, timeout=300):
     #
     # standby.signal is left in place deliberately: a promoted node ignores it,
     # and removing it here would only matter if the datadir were later reused.
+
+    # gp_configuration_history now arrives from production like any other catalog
+    # (nothing filters it as of P7), so a freshly promoted DR carries PRODUCTION's
+    # configuration history -- which is misleading the moment this cluster starts
+    # writing its own.  Replace it with the one event that is true of this cluster.
+    #
+    # DELETE, not TRUNCATE: TRUNCATE rewrites a mapped shared catalog's relfilenode
+    # and emits a relmap update, which is a much larger event than the tidy-up
+    # warrants.  --keep-history skips this entirely, for forensics.
+    if keep_history:
+        print("  gp_configuration_history left as production wrote it (--keep-history)")
+    else:
+        rc, out, err = _psql(
+            cp,
+            "set allow_system_table_mods = on;"
+            "delete from gp_configuration_history;"
+            "insert into gp_configuration_history values "
+            "  (now(), %d, 'DR promoted at restore point %s');"
+            % (_coord_dbid(cp, host), consistent_n.replace("'", "''")),
+            host=host)
+        if rc != 0:
+            print("  WARNING: could not reset gp_configuration_history: %s"
+                  % (err or out or "no output"))
+        else:
+            print("  gp_configuration_history reset to one row: promoted at '%s'"
+                  % consistent_n)
+
     print("ggdr promote: DONE -- cluster promoted to online read-write "
           "(as-of restore point '%s'); DR mode disengaged with recovery, no restart needed."
           % consistent_n)
     return 0
+
+
+def _coord_dbid(port, host=None):
+    """This cluster's coordinator dbid, for the promotion history row."""
+    rc, out, err = _psql(port, "select dbid from gp_segment_configuration "
+                               "where content = -1 and role = 'p';", host=host)
+    try:
+        return int(out)
+    except (TypeError, ValueError):
+        return 1
 
 
 #: the topology store's fields, in order.  A dr_topology.tsv line is exactly these
@@ -721,6 +763,9 @@ def main():
     p_prom.add_argument("--at", metavar="RP", help="require the consistent cut to equal this restore point")
     p_prom.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     p_prom.add_argument("--timeout", type=int, default=300, help="seconds to wait per phase (default 300)")
+    p_prom.add_argument("--keep-history", action="store_true",
+                        help="leave gp_configuration_history as production wrote it "
+                             "(default: replace it with one 'DR promoted at ...' row)")
     p_cr = sub.add_parser("create-replica", help="build a DR replica from per-instance base backups")
     p_cr.add_argument("--topology", required=True, metavar="TSV",
                       help="dr_topology.tsv (dbid content role prefrole mode status port host addr datadir)")
@@ -741,8 +786,8 @@ def main():
     if args.cmd == "stat":
         return cmd_stat()
     if args.cmd == "promote":
-        return cmd_promote(at=args.at,
-                           assume_yes=args.yes, timeout=args.timeout)
+        return cmd_promote(at=args.at, assume_yes=args.yes, timeout=args.timeout,
+                           keep_history=args.keep_history)
     if args.cmd == "create-replica":
         return cmd_create_replica(topology=args.topology, basebackup_dir=args.basebackup_dir,
                                   wal_archive=args.wal_archive, restore_command=args.restore_command,

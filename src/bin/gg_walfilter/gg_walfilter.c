@@ -24,9 +24,9 @@
  *
  * A record is rewritten iff it has at least one block reference and EVERY
  * block reference matches some rule; records with no block references
- * always pass.  --gp-dr-topology is the preset for a Greengage DR replica:
- * the protected cluster-topology catalogs, plus a guard that halts restore
- * (exit 3 + a sticky HALT sentinel) if production rebuilds one of them.
+ * always pass.  --halt-on-remap adds a guard that halts restore (exit 3 + a
+ * sticky HALT sentinel) if production rebuilds one of the protected mapped
+ * catalogs rather than merely writing to it.
  *
  * Exit status: 0 filtered + installed; 1 usage or WAL-format error (fail
  * closed: a segment we cannot parse is never passed through); 2 fetch
@@ -55,24 +55,6 @@
 #define PG_RMGR(symname, name, redo, desc, identify, startup, cleanup, mask) name,
 static const char *const rmgr_names[] = {
 #include "access/rmgrlist.h"
-};
-
-/*
- * The Greengage cluster-topology catalogs a DR replica must keep local:
- * these shared catalogs describe THIS cluster, so production's WAL must
- * never rewrite their pages.  Raw BKI OIDs (gp_version.h and
- * gp_version_at_initdb.h disagree on the symbolic name); the same list the
- * in-backend redo filter (dr_redo_filter.c) uses.
- */
-static const Oid gp_dr_topology_oids[] = {
-	5036,						/* gp_segment_configuration */
-	7139,						/* gp_segment_config_content_preferred_role_index */
-	7140,						/* gp_segment_config_dbid_index */
-	6092,						/* gp_segment_configuration TOAST table */
-	6093,						/* gp_segment_configuration TOAST index */
-	5106,						/* gp_configuration_history */
-	5101,						/* gp_id */
-	5103,						/* gp_version_at_initdb */
 };
 
 WfErrorMode wf_error_mode = WF_ERRMODE_PLAIN;
@@ -175,7 +157,6 @@ wf_cleanup_atexit(void)
 typedef struct WfCliOpts
 {
 	WfRules		rules;
-	bool		gp_dr_topology;
 	const char *datadir;
 	const char *state_dir;
 	bool		verbose;
@@ -191,7 +172,7 @@ enum
 	OPT_EXCLUDE_DATABASE,
 	OPT_EXCLUDE_TABLESPACE,
 	OPT_PROTECT_MAPPED_OID,
-	OPT_GP_DR_TOPOLOGY,
+	OPT_HALT_ON_REMAP,
 	OPT_STATE_DIR,
 	OPT_FETCH,
 	OPT_ARCHIVE_DIR,
@@ -203,7 +184,7 @@ enum
 	{"exclude-database", required_argument, NULL, OPT_EXCLUDE_DATABASE}, \
 	{"exclude-tablespace", required_argument, NULL, OPT_EXCLUDE_TABLESPACE}, \
 	{"protect-mapped-oid", required_argument, NULL, OPT_PROTECT_MAPPED_OID}, \
-	{"gp-dr-topology", no_argument, NULL, OPT_GP_DR_TOPOLOGY}, \
+	{"halt-on-remap", no_argument, NULL, OPT_HALT_ON_REMAP}, \
 	{"datadir", required_argument, NULL, 'D'}, \
 	{"state-dir", required_argument, NULL, OPT_STATE_DIR}, \
 	{"verbose", no_argument, NULL, 'v'}
@@ -225,9 +206,9 @@ usage(void)
 		   "  --exclude-tablespace OID          any relation in that tablespace\n"
 		   "  --protect-mapped-oid OID          shared mapped catalog, resolved via\n"
 		   "                                    <datadir>/global/pg_filenode.map\n"
-		   "  --gp-dr-topology                  preset: protect the Greengage cluster-\n"
-		   "                                    topology catalogs and halt on a\n"
-		   "                                    forbidden remap\n"
+		   "  --halt-on-remap                   halt (exit 3) if production rebuilds a\n"
+		   "                                    protected mapped catalog instead of\n"
+		   "                                    writing to it\n"
 		   "\nCommon options:\n"
 		   "  -D, --datadir DIR                 data directory (default: $PGDATA, else\n"
 		   "                                    the current directory -- the server runs\n"
@@ -320,8 +301,8 @@ handle_common_opt(WfCliOpts *opts, int c)
 			wf_rules_add_mapped_oid(&opts->rules,
 									parse_oid_arg("--protect-mapped-oid", optarg));
 			return true;
-		case OPT_GP_DR_TOPOLOGY:
-			opts->gp_dr_topology = true;
+		case OPT_HALT_ON_REMAP:
+			opts->rules.remap_guard = true;
 			return true;
 		case 'D':
 			opts->datadir = optarg;
@@ -364,20 +345,12 @@ state_dir_for(const WfCliOpts *opts, char *out)
 }
 
 /*
- * Apply the --gp-dr-topology preset and resolve mapped OIDs through
- * pg_filenode.map (the Python tool's rules_from_args()).
+ * Resolve mapped OIDs through pg_filenode.map (the Python tool's
+ * rules_from_args()).
  */
 static void
 finalize_rules(WfCliOpts *opts)
 {
-	if (opts->gp_dr_topology)
-	{
-		int			i;
-
-		for (i = 0; i < (int) lengthof(gp_dr_topology_oids); i++)
-			wf_rules_add_mapped_oid(&opts->rules, gp_dr_topology_oids[i]);
-		opts->rules.remap_guard = true;
-	}
 	if (opts->rules.nmapped > 0)
 		wf_rules_resolve_mapped(&opts->rules, effective_datadir(opts));
 }

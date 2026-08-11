@@ -672,7 +672,21 @@ gg_dr_promote(PG_FUNCTION_ARGS)
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (!RecoveryInProgress())
+		{
+			/*
+			 * gp_configuration_history is replicated like any other catalog, so
+			 * this cluster is now carrying PRODUCTION's configuration history
+			 * into a cluster that is about to write its own.  Nothing here can
+			 * tidy it up: this function runs inside the promoting backend, and
+			 * the segments may still be finishing.  Say so once, rather than
+			 * leave it to be discovered.
+			 */
+			ereport(NOTICE,
+					(errmsg("gp_configuration_history still holds the rows replayed from production"),
+					 errhint("Run \"ggdr promote\" instead of this function to replace it with a single "
+							 "promotion row, or clear it by hand.")));
 			PG_RETURN_BOOL(true);
+		}
 		pg_usleep(1000000L);
 	}
 }

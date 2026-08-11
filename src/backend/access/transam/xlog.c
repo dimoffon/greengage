@@ -37,7 +37,6 @@
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogutils.h"
-#include "access/dr_redo_filter.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
@@ -5577,11 +5576,11 @@ readRecoverySignalFile(void)
  *
  * Hot standby *is* the disaster-recovery replica mode: rather than carry a
  * second mode alongside it, enabling hot standby gives a node the whole DR
- * behaviour -- the apply-time topology redo filter (dr_redo_filter.c), read-only
- * enforcement, and the standby distributed-read path.  Stock hot standby on its
- * own has little practical use in Greengage (querying a mirror loads the
- * production host it is meant to protect, and a failover to that mirror strands
- * the session), so the mode is repurposed rather than duplicated.
+ * behaviour -- read-only enforcement, the served-snapshot capture, and the
+ * standby distributed-read path.  Stock hot standby on its own has little
+ * practical use in Greengage (querying a mirror loads the production host it is
+ * meant to protect, and a failover to that mirror strands the session), so the
+ * mode is repurposed rather than duplicated.
  *
  * Consequences worth knowing:
  *
@@ -5590,10 +5589,10 @@ readRecoverySignalFile(void)
  *     no restart, and nothing to unset.
  *
  *   * hot_standby defaults to off, so ordinary mirrors and the standby
- *     coordinator are unaffected.  Do NOT turn it on for them: the topology
- *     filter would freeze their gp_segment_configuration, and an FTS failover
- *     (or gpactivatestandby) would then promote a node describing a stale
- *     cluster.  hot_standby = on means "this node is a separate DR cluster".
+ *     coordinator are unaffected.  Do NOT turn it on for them: they would start
+ *     refusing writes and serving reads frozen at a restore point, which is not
+ *     what a mirror is for.  hot_standby = on means "this node is a separate DR
+ *     cluster".
  */
 bool
 IsDRReplicaMode(void)
@@ -7709,28 +7708,17 @@ StartupXLOG(void)
 					TransactionIdIsValid(record->xl_xid))
 					RecordKnownAssignedTransactionIds(record->xl_xid);
 
-				/*
-				 * Now apply the WAL record itself.  On a Greengage DR replica,
-				 * skip records that modify only protected topology catalogs so
-				 * production's WAL does not overwrite the DR-local rows; the
-				 * replay LSN still advances via the record reader.  The
-				 * consistency check must be skipped together with redo: a
-				 * filtered record's pages were deliberately left untouched,
-				 * so comparing them against production's images would fail.
-				 */
-				if (!DRRedoShouldFilter(xlogreader))
-				{
-					RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+				/* Now apply the WAL record itself */
+				RmgrTable[record->xl_rmid].rm_redo(xlogreader);
 
-					/*
-					 * After redo, check whether the backup pages associated
-					 * with the WAL record are consistent with the existing
-					 * pages. This check is done only if consistency check is
-					 * enabled for this record.
-					 */
-					if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
-						checkXLogConsistency(xlogreader);
-				}
+				/*
+				 * After redo, check whether the backup pages associated with
+				 * the WAL record are consistent with the existing pages. This
+				 * check is done only if consistency check is enabled for this
+				 * record.
+				 */
+				if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+					checkXLogConsistency(xlogreader);
 
 				/* Pop the error context stack */
 				error_context_stack = errcallback.previous;

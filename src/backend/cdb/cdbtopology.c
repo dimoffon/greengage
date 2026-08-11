@@ -18,6 +18,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "access/xlog.h"			/* RecoveryInProgress() */
 #include "catalog/gp_segment_configuration_internal.h"
 #include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
@@ -354,6 +355,34 @@ GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level)
 	GpTopoWriteSet *ws;
 	MemoryContext oldcxt;
 	int			i;
+
+	/*
+	 * A node in recovery does not get to change the cluster topology.
+	 *
+	 * The catalog provider used to enforce this for free: writing the catalog
+	 * needs an XID, and GetNewTransactionId() refuses one during recovery.  A
+	 * file needs no XID, so under the file provider that refusal simply was not
+	 * there any more, and a superuser on a read-only DR replica could durably
+	 * rewrite $PGDATA/gp_topology -- an entry removed, or a segment marked down,
+	 * with no gp_configuration_history row to explain it, surviving the
+	 * promotion the replica exists for.  ExecCheckXactReadOnly() does not catch
+	 * it either: SELECT gp_update_segment_mode_status(...) is a plain CMD_SELECT.
+	 *
+	 * So the rule moves here, where it applies to every provider and every
+	 * caller rather than falling out of one provider's implementation.
+	 *
+	 * This does not block promotion.  gp_activate_standby() runs from
+	 * UpdateCatalogForStandbyPromotion() in the startup process (xlog.c:8568),
+	 * which is reached after SharedRecoveryState is set to RECOVERY_STATE_DONE
+	 * (xlog.c:8505) -- recovery is already over by then, and that ordering is
+	 * relied upon in the comment above needToPromoteCatalog.
+	 */
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot modify the cluster topology during recovery"),
+				 errdetail("This node is replaying WAL; its topology describes the cluster it belongs to and is not the caller's to change."),
+				 errhint("Promote the cluster first, or run this on the cluster that owns the topology.")));
 
 	GpTopologyProviderStartup();
 	routine = GpTopoActiveProvider();
