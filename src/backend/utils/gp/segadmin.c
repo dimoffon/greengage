@@ -18,7 +18,7 @@
 #include "miscadmin.h"
 #include "pqexpbuffer.h"
 
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 #include "catalog/pg_proc.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbtopology.h"

@@ -33,7 +33,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 #include "catalog/indexing.h"
 #include "libpq-fe.h"
 
@@ -208,52 +208,52 @@ readGpSegConfigFromCatalogRel(Relation gp_seg_config_rel, int *total_dbs)
 		config = &configs[idx];
 
 		/* dbid */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_dbid, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_dbid, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->dbid = DatumGetInt16(attr);
 
 		/* content */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_content, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_content, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->segindex= DatumGetInt16(attr);
 
 		/* role */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_role, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_role, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->role = DatumGetChar(attr);
 
 		/* preferred-role */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_preferred_role, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_preferred_role, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->preferred_role = DatumGetChar(attr);
 
 		/* mode */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_mode, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_mode, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->mode = DatumGetChar(attr);
 
 		/* status */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_status, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_status, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->status = DatumGetChar(attr);
 
 		/* hostname */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_hostname, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_hostname, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->hostname = TextDatumGetCString(attr);
 
 		/* address */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_address, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_address, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->address = TextDatumGetCString(attr);
 
 		/* port */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_port, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_port, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->port = DatumGetInt32(attr);
 
 		/* datadir */
-		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_datadir, RelationGetDescr(gp_seg_config_rel), &isNull);
+		attr = heap_getattr(gp_seg_config_tuple, Anum_gp_segment_configuration_internal_datadir, RelationGetDescr(gp_seg_config_rel), &isNull);
 		Assert(!isNull);
 		config->datadir = TextDatumGetCString(attr);
 
@@ -371,7 +371,7 @@ catalog_delete_dbid(Relation rel, int16 dbid)
 	HeapTuple	tuple;
 
 	ScanKeyInit(&scankey,
-				Anum_gp_segment_configuration_dbid,
+				Anum_gp_segment_configuration_internal_dbid,
 				BTEqualStrategyNumber, F_INT2EQ,
 				Int16GetDatum(dbid));
 
@@ -396,9 +396,9 @@ static void
 catalog_update_entry(Relation rel, const GpSegConfigEntry *orig,
 					 const GpSegConfigEntry *work)
 {
-	Datum		values[Natts_gp_segment_configuration];
-	bool		nulls[Natts_gp_segment_configuration];
-	bool		repls[Natts_gp_segment_configuration];
+	Datum		values[Natts_gp_segment_configuration_internal];
+	bool		nulls[Natts_gp_segment_configuration_internal];
+	bool		repls[Natts_gp_segment_configuration_internal];
 	ScanKeyData scankey;
 	SysScanDesc sscan;
 	HeapTuple	tuple;
@@ -419,31 +419,31 @@ catalog_update_entry(Relation rel, const GpSegConfigEntry *orig,
 		} \
 	} while (0)
 
-	REPLACE_IF(Anum_gp_segment_configuration_content,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_content,
 			   orig->segindex != work->segindex,
 			   Int16GetDatum(work->segindex));
-	REPLACE_IF(Anum_gp_segment_configuration_role,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_role,
 			   orig->role != work->role,
 			   CharGetDatum(work->role));
-	REPLACE_IF(Anum_gp_segment_configuration_preferred_role,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_preferred_role,
 			   orig->preferred_role != work->preferred_role,
 			   CharGetDatum(work->preferred_role));
-	REPLACE_IF(Anum_gp_segment_configuration_mode,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_mode,
 			   orig->mode != work->mode,
 			   CharGetDatum(work->mode));
-	REPLACE_IF(Anum_gp_segment_configuration_status,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_status,
 			   orig->status != work->status,
 			   CharGetDatum(work->status));
-	REPLACE_IF(Anum_gp_segment_configuration_port,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_port,
 			   orig->port != work->port,
 			   Int32GetDatum(work->port));
-	REPLACE_IF(Anum_gp_segment_configuration_hostname,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_hostname,
 			   catalog_str_differs(orig->hostname, work->hostname),
 			   CStringGetTextDatum(work->hostname));
-	REPLACE_IF(Anum_gp_segment_configuration_address,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_address,
 			   catalog_str_differs(orig->address, work->address),
 			   CStringGetTextDatum(work->address));
-	REPLACE_IF(Anum_gp_segment_configuration_datadir,
+	REPLACE_IF(Anum_gp_segment_configuration_internal_datadir,
 			   catalog_str_differs(orig->datadir, work->datadir),
 			   CStringGetTextDatum(work->datadir));
 
@@ -453,7 +453,7 @@ catalog_update_entry(Relation rel, const GpSegConfigEntry *orig,
 		return;
 
 	ScanKeyInit(&scankey,
-				Anum_gp_segment_configuration_dbid,
+				Anum_gp_segment_configuration_internal_dbid,
 				BTEqualStrategyNumber, F_INT2EQ,
 				Int16GetDatum(work->dbid));
 
@@ -476,25 +476,25 @@ catalog_update_entry(Relation rel, const GpSegConfigEntry *orig,
 static void
 catalog_insert_entry(Relation rel, const GpSegConfigEntry *work)
 {
-	Datum		values[Natts_gp_segment_configuration];
-	bool		nulls[Natts_gp_segment_configuration];
+	Datum		values[Natts_gp_segment_configuration_internal];
+	bool		nulls[Natts_gp_segment_configuration_internal];
 	HeapTuple	tuple;
 
 	MemSet(nulls, false, sizeof(nulls));
 
-	values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(work->dbid);
-	values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(work->segindex);
-	values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(work->role);
-	values[Anum_gp_segment_configuration_preferred_role - 1] =
+	values[Anum_gp_segment_configuration_internal_dbid - 1] = Int16GetDatum(work->dbid);
+	values[Anum_gp_segment_configuration_internal_content - 1] = Int16GetDatum(work->segindex);
+	values[Anum_gp_segment_configuration_internal_role - 1] = CharGetDatum(work->role);
+	values[Anum_gp_segment_configuration_internal_preferred_role - 1] =
 		CharGetDatum(work->preferred_role);
-	values[Anum_gp_segment_configuration_mode - 1] = CharGetDatum(work->mode);
-	values[Anum_gp_segment_configuration_status - 1] = CharGetDatum(work->status);
-	values[Anum_gp_segment_configuration_port - 1] = Int32GetDatum(work->port);
-	values[Anum_gp_segment_configuration_hostname - 1] =
+	values[Anum_gp_segment_configuration_internal_mode - 1] = CharGetDatum(work->mode);
+	values[Anum_gp_segment_configuration_internal_status - 1] = CharGetDatum(work->status);
+	values[Anum_gp_segment_configuration_internal_port - 1] = Int32GetDatum(work->port);
+	values[Anum_gp_segment_configuration_internal_hostname - 1] =
 		CStringGetTextDatum(work->hostname);
-	values[Anum_gp_segment_configuration_address - 1] =
+	values[Anum_gp_segment_configuration_internal_address - 1] =
 		CStringGetTextDatum(work->address);
-	values[Anum_gp_segment_configuration_datadir - 1] =
+	values[Anum_gp_segment_configuration_internal_datadir - 1] =
 		CStringGetTextDatum(work->datadir);
 
 	tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);

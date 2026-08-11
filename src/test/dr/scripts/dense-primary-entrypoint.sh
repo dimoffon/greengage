@@ -83,18 +83,18 @@ log "dense-primary: inserting + deleting $FILLER_ROWS filler rows in ONE transac
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q <<SQL
 BEGIN;
-INSERT INTO gp_segment_configuration
+INSERT INTO gp_segment_configuration_internal
        (dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir)
 SELECT 10000 + g, 10000 + g, 'm', 'm', 'n', 'd', 40000 + g,
        'filler', 'filler', '/nonexistent/filler'
   FROM generate_series(1, $FILLER_ROWS) g;
-DELETE FROM gp_segment_configuration WHERE content >= 10000;
+DELETE FROM gp_segment_configuration_internal WHERE content >= 10000;
 COMMIT;
 SQL
 
 PROD_PAGES_DENSE=$(pages)
-PROD_LIVE=$(u "select count(*) from gp_segment_configuration;")
-PROD_MAX_BLK=$(u "select max(substring(ctid::text from '\((\d+),')::int) from gp_segment_configuration;")
+PROD_LIVE=$(u "select count(*) from gp_segment_configuration_internal;")
+PROD_MAX_BLK=$(u "select max(substring(ctid::text from '\((\d+),')::int) from gp_segment_configuration_internal;")
 log "dense-primary: catalog is now $PROD_PAGES_DENSE page(s); $PROD_LIVE live row(s), highest live block $PROD_MAX_BLK"
 [ "$PROD_PAGES_DENSE" -ge "$MIN_PAGES" ] || \
 	die "densify produced only $PROD_PAGES_DENSE page(s); need >= $MIN_PAGES (raise FILLER_ROWS)"

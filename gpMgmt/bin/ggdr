@@ -420,13 +420,13 @@ def _check_seeded_topology(rows):
     rc, out, err = _psql(port,
                          "select count(*)||'|'||"
                          "coalesce(max((ctid::text::point)[0]::int), -1)||'|'||"
-                         "(pg_relation_size('gp_segment_configuration')"
+                         "(pg_relation_size('gp_segment_configuration_internal')"
                          " / current_setting('block_size')::int)||'|'||"
                          "coalesce(string_agg(dbid||':'||content||':'||port||':'||hostname,"
                          "                    ',' order by content), '') "
-                         "  from gp_segment_configuration;")
+                         "  from gp_segment_configuration_internal;")
     if rc != 0 or out.count("|") != 3:
-        print("  topology check: SKIPPED -- could not read gp_segment_configuration (%s)"
+        print("  topology check: SKIPPED -- could not read gp_segment_configuration_internal (%s)"
               % (err or out or "no output"))
         return 0
 

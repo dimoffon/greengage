@@ -149,11 +149,11 @@ done
 echo "Configuring replica master's gp_segment_configuration..."
 PGOPTIONS="-c gp_role=utility" psql postgres -c "
 SET allow_system_table_mods=true;
-DELETE FROM gp_segment_configuration WHERE preferred_role='m';
-UPDATE gp_segment_configuration SET dbid=${REPLICA_MASTER_DBID}, datadir='${REPLICA_MASTER}' WHERE content = -1;
-UPDATE gp_segment_configuration SET dbid=${REPLICA_PRIMARY1_DBID}, datadir='${REPLICA_PRIMARY1}' WHERE content = 0;
-UPDATE gp_segment_configuration SET dbid=${REPLICA_PRIMARY2_DBID}, datadir='${REPLICA_PRIMARY2}' WHERE content = 1;
-UPDATE gp_segment_configuration SET dbid=${REPLICA_PRIMARY3_DBID}, datadir='${REPLICA_PRIMARY3}' WHERE content = 2;
+DELETE FROM gp_segment_configuration_internal WHERE preferred_role='m';
+UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_MASTER_DBID}, datadir='${REPLICA_MASTER}' WHERE content = -1;
+UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY1_DBID}, datadir='${REPLICA_PRIMARY1}' WHERE content = 0;
+UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY2_DBID}, datadir='${REPLICA_PRIMARY2}' WHERE content = 1;
+UPDATE gp_segment_configuration_internal SET dbid=${REPLICA_PRIMARY3_DBID}, datadir='${REPLICA_PRIMARY3}' WHERE content = 2;
 "
 
 # Restart the cluster to get the MPP parts working.

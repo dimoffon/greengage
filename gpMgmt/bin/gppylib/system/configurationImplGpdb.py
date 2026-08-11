@@ -385,19 +385,21 @@ class GpConfigurationProviderUsingGpdbCatalog(GpConfigurationProvider) :
         dbid = seg.getSegmentDbId()
         if dbid in peerMap: # The dbid may not be in the peer map, if e.g. we're getting here from gpexpand, in which case no action is necessary
             peerSegment = peerMap[dbid]
-            updateStmt = "SET allow_system_table_mods=true;\nUPDATE gp_segment_configuration SET mode = 'n' WHERE dbid = %d;"
+            updateStmt = "SELECT pg_catalog.gp_update_segment_mode_status(%d::int2, 'n'::\"char\", NULL);"
             return updateStmt % peerSegment.getSegmentDbId()
         return ""
 
     def __updateSegmentModeStatus(self, conn, seg):
         # run an update
-        sql = "UPDATE pg_catalog.gp_segment_configuration\n" + \
-            "  SET\n" + \
-            "  mode = " + self.__toSqlCharValue(seg.getSegmentMode()) + ",\n" \
-            "  status = " + self.__toSqlCharValue(seg.getSegmentStatus()) + "\n" \
-            "WHERE dbid = " + self.__toSqlIntValue(seg.getSegmentDbId()) + ";"
+        # The topology is not necessarily in the catalog, so this cannot be an
+        # UPDATE.  The function reaches whichever store is active, and errors on
+        # an unknown dbid -- which is what the rowcount assertion used to check.
+        sql = "SELECT pg_catalog.gp_update_segment_mode_status(" + \
+            self.__toSqlIntValue(seg.getSegmentDbId()) + "::int2, " + \
+            self.__toSqlCharValue(seg.getSegmentMode()) + "::\"char\", " + \
+            self.__toSqlCharValue(seg.getSegmentStatus()) + "::\"char\");"
         logger.debug(sql)
-        dbconn.executeUpdateOrInsert(conn, sql, 1)
+        dbconn.querySingleton(conn, sql)
 
 
     def fetchSingleOutputRow(self, conn, sql, retry=False):

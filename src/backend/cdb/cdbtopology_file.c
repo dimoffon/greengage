@@ -38,7 +38,7 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 #include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "miscadmin.h"

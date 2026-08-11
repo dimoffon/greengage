@@ -56,7 +56,7 @@ select gp_request_fts_probe_scan();
 -- dbid=2 corresponds to content 0 and role p, change it to dbid=9
 set allow_system_table_mods to true;
 SET
-update gp_segment_configuration set dbid=9 where content=0 and role='p';
+update gp_segment_configuration_internal set dbid=9 where content=0 and role='p';
 UPDATE 1
 
 -- trigger failover
@@ -110,7 +110,7 @@ select dbid from gp_segment_configuration where dbid=2;
 -- end_ignore
 (exited with code 0)
 
-update gp_segment_configuration set dbid=2 where dbid=9;
+update gp_segment_configuration_internal set dbid=2 where dbid=9;
 UPDATE 1
 set allow_system_table_mods to false;
 SET

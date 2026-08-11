@@ -158,7 +158,7 @@ else
 fi
 # M2 (writes refused): FOR UPDATE + DML go through ExecCheckXactReadOnly (DR message);
 # DDL goes through check_xact_readonly (stock read-only message). All must fail.
-refused "M2 SELECT ... FOR UPDATE" "select port from gp_segment_configuration where content = 0 for update;"
+refused "M2 SELECT ... FOR UPDATE" "select id from dr_marker for update;"
 refused "M2 DML (INSERT)"          "insert into dr_marker values (99, 'must be refused');"
 refused "M2 DDL (CREATE TABLE)"    "create table dr_should_not_exist (x int);"
 echo "============================================================================================"

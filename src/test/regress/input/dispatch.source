@@ -551,7 +551,7 @@ DROP DATABASE dispatch_test_db;
 CREATE EXTENSION if not exists gp_inject_fault;
 create table t13393(tc1 int);
 insert into t13393 select generate_series(1,10000);
-analyze gp_segment_configuration;
+analyze gp_segment_configuration_internal;
 SELECT gp_inject_fault('cdbcomponent_recycle_idle_qe_error', 'interrupt', dbid, current_setting('gp_session_id')::int)
  from gp_segment_configuration where content=-1 and role='p';
 select * from gp_segment_configuration a, t13393 ,gp_segment_configuration b where a.dbid = t13393.tc1 limit 0;

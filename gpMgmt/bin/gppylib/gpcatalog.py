@@ -24,7 +24,7 @@ class GPCatalogException(Exception):
 # Hard coded since "coordinator only" is not defined in the catalog
 COORDINATOR_ONLY_TABLES = [
     'gp_configuration_history',
-    'gp_segment_configuration',
+    'gp_segment_configuration_internal',
     'pg_stat_last_operation',
     'pg_stat_last_shoperation',
     'pg_statistic',

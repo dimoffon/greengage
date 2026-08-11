@@ -149,7 +149,7 @@ check_vacuum_worked()
 	# Query for the xmin ages.
 	local xmin_ages=$( \
 		PGOPTIONS='-c gp_role=utility' \
-		"${NEW_BINDIR}/psql" -c 'SELECT age(xmin) FROM pg_catalog.gp_segment_configuration GROUP BY age(xmin);' \
+		"${NEW_BINDIR}/psql" -c 'SELECT age(xmin) FROM pg_catalog.gp_segment_configuration_internal GROUP BY age(xmin);' \
 			 -p 18432 -t -A template1 \
 	)
 

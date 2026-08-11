@@ -31,7 +31,7 @@ select gp_request_fts_probe_scan();
 -- Verify that FTS didn't leak any locks due to the error during
 -- config update.
 select locktype, mode, relation, pid, granted from pg_locks where
-relation = 'gp_segment_configuration'::regclass or
+relation = 'gp_segment_configuration_internal'::regclass or
 relation = 'gp_configuration_history'::regclass;
 
 select count(*) = 2 as in_sync from gp_segment_configuration

@@ -48,7 +48,7 @@ select gp_request_fts_probe_scan();
 -- make the dbid in gp_segment_configuration not continuous
 -- dbid=2 corresponds to content 0 and role p, change it to dbid=9
 set allow_system_table_mods to true;
-update gp_segment_configuration set dbid=9 where content=0 and role='p';
+update gp_segment_configuration_internal set dbid=9 where content=0 and role='p';
 
 -- trigger failover
 select gp_request_fts_probe_scan();
@@ -77,7 +77,7 @@ select dbid from gp_segment_configuration where dbid=2;
 -- recover the segment to its original datadir
 !\retcode gprecoverseg -a -i /tmp/recover_config_file2;
 
-update gp_segment_configuration set dbid=2 where dbid=9;
+update gp_segment_configuration_internal set dbid=2 where dbid=9;
 set allow_system_table_mods to false;
 
 -- we manually change dbid from 2 to 9, which causes the

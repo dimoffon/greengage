@@ -21,7 +21,7 @@
 
 #include "access/xlog.h"  /*RecoveryInProgress*/
 #include "access/xlogdefs.h"  /*XLogRecPtr*/
-#include "catalog/gp_segment_configuration.h" /* COORDINATOR_CONTENT_ID */
+#include "catalog/gp_segment_configuration_internal.h" /* COORDINATOR_CONTENT_ID */
 
 /*
  * ----- Declarations of Greengage-specific global variables ------

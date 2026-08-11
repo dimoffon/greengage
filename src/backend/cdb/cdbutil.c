@@ -29,7 +29,7 @@
 
 #include <sys/param.h>			/* for MAXHOSTNAMELEN */
 
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 #include "common/ip.h"
 #include "nodes/makefuncs.h"
 #include "utils/builtins.h"

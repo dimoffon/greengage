@@ -88,7 +88,7 @@ sleep 5
 log "primary: changing gp_segment_configuration (seg0 hostname) to test the DR filter"
 PGOPTIONS='-c gp_role=utility -c allow_system_table_mods=on' \
 	psql -p "$PORT_BASE" -d postgres -q -c \
-	"update gp_segment_configuration set hostname = 'prod-seg0-CHANGED' where content = 0;" || true
+	"update gp_segment_configuration_internal set hostname = 'prod-seg0-CHANGED' where content = 0;" || true
 {
 	echo "PRODUCTION_SEG0_HOSTNAME=$(psql -p "$PORT_BASE" -d postgres -Atc "select hostname from gp_segment_configuration where content=0;")"
 	echo "PRODUCTION_CHANGE_LSN=$(psql -p "$PORT_BASE" -d postgres -Atc "select pg_current_wal_lsn();")"

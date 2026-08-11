@@ -47,7 +47,7 @@
 #include "utils/rel.h"
 
 #include "catalog/gp_configuration_history.h"
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 
 #include "tcop/tcopprot.h" /* quickdie() */
 

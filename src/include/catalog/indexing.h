@@ -383,9 +383,9 @@ DECLARE_UNIQUE_INDEX(pg_resgroupcapability_resgroupid_reslimittype_index, 6445, 
 DECLARE_INDEX(pg_resgroupcapability_resgroupid_index, 6446, on pg_resgroupcapability using btree(resgroupid oid_ops));
 #define ResGroupCapabilityResgroupidIndexId	6446
 
-DECLARE_UNIQUE_INDEX(gp_segment_config_content_preferred_role_index, 7139, on gp_segment_configuration using btree(content int2_ops, preferred_role char_ops));
+DECLARE_UNIQUE_INDEX(gp_segment_config_content_preferred_role_index, 7139, on gp_segment_configuration_internal using btree(content int2_ops, preferred_role char_ops));
 #define GpSegmentConfigContentPreferred_roleIndexId	7139
-DECLARE_UNIQUE_INDEX(gp_segment_config_dbid_index, 7140, on gp_segment_configuration using btree(dbid int2_ops));
+DECLARE_UNIQUE_INDEX(gp_segment_config_dbid_index, 7140, on gp_segment_configuration_internal using btree(dbid int2_ops));
 #define GpSegmentConfigDbidIndexId	7140
 
 DECLARE_UNIQUE_INDEX(pg_extprotocol_oid_index, 7156, on pg_extprotocol using btree(oid oid_ops));

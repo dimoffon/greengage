@@ -111,7 +111,7 @@ DECLARE_TOAST(pg_type_encoding, 6222, 6223);
 DECLARE_TOAST(pg_extprotocol, 7173, 7174);
 
 /* GPDB additional shared catalogs */
-DECLARE_TOAST(gp_segment_configuration, 6092, 6093);
+DECLARE_TOAST(gp_segment_configuration_internal, 6092, 6093);
 #define GpSegmentConfigToastTable	6092
 #define GpSegmentConfigToastIndex	6093
 

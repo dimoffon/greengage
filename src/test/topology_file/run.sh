@@ -2,11 +2,12 @@
 #
 # The file-backed cluster topology store, end to end.
 #
-# Deliberately free of gpMgmt: under gp_topology_source=file nothing writes
-# gp_segment_configuration, so gpstart, gpstop, gpstate and gpconfig cannot read
-# the topology and refuse to run.  Everything here is driven with initdb, psql
-# and a postmaster started directly, which is how a file-mode cluster is managed
-# until gp_segment_configuration becomes a view over the active store.
+# Driven with initdb, gg_topology, psql and a postmaster started directly,
+# rather than with gpMgmt.  gp_topology_source is PGC_POSTMASTER, so it has to
+# be in each node's postgresql.conf before anything starts -- gpstop -ar will
+# not add it -- and starting nodes by hand is the only way to arm it in a test.
+# gpMgmt itself works under any provider now that gp_segment_configuration is a
+# view over the active store.
 #
 # Usage:  ./run.sh [BINDIR]
 #
@@ -182,7 +183,8 @@ gen() { $GGTOPO dump -D "$W" | awk '/^generation/{print $2}'; }
 chk "gp_add_segment_primary returns a dbid" "2" "$(q "select gp_add_segment_primary('sdw1','sdw1',6100,'/d/s0')")"
 chk "  the store advanced"                  "2" "$(gen)"
 chk "  the entry is in the store"           "1" "$($GGTOPO dump -D "$W" | grep -c '^2 0 p p n u 6100 sdw1 sdw1 /d/s0$')"
-chk "  and the catalog was not touched"     "0" "$(q "select count(*) from gp_segment_configuration")"
+chk "  and the catalog was not touched"     "0" "$(q "select count(*) from gp_segment_configuration_internal")"
+chk "  but the view shows the store"        "2" "$(q "select count(*) from gp_segment_configuration")"
 
 chk "a second primary"                      "3" "$(q "select gp_add_segment_primary('sdw2','sdw2',6101,'/d/s1')")"
 chk "  takes the next content"              "1" "$($GGTOPO dump -D "$W" | grep -c '^3 1 p p n u 6101')"

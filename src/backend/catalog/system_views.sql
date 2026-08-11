@@ -824,6 +824,25 @@ $$
 $$
 LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
 
+-- The cluster topology, from whatever store gp_topology_source names.
+--
+-- The shared catalog behind the "catalog" provider is
+-- gp_segment_configuration_internal.  Nothing outside that provider should read
+-- it: under any other provider its rows are stale or absent, which is the whole
+-- reason this view exists.
+--
+-- Position matters.  gp_stat_replication below and pg_max_external_files later
+-- in this file both select from gp_segment_configuration, and initdb runs this
+-- file top to bottom.
+--
+-- The function is aliased because the planner pulls this view up and then names
+-- the surviving range table entry in EXPLAIN and in column qualifications.
+-- Without the alias every plan touching the topology would start saying
+-- gp_get_segment_configuration.
+CREATE VIEW gp_segment_configuration AS
+    SELECT * FROM pg_catalog.gp_get_segment_configuration()
+        AS gp_segment_configuration;
+
 -- This view has an additional column than pg_stat_replication so cannot be generated using system_views_gp.in
 CREATE VIEW gp_stat_replication AS
     SELECT *, pg_catalog.gp_replication_error() AS sync_error

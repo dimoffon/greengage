@@ -78,8 +78,8 @@ advance() {   # $1=to -- move the whole cluster to a new restore point AND serve
 
 BLKSZ=$(q "select current_setting('block_size')::int;")
 dr_pages()   { q "select pg_relation_size('gp_segment_configuration') / $BLKSZ;"; }
-dr_rows()    { q "select count(*) from gp_segment_configuration;"; }
-dr_max_blk() { q "select coalesce(max(substring(ctid::text from '\((\d+),')::int), -1) from gp_segment_configuration;"; }
+dr_rows()    { q "select count(*) from gp_segment_configuration_internal;"; }
+dr_max_blk() { q "select coalesce(max(substring(ctid::text from '\((\d+),')::int), -1) from gp_segment_configuration_internal;"; }
 
 log "dense-dr: waiting for all ${#NODES[@]} nodes to pause at dense_rp_pre ..."
 for _ in $(seq 1 120); do all_paused && break; sleep 2; done

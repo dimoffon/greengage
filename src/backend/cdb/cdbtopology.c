@@ -18,7 +18,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
-#include "catalog/gp_segment_configuration.h"
+#include "catalog/gp_segment_configuration_internal.h"
 #include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "funcapi.h"
@@ -809,7 +809,7 @@ gp_get_segment_configuration(PG_FUNCTION_ARGS)
 	/* the OUT parameters in pg_proc are the only definition of the row type */
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
-	Assert(tupdesc->natts == Natts_gp_segment_configuration);
+	Assert(tupdesc->natts == Natts_gp_segment_configuration_internal);
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
@@ -844,31 +844,31 @@ gp_get_segment_configuration(PG_FUNCTION_ARGS)
 	for (i = 0; i < nentries; i++)
 	{
 		GpSegConfigEntry *e = &entries[i];
-		Datum		values[Natts_gp_segment_configuration];
-		bool		nulls[Natts_gp_segment_configuration];
+		Datum		values[Natts_gp_segment_configuration_internal];
+		bool		nulls[Natts_gp_segment_configuration_internal];
 
 		MemSet(nulls, false, sizeof(nulls));
 
-		values[Anum_gp_segment_configuration_dbid - 1] = Int16GetDatum(e->dbid);
-		values[Anum_gp_segment_configuration_content - 1] = Int16GetDatum(e->segindex);
-		values[Anum_gp_segment_configuration_role - 1] = CharGetDatum(e->role);
-		values[Anum_gp_segment_configuration_preferred_role - 1] = CharGetDatum(e->preferred_role);
-		values[Anum_gp_segment_configuration_mode - 1] = CharGetDatum(e->mode);
-		values[Anum_gp_segment_configuration_status - 1] = CharGetDatum(e->status);
-		values[Anum_gp_segment_configuration_port - 1] = Int32GetDatum(e->port);
+		values[Anum_gp_segment_configuration_internal_dbid - 1] = Int16GetDatum(e->dbid);
+		values[Anum_gp_segment_configuration_internal_content - 1] = Int16GetDatum(e->segindex);
+		values[Anum_gp_segment_configuration_internal_role - 1] = CharGetDatum(e->role);
+		values[Anum_gp_segment_configuration_internal_preferred_role - 1] = CharGetDatum(e->preferred_role);
+		values[Anum_gp_segment_configuration_internal_mode - 1] = CharGetDatum(e->mode);
+		values[Anum_gp_segment_configuration_internal_status - 1] = CharGetDatum(e->status);
+		values[Anum_gp_segment_configuration_internal_port - 1] = Int32GetDatum(e->port);
 
 		if (e->hostname)
-			values[Anum_gp_segment_configuration_hostname - 1] = CStringGetTextDatum(e->hostname);
+			values[Anum_gp_segment_configuration_internal_hostname - 1] = CStringGetTextDatum(e->hostname);
 		else
-			nulls[Anum_gp_segment_configuration_hostname - 1] = true;
+			nulls[Anum_gp_segment_configuration_internal_hostname - 1] = true;
 		if (e->address)
-			values[Anum_gp_segment_configuration_address - 1] = CStringGetTextDatum(e->address);
+			values[Anum_gp_segment_configuration_internal_address - 1] = CStringGetTextDatum(e->address);
 		else
-			nulls[Anum_gp_segment_configuration_address - 1] = true;
+			nulls[Anum_gp_segment_configuration_internal_address - 1] = true;
 		if (e->datadir)
-			values[Anum_gp_segment_configuration_datadir - 1] = CStringGetTextDatum(e->datadir);
+			values[Anum_gp_segment_configuration_internal_datadir - 1] = CStringGetTextDatum(e->datadir);
 		else
-			nulls[Anum_gp_segment_configuration_datadir - 1] = true;
+			nulls[Anum_gp_segment_configuration_internal_datadir - 1] = true;
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}

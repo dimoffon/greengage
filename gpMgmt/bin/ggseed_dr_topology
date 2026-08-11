@@ -86,7 +86,7 @@ inserts=$(awk -F'\t' '
 	function q(s) { gsub(/\x27/, "\x27\x27", s); return "\x27" s "\x27" }
 	NF < 10 { next }
 	{
-		printf "INSERT INTO gp_segment_configuration (dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);\n", \
+		printf "INSERT INTO gp_segment_configuration_internal (dbid, content, role, preferred_role, mode, status, port, hostname, address, datadir) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);\n", \
 			$1, $2, q($3), q($4), q($5), q($6), $7, q($8), q($9), q($10)
 	}
 ' "$topology")
@@ -104,11 +104,11 @@ postgres --single -D "$datadir" \
 	-c gp_role=utility \
 	-c allow_system_table_mods=on \
 	template1 <<SQL
-DELETE FROM gp_segment_configuration;
+DELETE FROM gp_segment_configuration_internal;
 $inserts
-VACUUM FREEZE gp_segment_configuration;
+VACUUM FREEZE gp_segment_configuration_internal;
 CHECKPOINT;
 SQL
 
-echo "$prog: done -- gp_segment_configuration replaced and frozen."
+echo "$prog: done -- gp_segment_configuration_internal replaced and frozen."
 echo "$prog: next, arm DR mode (gp_dr_replica=on + dr_replica.signal + restore_command) and start continuous restore."

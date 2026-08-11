@@ -31,7 +31,7 @@ def _run_sql(sql, opts=None):
 
 def change_hostname(content, preferred_role, hostname, utility=False):
     with closing(dbconn.connect(dbconn.DbURL(dbname="template1"), utility=utility, allowSystemTableMods=True, unsetSearchPath=False)) as conn:
-        dbconn.execSQL(conn, "UPDATE gp_segment_configuration SET hostname = '{0}', address = '{0}' WHERE content = {1} AND preferred_role = '{2}'".format(hostname, content, preferred_role))
+        dbconn.execSQL(conn, "UPDATE gp_segment_configuration_internal SET hostname = '{0}', address = '{0}' WHERE content = {1} AND preferred_role = '{2}'".format(hostname, content, preferred_role))
 
 @when('the standby host is made unreachable')
 def impl(context):
@@ -55,7 +55,7 @@ def cleanup(context):
     subprocess.check_call(['gpstart', '-am'])
     _run_sql("""
         SET allow_system_table_mods='true';
-        UPDATE gp_segment_configuration
+        UPDATE gp_segment_configuration_internal
            SET hostname = coordinator.hostname,
                 address = coordinator.address
           FROM (
