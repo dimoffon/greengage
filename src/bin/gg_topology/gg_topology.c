@@ -153,10 +153,75 @@ do_dump(const char *datadir)
  * write -" is the migration path, and a data directory containing a space is
  * an eleven-token error here rather than a truncation later.
  */
+/*
+ * Split one line into exactly GPSEGCONFIGNUMATTR single-space-separated
+ * tokens, in place.
+ *
+ * Not sscanf: "%s" has no bound, so reading a field into a fixed buffer is a
+ * stack overflow waiting for a long hostname.  Splitting in place has no
+ * buffer to overflow, and it enforces the format's own rule -- the last field
+ * runs to end of line, so an eleventh token is a space inside a data
+ * directory rather than something to truncate.
+ */
+static bool
+split_entry(char *line, char **tok)
+{
+	int			n;
+
+	for (n = 0; n < GPSEGCONFIGNUMATTR - 1; n++)
+	{
+		char	   *sp = strchr(line, ' ');
+
+		if (sp == NULL || sp == line)
+			return false;
+
+		*sp = '\0';
+		tok[n] = line;
+		line = sp + 1;
+	}
+
+	if (*line == '\0' || strchr(line, ' ') != NULL)
+		return false;
+
+	tok[GPSEGCONFIGNUMATTR - 1] = line;
+	return true;
+}
+
+static int
+parse_field_int(const char *s, const char *what, int lineno, int lo, int hi)
+{
+	char	   *endptr;
+	long		val;
+
+	errno = 0;
+	val = strtol(s, &endptr, 10);
+	if (errno != 0 || endptr == s || *endptr != '\0' || val < lo || val > hi)
+	{
+		pg_log_error("line %d: %s \"%s\" is not an integer between %d and %d",
+					 lineno, what, s, lo, hi);
+		exit(1);
+	}
+
+	return (int) val;
+}
+
+static char
+parse_field_char(const char *s, const char *what, int lineno)
+{
+	if (strlen(s) != 1)
+	{
+		pg_log_error("line %d: %s \"%s\" must be a single character",
+					 lineno, what, s);
+		exit(1);
+	}
+
+	return s[0];
+}
+
 static void
 read_entries(FILE *fp, GpTopologyFile *topo)
 {
-	char		line[MAXPGPATH * 2];
+	char		line[MAXPGPATH * 4];
 	int			nalloc = 16;
 	int			lineno = 0;
 
@@ -166,31 +231,26 @@ read_entries(FILE *fp, GpTopologyFile *topo)
 	while (fgets(line, sizeof(line), fp) != NULL)
 	{
 		GpSegConfigEntry *e;
-		char		host[MAXPGPATH];
-		char		addr[MAXPGPATH];
-		char		dir[MAXPGPATH];
-		int			dbid,
-					content,
-					port;
-		char		role,
-					prole,
-					mode,
-					status;
+		char	   *tok[GPSEGCONFIGNUMATTR];
 		size_t		len = strlen(line);
 
 		lineno++;
+
+		if (len == sizeof(line) - 1 && line[len - 1] != '\n')
+		{
+			pg_log_error("line %d is too long", lineno);
+			exit(1);
+		}
 
 		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 			line[--len] = '\0';
 		if (len == 0)
 			continue;			/* blank lines are ignored, not an error */
 
-		if (sscanf(line, "%d %d %c %c %c %c %d %s %s %[^\n]",
-				   &dbid, &content, &role, &prole, &mode, &status, &port,
-				   host, addr, dir) != GPSEGCONFIGNUMATTR)
+		if (!split_entry(line, tok))
 		{
-			pg_log_error("line %d: expected %d fields", lineno,
-						 GPSEGCONFIGNUMATTR);
+			pg_log_error("line %d: expected %d fields separated by single spaces",
+						 lineno, GPSEGCONFIGNUMATTR);
 			exit(1);
 		}
 
@@ -205,16 +265,16 @@ read_entries(FILE *fp, GpTopologyFile *topo)
 
 		e = &topo->entries[topo->nentries++];
 		memset(e, 0, sizeof(*e));
-		e->dbid = (int16) dbid;
-		e->segindex = (int16) content;
-		e->role = role;
-		e->preferred_role = prole;
-		e->mode = mode;
-		e->status = status;
-		e->port = port;
-		e->hostname = pg_strdup(host);
-		e->address = pg_strdup(addr);
-		e->datadir = pg_strdup(dir);
+		e->dbid = (int16) parse_field_int(tok[0], "dbid", lineno, 1, PG_INT16_MAX);
+		e->segindex = (int16) parse_field_int(tok[1], "content", lineno, -1, PG_INT16_MAX);
+		e->role = parse_field_char(tok[2], "role", lineno);
+		e->preferred_role = parse_field_char(tok[3], "preferred_role", lineno);
+		e->mode = parse_field_char(tok[4], "mode", lineno);
+		e->status = parse_field_char(tok[5], "status", lineno);
+		e->port = parse_field_int(tok[6], "port", lineno, 1, 65535);
+		e->hostname = pg_strdup(tok[7]);
+		e->address = pg_strdup(tok[8]);
+		e->datadir = pg_strdup(tok[9]);
 	}
 }
 
