@@ -28,6 +28,14 @@ poll_mock (struct pollfd * p1, nfds_t p2, int p3)
 /* Actual function body */
 #include "../ftsprobe.c"
 
+/*
+ * The write set updateConfiguration() opens for a primary/mirror pair.  Never
+ * dereferenced by ftsprobe.c -- it only passes the pointer to
+ * probeWalRepUpdateConfig(), which is mocked -- but it must not be NULL, so
+ * that a test would notice if that ever stopped being true.
+ */
+static GpTopoWriteSet dummyTopoWriteSet;
+
 static void
 InitFtsProbeInfo(void)
 {
@@ -165,6 +173,7 @@ ExpectedPrimaryAndMirrorConfiguration(CdbComponentDatabaseInfo *primary,
 	/* mock probeWalRepUpdateConfig */
 	if (willUpdatePrimary)
 	{
+		expect_value(probeWalRepUpdateConfig, ws, &dummyTopoWriteSet);
 		expect_value(probeWalRepUpdateConfig, dbid, primary->config->dbid);
 		expect_value(probeWalRepUpdateConfig, segindex, primary->config->segindex);
 		expect_value(probeWalRepUpdateConfig, role, newPrimaryRole);
@@ -177,6 +186,7 @@ ExpectedPrimaryAndMirrorConfiguration(CdbComponentDatabaseInfo *primary,
 
 	if (willUpdateMirror)
 	{
+		expect_value(probeWalRepUpdateConfig, ws, &dummyTopoWriteSet);
 		expect_value(probeWalRepUpdateConfig, dbid, mirror->config->dbid);
 		expect_value(probeWalRepUpdateConfig, segindex, mirror->config->segindex);
 		expect_value(probeWalRepUpdateConfig, role, newMirrorRole);
@@ -193,6 +203,14 @@ PrimaryOrMirrorWillBeUpdated(int count)
 {
 	will_be_called_count(StartTransactionCommand, count);
 	will_be_called_count(GetTransactionSnapshot, count);
+
+	expect_any_count(GpTopoBeginWrite, cxt, count);
+	expect_value_count(GpTopoBeginWrite, level, GP_TOPO_WRITE_ROW, count);
+	will_return_count(GpTopoBeginWrite, &dummyTopoWriteSet, count);
+
+	expect_value_count(GpTopoCommitWrite, ws, &dummyTopoWriteSet, count);
+	will_be_called_count(GpTopoCommitWrite, count);
+
 	will_be_called_count(CommitTransactionCommand, count);
 }
 

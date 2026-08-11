@@ -28,6 +28,7 @@
 #include "catalog/gp_configuration_history.h"
 #include "catalog/indexing.h"
 #include "cdb/cdbfts.h"
+#include "cdb/cdbtopology.h"
 #include "cdb/cdbvars.h"
 #include "postmaster/fts.h"
 #include "postmaster/ftsprobe.h"
@@ -945,18 +946,29 @@ updateConfiguration(CdbComponentDatabaseInfo *primary,
 	ResourceOwner save = CurrentResourceOwner;
 	if (UpdateNeeded)
 	{
+		GpTopoWriteSet *ws;
+
 		StartTransactionCommand();
 		GetTransactionSnapshot();
 
+		/*
+		 * One write set for the pair.  Previously each of the two updates took
+		 * and dropped its own RowExclusiveLock, leaving a window in the middle
+		 * where a primary was marked down and its mirror not yet promoted.
+		 */
+		ws = GpTopoBeginWrite(CurTransactionContext, GP_TOPO_WRITE_ROW);
+
 		if (UpdatePrimary)
-			probeWalRepUpdateConfig(primary->config->dbid, primary->config->segindex,
+			probeWalRepUpdateConfig(ws, primary->config->dbid, primary->config->segindex,
 									newPrimaryRole, IsPrimaryAlive,
 									IsInSync);
 
 		if (UpdateMirror)
-			probeWalRepUpdateConfig(mirror->config->dbid, mirror->config->segindex,
+			probeWalRepUpdateConfig(ws, mirror->config->dbid, mirror->config->segindex,
 									newMirrorRole, IsMirrorAlive,
 									IsInSync);
+
+		GpTopoCommitWrite(ws);
 
 		CommitTransactionCommand();
 		CurrentResourceOwner = save;

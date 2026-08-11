@@ -73,7 +73,14 @@ extern bool FtsIsActive(void);
  * Interface for WALREP specific checking
  */
 extern void HandleFtsMessage(const char* query_string);
-extern void probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
+
+/*
+ * Edits the topology in `ws` (see cdb/cdbtopology.h); nothing is written until
+ * the write set is committed.
+ */
+struct GpTopoWriteSet;
+extern void probeWalRepUpdateConfig(struct GpTopoWriteSet *ws,
+									int16 dbid, int16 segindex, char role,
 									bool IsSegmentAlive, bool IsInSync);
 extern void probeUpdateConfHistory(const CdbComponentDatabaseInfo *primary,
 									bool isSegmentAlive,

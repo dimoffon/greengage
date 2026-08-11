@@ -29,7 +29,6 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
-#include "access/genam.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
@@ -44,7 +43,6 @@
 #include "postmaster/postmaster.h"
 #include "utils/builtins.h"
 #include "utils/faultinjector.h"
-#include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -188,9 +186,12 @@ CdbComponentDatabases *readCdbComponentInfoAndUpdateStatus(void)
 }
 
 void
-probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
+probeWalRepUpdateConfig(GpTopoWriteSet *ws,
+						int16 dbid, int16 segindex, char role,
 						bool IsSegmentAlive, bool IsInSync)
 {
+	GpSegConfigEntry *config;
+
 	AssertImply(IsInSync, IsSegmentAlive);
 
 	/*
@@ -229,61 +230,26 @@ probeWalRepUpdateConfig(int16 dbid, int16 segindex, char role,
 	}
 
 	/*
-	 * Find and update gp_segment_configuration tuple.
+	 * Find and update this segment's topology entry.
+	 *
+	 * Role, status and mode are the only three columns FTS has ever owned, and
+	 * assigning exactly those three is what keeps it that way: the provider
+	 * writes only the columns that differ from what it read, so nothing else
+	 * on this row can be touched from here.
 	 */
-	{
-		Relation configrel;
+	config = GpTopoFindByDbid(ws, dbid);
 
-		HeapTuple configtuple;
-		HeapTuple newtuple;
+	if (config == NULL)
+		elog(ERROR, "FTS cannot find dbid=%d in %s", dbid,
+			 GpSegmentConfigRelationName);
 
-		Datum configvals[Natts_gp_segment_configuration];
-		bool confignulls[Natts_gp_segment_configuration] = { false };
-		bool repls[Natts_gp_segment_configuration] = { false };
+	config->role = role;
+	config->status = IsSegmentAlive ? GP_SEGMENT_CONFIGURATION_STATUS_UP :
+		GP_SEGMENT_CONFIGURATION_STATUS_DOWN;
+	config->mode = IsInSync ? GP_SEGMENT_CONFIGURATION_MODE_INSYNC :
+		GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC;
 
-		ScanKeyData scankey;
-		SysScanDesc sscan;
-
-		configrel = table_open(GpSegmentConfigRelationId,
-							   RowExclusiveLock);
-
-		ScanKeyInit(&scankey,
-					Anum_gp_segment_configuration_dbid,
-					BTEqualStrategyNumber, F_INT2EQ,
-					Int16GetDatum(dbid));
-		sscan = systable_beginscan(configrel, GpSegmentConfigDbidIndexId,
-								   true, NULL, 1, &scankey);
-
-		configtuple = systable_getnext(sscan);
-
-		if (!HeapTupleIsValid(configtuple))
-		{
-			elog(ERROR, "FTS cannot find dbid=%d in %s", dbid,
-				 RelationGetRelationName(configrel));
-		}
-
-		configvals[Anum_gp_segment_configuration_role-1] = CharGetDatum(role);
-		repls[Anum_gp_segment_configuration_role-1] = true;
-
-		configvals[Anum_gp_segment_configuration_status-1] =
-			CharGetDatum(IsSegmentAlive ? GP_SEGMENT_CONFIGURATION_STATUS_UP :
-										GP_SEGMENT_CONFIGURATION_STATUS_DOWN);
-		repls[Anum_gp_segment_configuration_status-1] = true;
-
-		configvals[Anum_gp_segment_configuration_mode-1] =
-			CharGetDatum(IsInSync ? GP_SEGMENT_CONFIGURATION_MODE_INSYNC :
-						 GP_SEGMENT_CONFIGURATION_MODE_NOTINSYNC);
-		repls[Anum_gp_segment_configuration_mode-1] = true;
-
-		newtuple = heap_modify_tuple(configtuple, RelationGetDescr(configrel),
-									 configvals, confignulls, repls);
-		CatalogTupleUpdate(configrel, &configtuple->t_self, newtuple);
-
-		systable_endscan(sscan);
-		pfree(newtuple);
-
-		table_close(configrel, RowExclusiveLock);
-	}
+	GpTopoUpdate(ws, config);
 }
 
 void
