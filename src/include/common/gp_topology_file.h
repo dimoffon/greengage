@@ -60,4 +60,111 @@ typedef struct GpSegConfigEntry
 /* Number of serialized fields per entry, in order, as listed above. */
 #define GPSEGCONFIGNUMATTR 10
 
+
+/* ----------------------------------------------------------------
+ *				$PGDATA/gp_topology
+ * ----------------------------------------------------------------
+ *
+ * The on-disk form of a whole topology, for the file-backed store:
+ *
+ *		GPTOPOLOGY 1
+ *		system_identifier 7123456789012345678
+ *		generation 42
+ *		nentries 9
+ *		1 -1 p p s u 5432 cdw cdw /data/coordinator/gpseg-1
+ *		...
+ *		crc32c 9f3ac21b
+ *
+ * Text, for three reasons: the entry lines are byte-identical to the ones the
+ * catalog provider has always dumped for out-of-transaction readers, so
+ * migration is a header wrap; the file is a few hundred lines at most; and the
+ * first thing anyone does to a node that will not start is cat it.
+ *
+ * The CRC covers every byte from the start of the file up to and including the
+ * newline that ends the last entry -- i.e. everything but the crc32c line, so
+ * the writer never has to special-case where the covered region stops.  Unlike
+ * pg_control's, it is host-endian-independent: FIN_CRC32C byte-swaps, and every
+ * other byte in the file is ASCII.
+ *
+ * generation is the compare-and-set token, and doubles as the bootstrap
+ * marker: initdb writes generation 0 with no entries, and every real writer
+ * writes at least 1.  So "generation 0 with entries" is a corrupt header, and
+ * "generation 0" on a node that is supposed to be serving is a store nobody
+ * ever migrated into.  system_identifier catches a file copied in from an
+ * unrelated cluster -- but only one way round: a disaster-recovery replica is a
+ * physical copy of production and shares its identifier, so a match proves
+ * nothing.
+ *
+ * Nothing here reports errors.  Every entry point returns a typed code, because
+ * the same condition is FATAL in the postmaster, an ERROR in a backend and an
+ * exit(1) in initdb, and only the caller knows which.
+ */
+
+#define GP_TOPOLOGY_FILENAME		"gp_topology"
+#define GP_TOPOLOGY_TMP_PREFIX		"gp_topology.tmp"
+#define GP_TOPOLOGY_FORMAT_VERSION	1
+
+typedef struct GpTopologyFile
+{
+	int			version;		/* as read; always _FORMAT_VERSION on write */
+	uint64		system_identifier;	/* 0 == not recorded, not comparable */
+	uint64		generation;		/* CAS token; 0 == never written for real */
+	int			nentries;
+	GpSegConfigEntry *entries;	/* NULL iff nentries == 0 */
+} GpTopologyFile;
+
+typedef enum GpTopologyFileError
+{
+	GP_TOPOFILE_OK = 0,
+	GP_TOPOFILE_ENOENT,			/* read: no such file; errno preserved */
+	GP_TOPOFILE_IO,				/* open/read/write/rename failed; errno kept */
+	GP_TOPOFILE_TRUNCATED,		/* ended before the crc32c line */
+	GP_TOPOFILE_BAD_MAGIC,
+	GP_TOPOFILE_BAD_VERSION,
+	GP_TOPOFILE_BAD_CRC,
+	GP_TOPOFILE_BAD_COUNT,		/* nentries disagrees with the lines present */
+	GP_TOPOFILE_BAD_HEADER,		/* generation 0 with entries */
+	GP_TOPOFILE_BAD_SYNTAX,		/* an entry line; *errline names it */
+	GP_TOPOFILE_UNSERIALIZABLE,	/* write: a field that could not be read back */
+	GP_TOPOFILE_SYSID_CONFLICT	/* write: would overwrite another cluster's */
+} GpTopologyFileError;
+
+extern const char *gp_topology_file_error_str(GpTopologyFileError err);
+
+/*
+ * Parse `len` bytes of `buf`.  The caller owns buf throughout and may free it
+ * the moment this returns: every string is copied.  On success out->entries and
+ * its strings are freshly allocated (palloc in the backend, malloc in a
+ * frontend) and the read-side scratch fields are zeroed.  On any failure *out
+ * is left zeroed and nothing is allocated.
+ */
+extern GpTopologyFileError gp_topology_parse(const char *buf, size_t len,
+											 GpTopologyFile *out, int *errline);
+
+/*
+ * Render `topo`, CRC included.  Returns a NUL-terminated buffer the caller
+ * owns; *len is its length without the terminator.  Returns NULL with *err set
+ * to UNSERIALIZABLE and *errentry the 0-based offender when a field could not
+ * be written and read back -- whitespace in a string, a NULL string, a dbid or
+ * port out of range.  Never mutates *topo.
+ */
+extern char *gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
+								   GpTopologyFileError *err, int *errentry);
+
+extern GpTopologyFileError gp_topology_read_file(const char *datadir,
+												 GpTopologyFile *out,
+												 int *errline);
+
+/*
+ * Write durably: serialize, write a per-pid temp file, fsync, durable_rename.
+ * Never mutates *topo -- in particular it does not touch generation, which is
+ * the caller's decision.  Unless `force`, refuses when the file already there
+ * records a different system identifier.
+ */
+extern GpTopologyFileError gp_topology_write_file(const char *datadir,
+												  const GpTopologyFile *topo,
+												  bool force, int *errentry);
+
+extern void gp_topology_file_free(GpTopologyFile *topo);
+
 #endif							/* GP_TOPOLOGY_FILE_H */
