@@ -18,6 +18,7 @@
 
 #include "access/xlog_internal.h"	/* for pg_start/stop_backup */
 #include "catalog/pg_type.h"
+#include "common/gp_topology_file.h"
 #include "common/file_perm.h"
 #include "commands/progress.h"
 #include "lib/stringinfo.h"
@@ -224,6 +225,16 @@ static const struct exclude_list_item excludeFiles[] =
 {
 	/* Skip auto conf temporary file. */
 	{PG_AUTOCONF_FILENAME ".tmp", false},
+
+	/*
+	 * Skip in-progress cluster topology writes.  Prefix match: the temp name
+	 * carries the writer's pid, so that two writers cannot interleave into one
+	 * shared name.  The topology file itself is deliberately NOT excluded --
+	 * a mirror or standby staying in the same cluster wants its source's copy,
+	 * and a node that needs a different one has it overwritten after the copy,
+	 * exactly as internal.auto.conf is.
+	 */
+	{GP_TOPOLOGY_TMP_PREFIX, true},
 
 	/* Skip current log file temporary file */
 	{LOG_METAINFO_DATAFILE_TMP, false},
