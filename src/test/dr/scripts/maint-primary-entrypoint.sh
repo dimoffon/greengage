@@ -32,6 +32,7 @@
 set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin
+reset_archive    # this run's /archive starts empty; the volume outlives `down`
 
 FILLER_ROWS=${FILLER_ROWS:-5000}
 MIN_PAGES=${MIN_PAGES:-3}

@@ -38,6 +38,55 @@ ensure_gpadmin() {
 	fi
 	# As gpadmin from here on.
 	source "$GPHOME/greengage_path.sh"
+	clean_stale_runtime_state
+}
+
+# Remove what a PREVIOUS life of this container left behind.
+#
+# `docker-compose up` reuses a stopped container rather than recreating it, so a
+# second run starts with the first run's filesystem: a populated
+# gpAux/gpdemo/datadirs and, fatally, stale /tmp/.s.PGSQL.*.lock files.
+# gpinitsystem refuses on those -- it prints "Have lock file ... but no process
+# running on port 7002" and then exits anyway with "Host primary has an active
+# database process on port = 7002" -- so the primary dies seconds after start,
+# --abort-on-container-exit takes the DR container down with it, and the stand
+# looks like it is restarting in a loop.
+#
+# Nothing of ours is running yet: this is the entrypoint of a container that has
+# just started, so every socket and lock file here is dead by definition.
+clean_stale_runtime_state() {
+	local stale
+	# find, not `ls glob`: with no matches ls exits 2, and under `set -o pipefail`
+	# that propagates out of the pipeline and kills the entrypoint -- which is how
+	# the first version of this helper broke the very thing it was added to fix.
+	stale=$(find /tmp -maxdepth 1 -name '.s.PGSQL.*' 2>/dev/null | wc -l)
+	if [ "${stale:-0}" -gt 0 ]; then
+		log "lib: removing $stale stale postgres socket/lock file(s) from a previous run"
+		rm -f /tmp/.s.PGSQL.* 2>/dev/null || true
+	fi
+	if [ -d "$DEMO/datadirs" ]; then
+		log "lib: removing $DEMO/datadirs from a previous run"
+		rm -rf "$DEMO/datadirs" 2>/dev/null || true
+	fi
+	rm -f "$DEMO/gpdemo-env.sh" 2>/dev/null || true
+}
+
+# Primary-only: start this run's /archive from empty.
+#
+# /archive is a named volume, so it outlives `docker-compose down` (only -v
+# removes it) and every re-run inherits the last run's base backups, WAL and
+# ready markers.  That is worse than the lock-file failure it sits next to,
+# because nothing fails: the DR builds from yesterday's backups and replays
+# yesterday's WAL, and the suite goes green having tested a cluster nobody meant
+# to test.
+#
+# Only the primary calls this -- it produces everything under /archive -- and it
+# calls it before writing any marker, so a DR waiting on one cannot see a stale
+# marker survive the wipe.
+reset_archive() {
+	log "lib: resetting $ARCHIVE for this run"
+	rm -rf "$ARCHIVE"/* 2>/dev/null || true
+	mkdir -p "$WAL_ARCHIVE" "$BASEBACKUP"
 }
 
 # Root-only: gpadmin user + passwordless localhost ssh + sshd + /archive perms.

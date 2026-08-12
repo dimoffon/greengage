@@ -34,9 +34,27 @@ ensure_gpadmin
 set -E
 trap 'rc=$?; echo "maint-dr: ABORT line $LINENO: [$BASH_COMMAND] exited $rc" >&2; exit $rc' ERR
 
+# See dr-entrypoint.sh: /archive outlives `down`, so only a marker from THIS run
+# will do.
+DR_START=$(date +%s)
 log "maint-dr: waiting for primary to publish base backups ..."
-for _ in $(seq 1 900); do [ -f "$READY_MARKER" ] && break; sleep 2; done
-[ -f "$READY_MARKER" ] || die "timed out waiting for $READY_MARKER"
+marker_is_fresh() {
+	[ -f "$READY_MARKER" ] || return 1
+	[ "$(stat -c %Y "$READY_MARKER" 2>/dev/null || echo 0)" -ge "$DR_START" ]
+}
+warned=
+for _ in $(seq 1 900); do
+	marker_is_fresh && break
+	if [ -z "$warned" ] && [ -f "$READY_MARKER" ]; then
+		warned=1
+		log "maint-dr: NOTE $READY_MARKER predates this container -- ignoring it and waiting"
+		log "maint-dr:      for one from this run.  If the primary published BEFORE this"
+		log "maint-dr:      container started (e.g. the DR was restarted on its own), it"
+		log "maint-dr:      will not publish again: restart both, or 'down -v' and up."
+	fi
+	sleep 2
+done
+marker_is_fresh || die "no $READY_MARKER from this run; restart both containers, or 'docker-compose down -v' first"
 source "$ARCHIVE/maint_prod_state.env"
 log "maint-dr: production catalog densified to $PAGES_DENSE page(s); relfilenode $RFN_PRE"
 

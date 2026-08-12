@@ -10,9 +10,30 @@ set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
 
+# Wait for a marker from THIS run.  /archive is a named volume that survives
+# `docker-compose down`, so a marker left by the previous run would send this
+# container off to build a replica from last run's base backups -- green, and
+# meaningless.  The primary wipes /archive at its own start; requiring the marker
+# to be newer than this container closes the gap between the two.
+DR_START=$(date +%s)
 log "dr: waiting for primary to publish base backups ..."
-for _ in $(seq 1 600); do [ -f "$READY_MARKER" ] && break; sleep 2; done
-[ -f "$READY_MARKER" ] || die "timed out waiting for $READY_MARKER"
+marker_is_fresh() {
+	[ -f "$READY_MARKER" ] || return 1
+	[ "$(stat -c %Y "$READY_MARKER" 2>/dev/null || echo 0)" -ge "$DR_START" ]
+}
+warned=
+for _ in $(seq 1 600); do
+	marker_is_fresh && break
+	if [ -z "$warned" ] && [ -f "$READY_MARKER" ]; then
+		warned=1
+		log "dr: NOTE $READY_MARKER predates this container -- ignoring it and waiting"
+		log "dr:      for one from this run.  If the primary published BEFORE this"
+		log "dr:      container started (e.g. the DR was restarted on its own), it"
+		log "dr:      will not publish again: restart both, or 'down -v' and up."
+	fi
+	sleep 2
+done
+marker_is_fresh || die "no $READY_MARKER from this run; restart both containers, or 'docker-compose down -v' first"
 log "dr: primary ready; building DR cluster"
 
 # Derive the DR layout (content -> datadir, content -> port) from the published

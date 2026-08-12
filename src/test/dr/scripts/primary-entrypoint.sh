@@ -5,6 +5,7 @@
 set -euo pipefail
 source /dr/scripts/lib.sh
 ensure_gpadmin   # re-execs as gpadmin, sources greengage_path.sh
+reset_archive    # this run's /archive starts empty; the volume outlives `down`
 
 cd "$DEMO"
 
