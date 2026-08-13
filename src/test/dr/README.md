@@ -71,7 +71,20 @@ a while; subsequent runs reuse the image.
      replica" error). → `DR M1+M2 TEST: PASS (7/7)`.
 
    The DR coordinator is left **running**, so you can connect and read it:
-   `… exec dr env PGOPTIONS='-c gp_role=utility' psql -p 7000 postgres`.
+   `… exec dr psql -p 7000 postgres`.
+
+   > **Connect in dispatch mode — a plain `psql`.** Do **not** add
+   > `PGOPTIONS='-c gp_role=utility'` to read *data*: utility mode does not
+   > dispatch, so a distributed table is read on the coordinator alone and comes
+   > back **empty** — at every restore point, no matter what the replica has
+   > replayed or is serving. It looks exactly like a replica that never received
+   > the data, and every status surface will disagree with it, because the rows
+   > are on the segments. (This README said `gp_role=utility` until M2′ shipped,
+   > when the coordinator-only read was all a DR could serve; it now serves
+   > distributed reads, which is what you want.) Utility mode remains the right
+   > tool for the other job — inspecting **one node's own** state
+   > (`pg_is_in_recovery()`, `pg_last_served_restore_point()`, that node's slice
+   > of a table): `… exec dr env PGOPTIONS='-c gp_role=utility' psql -p 7002 postgres`.
 
 4. **M3 skew** — the regression test for the mid-advance torn read (scenario C-12,
    [ADR-0006](../../../doc/architecture/adr/0006-dr-read-replica.md) D8).
