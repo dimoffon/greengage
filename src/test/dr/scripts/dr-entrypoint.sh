@@ -439,6 +439,22 @@ if [ -n "$sok" ]; then
 			r=$(dsp 'set enable_seqscan=off; set enable_bitmapscan=off; explain (analyze, costs off, timing off, summary off) select count(k) from dr_ios;' | grep -ci 'Heap Fetches: 0$' || true)
 			[ "$r" = 0 ] && ok3 "M3 skew: no zero-heap-fetch index-only scan on the replica (visibility-map fast path disabled)" \
 						 || no3 "M3 skew: $r index-only scan node(s) reported 'Heap Fetches: 0' (the heap was skipped)"
+
+			# Reported 2026-08-13: with a subset re-pointed, every node is still
+			# SERVING the old point -- and status used to report only the point
+			# replay had reached and call it the consistent serve point, which
+			# describes this cluster wrongly.  The state under test right here is
+			# exactly that one, so assert the two points are reported apart.
+			r=$(dsp "select count(*) from gg_stat_dr_replica where served_restore_point = 'dr_rp1';")
+			[ "$r" = 3 ] && ok3 "M3 skew: all 3 nodes report served_restore_point=dr_rp1 (what reads are answered as of)" \
+						 || no3 "M3 skew: nodes serving dr_rp1 = '$r' (expected 3)"
+			r=$(dsp "select count(*) from gg_stat_dr_replica where restore_point = 'dr_rp2';")
+			[ "$r" = 2 ] && ok3 "M3 skew: 2 nodes report restore_point=dr_rp2 -- reached and served genuinely differ" \
+						 || no3 "M3 skew: nodes stopped at dr_rp2 = '$r' (expected 2)"
+			r=$(dsp "select coalesce(consistent_restore_point,'<null>')||'|'||coalesce(consistent_paused_point,'<null>') from gg_stat_dr_replica_summary;")
+			[ "$r" = "dr_rp1|<null>" ] \
+				&& ok3 "M3 skew: summary = serving dr_rp1, no single reached point (the skew is visible, not papered over)" \
+				|| no3 "M3 skew: summary consistent_restore_point|consistent_paused_point = '$r' (expected 'dr_rp1|<null>')"
 		else
 			no3 "M3 skew: segments did not reach dr_rp2 (skew state not established)"
 		fi
@@ -449,6 +465,13 @@ if [ -n "$sok" ]; then
 		r=$(dsp 'select count(*) from dr_m3;')
 		[ "$r" = 2 ] && ok3 "M3: after advancing to dr_rp2, dr_m3 count = 2 (new data now visible as-of rp2)" \
 					 || no3 "M3: as-of dr_rp2 dr_m3 = '$r' (expected 2)"
+		# The other half of the bug above: once the publish lands, the served point
+		# is the one that moved.  Reads changing and the summary changing must be
+		# the same event, or the status is lying in the other direction.
+		r=$(dsp "select coalesce(consistent_restore_point,'<null>')||'|'||coalesce(consistent_paused_point,'<null>') from gg_stat_dr_replica_summary;")
+		[ "$r" = "dr_rp2|dr_rp2" ] \
+			&& ok3 "M3: after the publish, served and reached agree at dr_rp2 (summary and reads moved together)" \
+			|| no3 "M3: summary consistent_restore_point|consistent_paused_point = '$r' (expected 'dr_rp2|dr_rp2')"
 
 		# --- M3 STRADDLE: advance to dr_rp_straddle, where a distributed 2PC txn T
 		#     spanning both segments straddles the cut -- its DISTRIBUTED_COMMIT is
@@ -546,10 +569,18 @@ if [ -n "$sok" ]; then
 	ok6() { log "dr-test: PASS  $1"; p6=$((p6+1)); }
 	no6() { log "dr-test: FAIL  $1"; f6=$((f6+1)); }
 	for _ in $(seq 1 60); do [ -f "$ARCHIVE/gg_ready" ] && break; sleep 2; done
-	if $GG stat 2>&1 | grep -q "consistent serve point: dr_rp_straddle_done"; then
-		ok6 "ggdr stat: consistent serve point = dr_rp_straddle_done"
+	# 'serving reads as of', not the old 'consistent serve point': stat reports the
+	# served point and the reached point as two lines now, because they are two
+	# facts and a cluster can hold them apart.
+	if $GG stat 2>&1 | grep -q "serving reads as of: dr_rp_straddle_done"; then
+		ok6 "ggdr stat: serving reads as of dr_rp_straddle_done"
 	else
-		no6 "ggdr stat: did not report dr_rp_straddle_done"; $GG stat 2>&1 | tail -6 >&2
+		no6 "ggdr stat: did not report dr_rp_straddle_done"; $GG stat 2>&1 | tail -8 >&2
+	fi
+	if $GG stat 2>&1 | grep -q "replay stopped at:   dr_rp_straddle_done$"; then
+		ok6 "ggdr stat: reports the reached point separately, and it agrees after a whole-cluster switch"
+	else
+		no6 "ggdr stat: 'replay stopped at' did not report a clean dr_rp_straddle_done"; $GG stat 2>&1 | tail -8 >&2
 	fi
 	if $GG switch dr_rp_switch 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_switch'"; then
 		ok6 "ggdr switch dr_rp_switch: all 3 nodes advanced to the new restore point"
@@ -559,8 +590,8 @@ if [ -n "$sok" ]; then
 	r=$(dsp "select count(*) from gg_switch;")
 	[ "$r" = 5 ] && ok6 "ggdr switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \
 				 || no6 "ggdr switch: gg_switch = '$r' (expected 5)"
-	if $GG stat 2>&1 | grep -q "consistent serve point: dr_rp_switch"; then
-		ok6 "ggdr stat: consistent serve point moved to dr_rp_switch"
+	if $GG stat 2>&1 | grep -q "serving reads as of: dr_rp_switch"; then
+		ok6 "ggdr stat: the served point moved to dr_rp_switch"
 	else
 		no6 "ggdr stat: did not report dr_rp_switch after the switch"
 	fi
