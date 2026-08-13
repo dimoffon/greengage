@@ -18,6 +18,7 @@
 
 #include <unistd.h>
 
+#include "access/dr_served_snapshot.h"
 #include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -608,6 +609,34 @@ pg_last_paused_restore_point(PG_FUNCTION_ARGS)
 	char		name[MAXFNAMELEN];
 
 	GetPausedRestorePointName(name, sizeof(name));
+	if (name[0] == '\0')
+		PG_RETURN_NULL();
+
+	PG_RETURN_TEXT_P(cstring_to_text(name));
+}
+
+/*
+ * Greengage DR: report the name of the restore point this node is currently
+ * SERVING reads from -- the image frozen when replay reached that point and
+ * published once every node had arrived.  NULL when nothing is published: a node
+ * still short of its first restore point (which answers no reads at all), or a
+ * cluster that has left recovery.
+ *
+ * Separate from pg_last_paused_restore_point() because the two genuinely differ,
+ * and the difference is invisible without this.  Replay REACHING a point does not
+ * make a node serve it -- only the publish does, and the publish is cluster-wide
+ * because a cut is only consistent once every node is at it.  Anything that
+ * re-points a subset of nodes (ggdr switch --content) therefore leaves every node
+ * paused at N while all of them still serve N-1, for as long as the operator
+ * leaves it that way.  Reporting the paused point and calling it the serve point
+ * -- which is all status could do before -- describes that cluster wrongly.
+ */
+Datum
+pg_last_served_restore_point(PG_FUNCTION_ARGS)
+{
+	char		name[MAXFNAMELEN];
+
+	DRServedSnapshotGetName(name, sizeof(name));
 	if (name[0] == '\0')
 		PG_RETURN_NULL();
 

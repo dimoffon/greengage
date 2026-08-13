@@ -1570,6 +1570,18 @@ UNION ALL
 -- forever.  On a promoted cluster that is stale trivia dressed up as status --
 -- and it makes rpo_seconds grow without bound for a cluster that has no RPO at
 -- all.  Both go NULL the moment the node leaves recovery.
+-- restore_point and served_restore_point are different questions and a DR
+-- replica can answer them differently: the first is the point replay has
+-- REACHED and stopped at, the second is the point this node ANSWERS READS as
+-- of.  Reaching a point does not start serving it -- only the cluster-wide
+-- publish does, because a cut is consistent only once every node is at it -- so
+-- re-pointing a subset of nodes (ggdr switch --content) leaves them paused at N
+-- and still serving N-1.  Report both, and let the rollup below decide which one
+-- the phrase "safe to serve" belongs to.
+--
+-- served_restore_point is guarded out of recovery for the same reason replay_lsn
+-- is: the shared-memory image outlives the promotion that stopped anyone reading
+-- from it, and reporting it on a promoted cluster is stale trivia.
 CREATE VIEW gg_stat_dr_replica AS
   SELECT -1 AS gp_segment_id, 'coordinator'::text AS role,
          (current_setting('hot_standby')::bool AND pg_is_in_recovery()) AS dr_replica,
@@ -1577,7 +1589,8 @@ CREATE VIEW gg_stat_dr_replica AS
          (SELECT pg_last_wal_replay_lsn() WHERE pg_is_in_recovery()) AS replay_lsn,
          (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()) AS replay_time,
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false) AS is_paused,
-         pg_last_paused_restore_point() AS restore_point
+         pg_last_paused_restore_point() AS restore_point,
+         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery()) AS served_restore_point
 UNION ALL
   SELECT gp_segment_id, 'segment'::text,
          (current_setting('hot_standby')::bool AND pg_is_in_recovery()),
@@ -1585,19 +1598,36 @@ UNION ALL
          (SELECT pg_last_wal_replay_lsn() WHERE pg_is_in_recovery()),
          (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()),
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false),
-         pg_last_paused_restore_point()
+         pg_last_paused_restore_point(),
+         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery())
     FROM gp_dist_random('gp_id') ORDER BY 1;
 
 -- Single-row rollup: is the whole cluster a consistent, safe-to-serve window?
 -- rpo_seconds is NULL once the cluster is out of recovery, because replay_time is.
+--
+-- consistent_restore_point answers "what are reads answered as of, cluster-wide"
+-- and is therefore computed from served_restore_point.  It used to be computed
+-- from the paused point, which is the same answer for every cluster driven only
+-- by whole-cluster switches -- and the wrong answer, silently, for one where a
+-- subset was re-pointed: it named a point no node was serving yet and called it
+-- safe to serve.
+--
+-- consistent_paused_point is the same rollup over the point replay has reached.
+-- It is what a promotion cuts at (gg_dr_promote() requires every node paused at
+-- one point, and the frozen images die with recovery), so the two are reported
+-- side by side rather than one replacing the other.  They differ exactly while a
+-- subset switch is outstanding.
 CREATE VIEW gg_stat_dr_replica_summary AS
   SELECT count(*) AS node_count,
          bool_and(dr_replica) AS all_dr_replica,
          bool_and(in_recovery) AS all_in_recovery,
          bool_and(is_paused) AS all_paused,
+         CASE WHEN count(*) = count(served_restore_point)
+               AND count(DISTINCT served_restore_point) = 1
+              THEN max(served_restore_point) ELSE NULL END AS consistent_restore_point,
          CASE WHEN count(*) = count(restore_point)
                AND count(DISTINCT restore_point) = 1
-              THEN max(restore_point) ELSE NULL END AS consistent_restore_point,
+              THEN max(restore_point) ELSE NULL END AS consistent_paused_point,
          extract(epoch FROM now() - min(replay_time)) AS rpo_seconds
     FROM gg_stat_dr_replica;
 

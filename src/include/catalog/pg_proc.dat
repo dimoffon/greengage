@@ -6090,6 +6090,13 @@
   prorettype => 'text', proargtypes => '',
   prosrc => 'pg_last_paused_restore_point' },
 
+# Greengage DR: the point reads are answered as of, which is not the same as the
+# point replay has reached -- see xlogfuncs.c.
+{ oid => '7019', descr => 'name of the restore point this node is serving reads from (Greengage DR)',
+  proname => 'pg_last_served_restore_point', provolatile => 'v',
+  prorettype => 'text', proargtypes => '',
+  prosrc => 'pg_last_served_restore_point' },
+
 # Greengage DR: cluster-wide recovery control (see xlogfuncs_gp.c).
 { oid => '7017', descr => 'advance the whole DR cluster to a restore point and pause there',
   proname => 'gg_dr_switch', provolatile => 'v', proparallel => 'u',

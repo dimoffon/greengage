@@ -634,7 +634,7 @@ gg_dr_promote(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("not every node is paused at restore point \"%s\"", local),
-				 errhint("Check gg_stat_dr_replica_summary.consistent_restore_point.")));
+				 errhint("Check gg_stat_dr_replica_summary.consistent_paused_point -- a promotion cuts at the point replay has reached, not at the one being served.")));
 
 	/*
 	 * Promote first, then resume: promotion only arms the trigger, and the
