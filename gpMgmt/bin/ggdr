@@ -217,6 +217,105 @@ def _psql_dispatch(sql, timeout=None):
         return 1, "", str(e)
 
 
+def _elapsed(seconds):
+    """Report to the second past a minute -- reports come every 30s, and a bare
+    '%dm' prints '1m' twice in a row, which reads like a stuck clock."""
+    if seconds < 60:
+        return "%ds" % seconds
+    minutes, rest = divmod(seconds, 60)
+    return "%dm" % minutes if rest == 0 else "%dm%02ds" % (minutes, rest)
+
+
+def _progress(states, target, prev_lsn=None):
+    """One line saying where each node is, relative to `target`.
+
+    prev_lsn (content -> replay_lsn from the previous report) turns "replaying"
+    into something worth reading: a node whose LSN has not moved since the last
+    check is not slow, it is receiving nothing -- which on an archive-fed replica
+    almost always means the WAL carrying `target` has not been archived yet.  That
+    is the difference between "wait" and "go force a WAL switch on production",
+    and it is not visible from a single sample.
+    """
+    out = []
+    for s in states:
+        label = _label(s["content"])
+        if not s["ok"]:
+            # A node short of its first restore point refuses every read, so it
+            # reports as unreadable here.  Say which of the two it is.
+            out.append("%s %s" % (label,
+                                  "no image to serve yet"
+                                  if "no restore point to serve from" in s["err"]
+                                  else "UNREACHABLE"))
+        elif s["paused"] and s["restore_point"] == target:
+            out.append("%s at '%s'" % (label, target))
+        else:
+            stalled = prev_lsn is not None and prev_lsn.get(s["content"]) == s["replay_lsn"]
+            out.append("%s replaying %s%s"
+                       % (label, s["replay_lsn"] or "?",
+                          " (no new WAL since last check)" if stalled else ""))
+    return ", ".join(out)
+
+
+def _psql_dispatch_watched(sql, nodes, target, poll=2, every=15):
+    """Run a blocking dispatch on the coordinator, reporting progress while it waits.
+
+    gg_dr_switch() does the waiting server-side and must: only the coordinator can
+    establish that every node has arrived, and only it may publish.  But it says
+    nothing until it returns, and the wait is unbounded by design -- how long it
+    takes is a property of how much WAL lies between here and the target, WAL that
+    production may not have archived yet.  A silent unbounded wait is
+    indistinguishable from a hang, and has been read as one.
+
+    So the waiting is watched from here, where the per-node utility connections
+    are: every `poll * every` seconds, say where each node has got to.  The
+    watching costs nothing between reports -- it is the same blocking wait, and
+    the node queries only run when a report is due.
+    """
+    cmd = ["psql", "-p", str(COORD_PORT), "-d", DB, "-v", "ON_ERROR_STOP=1", "-qtAc", sql]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        return 1, "", str(e)
+
+    polls = 0
+    prev_lsn = None
+    while True:
+        try:
+            # Retrying communicate() after a timeout does not lose output, which
+            # is what makes this safe to poll rather than reading the pipes by
+            # hand and risking a full-buffer deadlock.
+            out, err = proc.communicate(timeout=poll)
+            return proc.returncode, (out or "").strip(), (err or "").strip()
+        except subprocess.TimeoutExpired:
+            pass
+        except KeyboardInterrupt:
+            # Ctrl-C reached psql too (same process group); it asks the server to
+            # cancel the query, which is how gg_dr_switch() is meant to be
+            # interrupted.  Wait for that to land rather than leaving a stray psql.
+            print()
+            print("ggdr switch: cancelled -- asking the server to cancel gg_dr_switch() ...")
+            try:
+                out, err = proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+            print("  '%s' stays armed on every node, so each still stops there when its WAL"
+                  % target)
+            print("  arrives -- but nothing published it.  Re-run 'ggdr switch %s' to finish."
+                  % target)
+            return 1, (out or "").strip(), (err or "").strip()
+
+        polls += 1
+        if polls % every == 0:
+            states = [node_state(*n) for n in nodes]
+            arrived = sum(1 for s in states
+                          if s["ok"] and s["paused"] and s["restore_point"] == target)
+            print("  ... still waiting (%s): %d/%d at '%s' -- %s"
+                  % (_elapsed(polls * poll), arrived, len(nodes), target,
+                     _progress(states, target, prev_lsn)))
+            prev_lsn = dict((s["content"], s["replay_lsn"]) for s in states if s["ok"])
+
+
 def cmd_switch(restore_point, contents=None):
     nodes = get_nodes()
     if contents is not None:
@@ -232,7 +331,8 @@ def cmd_switch(restore_point, contents=None):
     print("ggdr switch: waiting for every node to reach '%s' "
           "(no timeout -- Ctrl-C cancels) ..." % restore_point)
     quoted = restore_point.replace("'", "''")
-    rc, out, err = _psql_dispatch("select pg_catalog.gg_dr_switch('%s');" % quoted)
+    rc, out, err = _psql_dispatch_watched(
+        "select pg_catalog.gg_dr_switch('%s');" % quoted, nodes, restore_point)
     if rc == 0 and out in ("t", "true"):
         print("ggdr switch: DONE -- all %d node(s) paused at '%s' "
               "(consistent serve point)" % (len(nodes), restore_point))
@@ -392,24 +492,21 @@ def cmd_switch_content(restore_point, targets):
           % ("it" if len(targets) == 1 else "them", restore_point))
     try:
         polls = 0
+        prev_lsn = None
         while True:
             states = [node_state(*n) for n in targets]
             if all(s["ok"] and s["paused"] and s["restore_point"] == restore_point
                    for s in states):
                 break
-            # A wait with no timeout must not also be silent: an unreachable node
-            # and a node still chewing through WAL look identical from outside
-            # until something says which it is.
+            # A wait with no timeout must not also be silent: a node receiving no
+            # WAL and a node still chewing through it look identical from outside
+            # until something says which is which.  Same report the cluster-wide
+            # switch prints, so the two paths read alike.
             polls += 1
             if polls % 15 == 0:
-                elapsed = polls * 2
                 print("  ... still waiting (%s): %s"
-                      % ("%dm" % (elapsed // 60) if elapsed >= 60 else "%ds" % elapsed,
-                         ", ".join("%s %s" % (_label(s["content"]),
-                                              ("at '%s'" % s["restore_point"] if s["paused"]
-                                               else "replaying %s" % (s["replay_lsn"] or "?"))
-                                              if s["ok"] else "UNREACHABLE")
-                                   for s in states)))
+                      % (_elapsed(polls * 2), _progress(states, restore_point, prev_lsn)))
+                prev_lsn = dict((s["content"], s["replay_lsn"]) for s in states if s["ok"])
             time.sleep(2)
     except KeyboardInterrupt:
         print()
