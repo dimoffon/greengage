@@ -508,11 +508,23 @@ if [ -n "$sok" ]; then
 	# resuming.  The view must still report the ACTUALLY-reached restore point
 	# (pg_last_paused_restore_point / XLogCtl), proving it is the C accessor and
 	# not the configured GUC -- the correctness gap the M5 plan flagged.
+	# ALTER SYSTEM, not sed: gg_dr_switch() armed dr_rp_straddle_done through
+	# AlterSystemSetConfigFile, so the live value is in postgresql.auto.conf --
+	# which also overrides postgresql.conf.  The sed this replaces went looking
+	# for it in postgresql.conf, matched nothing, and left the GUC exactly where
+	# it was, so the check below used to pass without re-pointing anything.
 	for nd in "${NODES[@]}"; do
-		sed -i "s/gp_pause_on_restore_point_replay = 'dr_rp_straddle_done'/gp_pause_on_restore_point_replay = 'never_reached'/" "${nd%:*}/postgresql.conf"
+		PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres \
+			-Atc "alter system set gp_pause_on_restore_point_replay = 'never_reached';" >/dev/null 2>&1 || true
 		PGOPTIONS='-c gp_role=utility' psql -p "${nd##*:}" -d postgres -Atc 'select pg_reload_conf();' >/dev/null 2>&1 || true
 	done
 	sleep 3
+	# Assert the re-point landed before asserting what survives it: a re-point
+	# that silently does nothing makes the served-N check below prove nothing.
+	r=$(q "show gp_pause_on_restore_point_replay;")
+	[ "$r" = "never_reached" ] \
+		&& ok5 "M5: the pause GUC really is re-pointed to 'never_reached' (so the check below is not vacuous)" \
+		|| no5 "M5: pause GUC = '$r' after the re-point (expected never_reached -- the served-N check below would prove nothing)"
 	r=$(dsp "select coalesce(consistent_restore_point,'<null>') from gg_stat_dr_replica_summary;")
 	[ "$r" = "dr_rp_straddle_done" ] \
 		&& ok5 "M5: served-N is FAITHFUL -- view still reports dr_rp_straddle_done after GUC re-pointed to 'never_reached' (C accessor, not GUC)" \
