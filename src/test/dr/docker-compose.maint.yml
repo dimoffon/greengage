@@ -41,7 +41,9 @@ x-gpdb: &gpdb
     - ./scripts:/dr/scripts:ro
     # Same as the default fixture: this one builds and promotes the replica with
     # the working tree's ggdr, so mount it over the copy baked into the image.
-    - ../../../gpMgmt/bin/ggdr:/home/gpadmin/gpdb_src/gpMgmt/bin/ggdr:ro
+    # The directory and not the file -- see docker-compose.yml for why a
+    # single-file mount silently stops seeing edits.
+    - ../../../gpMgmt/bin:/home/gpadmin/gpdb_src/gpMgmt/bin:ro
 
 services:
   primary:

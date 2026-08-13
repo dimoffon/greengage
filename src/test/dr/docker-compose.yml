@@ -29,7 +29,15 @@ x-gpdb: &gpdb
     # baked into the image by the Dockerfile's `COPY .`), and gpMgmt does not
     # install it into $GPHOME either -- so this path is the only copy that runs.
     # Mounted over like the scripts, so editing ggdr costs an `up`, not a rebuild.
-    - ../../../gpMgmt/bin/ggdr:/home/gpadmin/gpdb_src/gpMgmt/bin/ggdr:ro
+    #
+    # The DIRECTORY, not the file.  A single-file bind mount resolves to an inode
+    # when the container is created, and an editor that writes a temp file and
+    # renames it over the target -- which is most of them -- leaves the container
+    # holding the old inode forever: the edit is on disk, `docker exec cat` shows
+    # the old text, and nothing says why.  A directory mount resolves the name on
+    # every open.  Safe here because the image's copy of gpMgmt/bin is identical
+    # to the tree it was built from -- the build generates nothing in it.
+    - ../../../gpMgmt/bin:/home/gpadmin/gpdb_src/gpMgmt/bin:ro
 
 services:
   primary:
