@@ -83,7 +83,7 @@ extern void KnownAssignedTransactionIdsIdleMaintenance(void);
 extern int	GetMaxSnapshotXidCount(void);
 extern int	GetMaxSnapshotSubxidCount(void);
 
-extern void DRCaptureServedSnapshot(const char *rpName);
+extern void DRCaptureServedSnapshot(const char *rpName, TimestampTz rpTime);
 
 extern Snapshot GetSnapshotData(Snapshot snapshot, DtxContext distributedTransactionContext);
 

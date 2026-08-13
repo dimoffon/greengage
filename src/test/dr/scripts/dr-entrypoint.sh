@@ -582,10 +582,23 @@ if [ -n "$sok" ]; then
 	else
 		no6 "ggdr stat: 'replay stopped at' did not report a clean dr_rp_straddle_done"; $GG stat 2>&1 | tail -8 >&2
 	fi
+	# rpo_seconds is the age of the SERVED CUT, so advancing to a LATER restore
+	# point must lower it.  Production created dr_rp_switch well after
+	# dr_rp_straddle_done and the switch itself takes a second or two, so the drop
+	# is that gap less the switch.  Under the old definition -- age of the last
+	# replayed commit -- this was free to go either way, and with production idle
+	# between the two points it could only grow.
+	rpo_before=$(dsp "select round(rpo_seconds)::int from gg_stat_dr_replica_summary;")
 	if $GG switch dr_rp_switch 2>&1 | grep -q "all 3 node(s) paused at 'dr_rp_switch'"; then
 		ok6 "ggdr switch dr_rp_switch: all 3 nodes advanced to the new restore point"
 	else
 		no6 "ggdr switch dr_rp_switch: did not reach on all nodes"
+	fi
+	rpo_after=$(dsp "select round(rpo_seconds)::int from gg_stat_dr_replica_summary;")
+	if [ -n "$rpo_before" ] && [ -n "$rpo_after" ] && [ "$rpo_after" -lt "$rpo_before" ] 2>/dev/null; then
+		ok6 "ggdr: rpo_seconds fell with the served cut ($rpo_before -> $rpo_after; it ages the cut, not the last commit)"
+	else
+		no6 "ggdr: rpo_seconds went '$rpo_before' -> '$rpo_after' (expected a drop; a newer cut is a younger recovery point)"
 	fi
 	r=$(dsp "select count(*) from gg_switch;")
 	[ "$r" = 5 ] && ok6 "ggdr switch: gg_switch=5 now visible (data advanced to dr_rp_switch)" \

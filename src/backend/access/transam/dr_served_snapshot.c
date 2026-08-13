@@ -29,6 +29,7 @@ typedef struct DRSnapshotSlot
 {
 	bool		valid;
 	char		rpName[MAXFNAMELEN];
+	TimestampTz rpTime;			/* when PRODUCTION created the restore point */
 	TransactionId xmin;
 	TransactionId xmax;
 	int			subxcnt;
@@ -98,6 +99,7 @@ DRServedSnapshotShmemInit(void)
 
 void
 DRServedSnapshotStorePending(const char *rpName,
+							 TimestampTz rpTime,
 							 TransactionId xmin,
 							 TransactionId xmax,
 							 const TransactionId *subxip,
@@ -126,6 +128,7 @@ DRServedSnapshotStorePending(const char *rpName,
 	SpinLockAcquire(&DRServedSnapshotCtlData->mutex);
 	slot = &DRServedSnapshotCtlData->pending;
 	strlcpy(slot->rpName, rpName, MAXFNAMELEN);
+	slot->rpTime = rpTime;
 	slot->xmin = xmin;
 	slot->xmax = xmax;
 	slot->subxcnt = subxcnt;
@@ -157,6 +160,7 @@ DRServedSnapshotPublish(const char *rpName)
 	if (pending->valid && strcmp(pending->rpName, rpName) == 0)
 	{
 		strlcpy(served->rpName, pending->rpName, MAXFNAMELEN);
+		served->rpTime = pending->rpTime;
 		served->xmin = pending->xmin;
 		served->xmax = pending->xmax;
 		served->subxcnt = pending->subxcnt;
@@ -205,6 +209,22 @@ DRServedSnapshotPublishIfNothingServed(const char *rpName)
 		return;
 
 	DRServedSnapshotPublish(rpName);
+}
+
+TimestampTz
+DRServedSnapshotGetTime(void)
+{
+	TimestampTz when = 0;
+
+	if (DRServedSnapshotCtlData == NULL)
+		return 0;
+
+	SpinLockAcquire(&DRServedSnapshotCtlData->mutex);
+	if (DRServedSnapshotCtlData->served.valid)
+		when = DRServedSnapshotCtlData->served.rpTime;
+	SpinLockRelease(&DRServedSnapshotCtlData->mutex);
+
+	return when;
 }
 
 bool

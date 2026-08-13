@@ -2142,13 +2142,16 @@ CreateDistributedSnapshot(DistributedSnapshot *ds)
  * has applied the restore-point record and before it pauses.  Replay is about to
  * stop, so the image taken here is exactly the restore point's.
  *
+ * rpTime is the restore point's own timestamp from the record -- production's
+ * clock when the point was taken, which is the recovery point this image serves.
+ *
  * It is stored as *pending*: the coordinator publishes it only once every node
  * has arrived (see dr_served_snapshot.h).  Publishing here instead would serve
  * the new point on whichever node reached it first while a lagging segment is
  * still short of it -- the torn read, one restore point later.
  */
 void
-DRCaptureServedSnapshot(const char *rpName)
+DRCaptureServedSnapshot(const char *rpName, TimestampTz rpTime)
 {
 	TransactionId xmin;
 	TransactionId xmax;
@@ -2174,7 +2177,7 @@ DRCaptureServedSnapshot(const char *rpName)
 
 	LWLockRelease(ProcArrayLock);
 
-	DRServedSnapshotStorePending(rpName, xmin, xmax, subxip, subxcnt, suboverflowed);
+	DRServedSnapshotStorePending(rpName, rpTime, xmin, xmax, subxip, subxcnt, suboverflowed);
 
 	pfree(subxip);
 }

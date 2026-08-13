@@ -531,7 +531,7 @@ actually served.
 
 - **`gg_stat_dr_replica`** — one row per node
   (`gp_segment_id, role, dr_replica, in_recovery, replay_lsn, replay_time, is_paused,
-  restore_point, served_restore_point`). The coordinator row `UNION ALL`s the per-segment
+  restore_point, served_restore_point, served_restore_point_time`). The coordinator row `UNION ALL`s the per-segment
   rows via `gp_dist_random('gp_id')`, so each node reports its own local recovery state.
   The last two columns answer different questions and a replica can answer them
   differently: `restore_point` (`pg_last_paused_restore_point()`) is where replay stopped,
@@ -544,8 +544,12 @@ actually served.
   rollup — non-`NULL` only when every node is serving the same point, which is what
   "safe to serve" means — and `consistent_paused_point` is the same rollup over
   `restore_point`, which is what a promotion would cut at. They differ exactly while a
-  subset switch is outstanding. `rpo_seconds` is
-  `extract(epoch FROM now() - min(replay_time))`.
+  subset switch is outstanding. `rpo_seconds` is the **age of the served cut** —
+  `extract(epoch FROM now() - min(served_restore_point_time))`, i.e. how long ago
+  production created the restore point these reads answer as of, which is exactly
+  what promoting here would lose. It is not the age of the last replayed commit:
+  that measures replay liveness, so an idle production drives it up without bound
+  on a replica holding every row production has.
 
 There is deliberately **no cross-node LSN column** — each node has its own WAL/LSN space, so
 LSNs are not comparable across nodes. The consistency signal is "all at the same restore
@@ -864,7 +868,8 @@ $ ggdr stat
   cluster: 3 node(s), all in recovery, all paused
   serving reads as of: rp_hourly_42   (safe to serve as-of-N reads)
   replay stopped at:   rp_hourly_42
-  RPO: ~13s behind production's last replayed commit
+  RPO: the served cut was taken on production ~13s ago; anything committed
+       after it is not here, and is what promoting now would lose.
 
 # The two point columns agree for a cluster driven only by whole-cluster switches.
 # After 'switch <rp> --content …' they do not, and that is the state to read

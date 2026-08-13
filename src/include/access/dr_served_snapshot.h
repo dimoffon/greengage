@@ -38,6 +38,7 @@
 #define DR_SERVED_SNAPSHOT_H
 
 #include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 #include "storage/lock.h"
 
 extern Size DRServedSnapshotShmemSize(void);
@@ -50,6 +51,7 @@ extern void DRServedSnapshotShmemInit(void);
  * contents because KnownAssignedXids lives in procarray.c.
  */
 extern void DRServedSnapshotStorePending(const char *rpName,
+										 TimestampTz rpTime,
 										 TransactionId xmin,
 										 TransactionId xmax,
 										 const TransactionId *subxip,
@@ -76,6 +78,17 @@ extern bool DRServedSnapshotIsPublished(void);
 
 /* Name of the restore point currently being served, or "" if none. */
 extern void DRServedSnapshotGetName(char *buf, Size buflen);
+
+/*
+ * When the served restore point was created ON PRODUCTION -- the record's own
+ * rp_time, not the moment this node replayed it.  0 if nothing is served.
+ *
+ * This is the recovery point: everything production committed after it is absent
+ * here.  It is the only honest staleness measure an archive-fed replica has,
+ * because it never talks to production and so cannot know how far ahead
+ * production has got.
+ */
+extern TimestampTz DRServedSnapshotGetTime(void);
 
 /*
  * Copy the served image into an in-progress snapshot.  subxip must have room for

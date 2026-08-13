@@ -177,14 +177,16 @@ def node_state(content, address, port):
         "coalesce(pg_last_paused_restore_point(),'') ||'%(s)s'|| "
         "coalesce(pg_last_wal_replay_lsn()::text,'') ||'%(s)s'|| "
         "coalesce(round(extract(epoch from now()-pg_last_xact_replay_timestamp()))::text,'') ||'%(s)s'|| "
-        "coalesce((select pg_last_served_restore_point() where pg_is_in_recovery()),'');"
+        "coalesce((select pg_last_served_restore_point() where pg_is_in_recovery()),'') ||'%(s)s'|| "
+        "coalesce((select round(extract(epoch from now()-pg_last_served_restore_point_time())) "
+        "          where pg_is_in_recovery())::text,'');"
         % {"s": FIELDSEP}
     )
     rc, out, err = _psql(port, sql, host=host)
     if rc != 0 or not out:
         return {"content": content, "ok": False, "err": err or "no response"}
-    parts = (out.split(FIELDSEP) + [""] * 6)[:6]
-    inrec, paused, rp, lsn, age, served = parts
+    parts = (out.split(FIELDSEP) + [""] * 7)[:7]
+    inrec, paused, rp, lsn, age, served, served_age = parts
     truthy = ("t", "true")
     return {
         "content": content, "ok": True,
@@ -194,6 +196,7 @@ def node_state(content, address, port):
         "replay_lsn": lsn,
         "replay_age": age,
         "served_point": served,
+        "served_age": served_age,
     }
 
 
@@ -592,7 +595,13 @@ def cmd_stat():
     stopped = set(s["restore_point"] for s in reachable if s["paused"])
     consistent = bool(served) and len(served) == 1 and "" not in served
     consistent_stop = all_paused and len(stopped) == 1 and "" not in stopped
-    ages = [int(s["replay_age"]) for s in reachable if s["replay_age"]]
+    # RPO is the age of the SERVED CUT -- how long ago production took the restore
+    # point these reads answer as of -- and not the age of the last replayed
+    # commit, which is what it used to be.  The old number measured replay
+    # liveness, so an idle production (nothing to replay) drove it up without
+    # bound on a replica that was holding every row production had.  max() over
+    # the nodes, so a split serve point reports the oldest cut.
+    ages = [int(s["served_age"]) for s in reachable if s["served_age"]]
     rpo = max(ages) if ages else None
 
     if not all_paused and any_paused:
@@ -622,7 +631,9 @@ def cmd_stat():
     else:
         print("  replay stopped at:   nodes are not all stopped at one point")
     if rpo is not None:
-        print("  RPO: ~%ds behind production's last replayed commit" % rpo)
+        print("  RPO: the served cut was taken on production ~%s ago; anything committed"
+              % _elapsed(rpo))
+        print("       after it is not here, and is what promoting now would lose.")
     return 0
 
 

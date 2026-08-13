@@ -6097,6 +6097,11 @@
   prorettype => 'text', proargtypes => '',
   prosrc => 'pg_last_served_restore_point' },
 
+{ oid => '7020', descr => 'when production created the restore point this node is serving (Greengage DR)',
+  proname => 'pg_last_served_restore_point_time', provolatile => 'v',
+  prorettype => 'timestamptz', proargtypes => '',
+  prosrc => 'pg_last_served_restore_point_time' },
+
 # Greengage DR: cluster-wide recovery control (see xlogfuncs_gp.c).
 { oid => '7017', descr => 'advance the whole DR cluster to a restore point and pause there',
   proname => 'gg_dr_switch', provolatile => 'v', proparallel => 'u',

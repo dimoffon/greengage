@@ -5993,7 +5993,8 @@ pauseRecoveryOnRestorePoint(XLogReaderState *record)
 			 */
 			if (IsDRReplicaMode())
 			{
-				DRCaptureServedSnapshot(recordRestorePointData->rp_name);
+				DRCaptureServedSnapshot(recordRestorePointData->rp_name,
+											recordRestorePointData->rp_time);
 				DRServedSnapshotPublishIfNothingServed(recordRestorePointData->rp_name);
 			}
 

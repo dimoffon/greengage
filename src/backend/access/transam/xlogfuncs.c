@@ -644,6 +644,34 @@ pg_last_served_restore_point(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Greengage DR: when PRODUCTION created the restore point this node is serving
+ * -- the record's own rp_time, not the moment replay reached it.  NULL when
+ * nothing is served.
+ *
+ * This is the replica's recovery point, and the only honest staleness measure it
+ * has: everything production committed after this instant is absent here, and an
+ * archive-fed replica never talks to production, so it cannot know how much that
+ * is.  The obvious alternative -- age of the last replayed commit
+ * (pg_last_xact_replay_timestamp) -- measures the wrong thing between restore
+ * points: an idle production commits nothing, so that age grows without bound on
+ * a replica holding every row production has.
+ *
+ * Compares production's clock against the reader's.  So does every other lag
+ * figure built on a replayed timestamp; skew between the two hosts lands here
+ * unchanged.
+ */
+Datum
+pg_last_served_restore_point_time(PG_FUNCTION_ARGS)
+{
+	TimestampTz when = DRServedSnapshotGetTime();
+
+	if (when == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TIMESTAMPTZ(when);
+}
+
+/*
  * Returns bool with current recovery mode, a global state.
  */
 Datum

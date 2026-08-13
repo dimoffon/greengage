@@ -1590,7 +1590,8 @@ CREATE VIEW gg_stat_dr_replica AS
          (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()) AS replay_time,
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false) AS is_paused,
          pg_last_paused_restore_point() AS restore_point,
-         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery()) AS served_restore_point
+         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery()) AS served_restore_point,
+         (SELECT pg_last_served_restore_point_time() WHERE pg_is_in_recovery()) AS served_restore_point_time
 UNION ALL
   SELECT gp_segment_id, 'segment'::text,
          (current_setting('hot_standby')::bool AND pg_is_in_recovery()),
@@ -1599,7 +1600,8 @@ UNION ALL
          (SELECT pg_last_xact_replay_timestamp() WHERE pg_is_in_recovery()),
          coalesce((SELECT pg_is_wal_replay_paused() WHERE pg_is_in_recovery()), false),
          pg_last_paused_restore_point(),
-         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery())
+         (SELECT pg_last_served_restore_point() WHERE pg_is_in_recovery()),
+         (SELECT pg_last_served_restore_point_time() WHERE pg_is_in_recovery())
     FROM gp_dist_random('gp_id') ORDER BY 1;
 
 -- Single-row rollup: is the whole cluster a consistent, safe-to-serve window?
@@ -1617,6 +1619,19 @@ UNION ALL
 -- one point, and the frozen images die with recovery), so the two are reported
 -- side by side rather than one replacing the other.  They differ exactly while a
 -- subset switch is outstanding.
+--
+-- rpo_seconds is the age of the SERVED CUT: how long ago production created the
+-- restore point these reads are answered as of, so everything committed after it
+-- is what a promotion here would lose.  That is the recovery point, and it is the
+-- only one an archive-fed replica can compute -- it never talks to production, so
+-- it cannot know production's current LSN.
+--
+-- It used to be now() - min(replay_time), the age of the last replayed COMMIT,
+-- which measures the wrong thing the moment production goes idle: no commits to
+-- replay means that age grows without bound on a replica that is holding every
+-- row production has.  Observed reporting "~694s behind" on a replica whose every
+-- table matched production exactly.  min() over the nodes, so a split serve point
+-- reports the oldest cut rather than the newest.
 CREATE VIEW gg_stat_dr_replica_summary AS
   SELECT count(*) AS node_count,
          bool_and(dr_replica) AS all_dr_replica,
@@ -1628,7 +1643,7 @@ CREATE VIEW gg_stat_dr_replica_summary AS
          CASE WHEN count(*) = count(restore_point)
                AND count(DISTINCT restore_point) = 1
               THEN max(restore_point) ELSE NULL END AS consistent_paused_point,
-         extract(epoch FROM now() - min(replay_time)) AS rpo_seconds
+         extract(epoch FROM now() - min(served_restore_point_time)) AS rpo_seconds
     FROM gg_stat_dr_replica;
 
 GRANT SELECT ON gg_stat_dr_replica TO PUBLIC;
