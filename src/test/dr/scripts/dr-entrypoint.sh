@@ -384,14 +384,22 @@ if [ -n "$sok" ]; then
 		#     still instead of lasting milliseconds.  dr_m3's second row is replayed and
 		#     locally committed on a segment throughout, so a live snapshot shows 2.  The
 		#     frozen dr_rp1 image must keep showing 1 until gg_dr_switch() publishes.
-		skew_segments_to() {  # $1=from $2=to : rearm+resume the segments only
-			local content dd pp
-			for content in $SEG_CONTENTS; do
-				dd=${DR_DATADIR[$content]}; pp=${DR_PORT[$content]}
-				sed -i "s/gp_pause_on_restore_point_replay = '$1'/gp_pause_on_restore_point_replay = '$2'/" "$dd/postgresql.conf"
-				PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_reload_conf();'       >/dev/null 2>&1 || true
-				PGOPTIONS='-c gp_role=utility' psql -p "$pp" -d postgres -Atc 'select pg_wal_replay_resume();' >/dev/null 2>&1 || true
-			done
+		# 'ggdr switch --content' IS this primitive: arm the segments' pause target,
+		# reload, resume, wait -- and deliberately not publish, which is precisely
+		# what holds the coordinator serving dr_rp1 while the segments sit at
+		# dr_rp2.  Doing it by hand here meant sed'ing postgresql.conf, which is not
+		# where the target lives once anything has switched: gg_dr_switch() writes
+		# it with ALTER SYSTEM, and postgresql.auto.conf overrides postgresql.conf.
+		#
+		# `timeout` because ggdr's wait has none by design (an operator Ctrl-Cs it),
+		# and a test needs a bound.  Killing the wait leaves the target armed, so
+		# the segments still get there -- segs_reached below is what decides.
+		skew_segments_to() {  # $1=to : re-point the segments only, publishing nothing
+			set +e
+			timeout 300 $GG switch "$1" --content "${SEG_CONTENTS//$'\n'/,}" 2>&1 | sed 's/^/    ggdr: /'
+			local rc=${PIPESTATUS[0]}
+			set -e
+			[ "$rc" = 0 ] || log "dr-test: M3 skew: 'ggdr switch --content' exited $rc (see above)"
 		}
 		segs_reached() {  # $1=restore point : true iff every SEGMENT has replayed to it
 			local content pp
@@ -403,7 +411,7 @@ if [ -n "$sok" ]; then
 			return 0
 		}
 		log "dr-test: M3 skew: driving the SEGMENTS to dr_rp2 while the coordinator stays at dr_rp1 ..."
-		skew_segments_to dr_rp1 dr_rp2
+		skew_segments_to dr_rp2
 		for _ in $(seq 1 90); do segs_reached dr_rp2 && break; sleep 2; done
 		if segs_reached dr_rp2; then
 			ok3 "M3 skew: segments replayed to dr_rp2, coordinator still at dr_rp1 (mid-advance state, held)"

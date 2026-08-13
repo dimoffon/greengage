@@ -122,7 +122,7 @@ of reporting a pass, so an inconclusive run can never look green.
 | File | Purpose |
 |---|---|
 | `Dockerfile` | Ubuntu 24.04 + build deps; builds Greengage (`--disable-orca --without-python`) to `/usr/local/greengage-db-devel`; gpadmin/sshd handled at runtime. |
-| `docker-compose.yml` | `primary` + `dr` services, shared `wal_archive` volume, `privileged`/`sysctls`/`ulimits`/`init`. |
+| `docker-compose.yml` | `primary` + `dr` services, shared `wal_archive` volume, `privileged`/`sysctls`/`ulimits`/`init`. Bind-mounts `scripts/` **and `gpMgmt/bin/ggdr`** (the fixture runs ggdr from the source tree, and gpMgmt does not install it), so editing either costs an `up`, not a rebuild. |
 | `scripts/lib.sh` | Shared helpers + container (gpadmin/sshd) setup. |
 | `scripts/primary-entrypoint.sh` | Build cluster, archive, base-backup, change topology, record change LSN. |
 | `scripts/dr-entrypoint.sh` | Restore, arm DR mode, start the coordinator as a live hot-standby, run the M1+M2 assertions. |

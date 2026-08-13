@@ -7,8 +7,8 @@
 #   docker compose -f src/test/dr/docker-compose.yml down -v        # tear down
 #
 # Both services share one image (built once from the repo root). The cluster
-# work is done by the per-service entrypoint scripts under ./scripts (bind-
-# mounted for fast iteration without rebuilding the image).
+# work is done by the per-service entrypoint scripts under ./scripts, and by
+# ggdr -- both bind-mounted for fast iteration without rebuilding the image.
 version: "3.8"
 
 x-gpdb: &gpdb
@@ -25,6 +25,11 @@ x-gpdb: &gpdb
   volumes:
     - wal_archive:/archive
     - ./scripts:/dr/scripts:ro
+    # The fixture runs ggdr straight from the source tree ($SRC/gpMgmt/bin/ggdr,
+    # baked into the image by the Dockerfile's `COPY .`), and gpMgmt does not
+    # install it into $GPHOME either -- so this path is the only copy that runs.
+    # Mounted over like the scripts, so editing ggdr costs an `up`, not a rebuild.
+    - ../../../gpMgmt/bin/ggdr:/home/gpadmin/gpdb_src/gpMgmt/bin/ggdr:ro
 
 services:
   primary:
