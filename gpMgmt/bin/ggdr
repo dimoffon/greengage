@@ -36,11 +36,15 @@ Subcommands
         deliberately does NOT publish the new point: publishing is
         cluster-wide by construction, so reads go on answering as of the point the
         last whole-cluster switch published.  What it leaves behind is a SKEWED
-        cluster -- nodes stopped at different points, no consistent cut, 'promote'
-        refuses -- which is what it is for: driving one node by hand (catching up a
+        cluster -- which is what it is for: driving one node by hand (catching up a
         lagging segment, holding segments ahead of the coordinator for a test)
         without moving what the cluster serves.  A plain 'switch <rp>' afterwards
         brings the rest there and publishes.
+
+        Note what that means even once EVERY node has been re-pointed one at a
+        time: they are all stopped at the new point and all still serving the old
+        one, because nothing published.  'stat' reports both points for exactly
+        this reason; 'promote' cuts at the point replay stopped at.
 
   pause
         Immediately pause replay on every node at its current point.  This is NOT
@@ -51,8 +55,11 @@ Subcommands
 
   stat
         Print per-node recovery statistics and a cluster summary: in recovery?
-        paused? served restore point, replay LSN, replay age, and whether there is
-        a consistent serve point (all nodes paused at the same restore point).
+        paused? replay LSN, replay age, and TWO restore points that are easy to
+        confuse -- serve_at, the point this node answers reads as of, and
+        stopped_at, the point its replay reached.  Only a cluster-wide
+        publish moves the first, so they differ for as long as a '--content'
+        switch is left outstanding, and only the first is safe to serve.
 
   promote [--at <rp>] [--yes] [--timeout <secs>] [--keep-history]
         Promote the DR cluster to a normal ONLINE read-write cluster, cutting every
@@ -159,19 +166,25 @@ def _label(content):
 
 def node_state(content, address, port):
     host, port = _conn(content, address, port)
+    # served_point is asked for separately from restore_point on purpose: the
+    # first is what this node ANSWERS READS as of, the second is where its replay
+    # stopped.  Only a cluster-wide publish moves the first, so anything that
+    # re-points a subset of nodes leaves them different, and a status that shows
+    # only the second describes such a cluster wrongly.
     sql = (
         "select coalesce(pg_is_in_recovery()::text,'') ||'%(s)s'|| "
         "coalesce((case when pg_is_in_recovery() then pg_is_wal_replay_paused() else false end)::text,'') ||'%(s)s'|| "
         "coalesce(pg_last_paused_restore_point(),'') ||'%(s)s'|| "
         "coalesce(pg_last_wal_replay_lsn()::text,'') ||'%(s)s'|| "
-        "coalesce(round(extract(epoch from now()-pg_last_xact_replay_timestamp()))::text,'');"
+        "coalesce(round(extract(epoch from now()-pg_last_xact_replay_timestamp()))::text,'') ||'%(s)s'|| "
+        "coalesce((select pg_last_served_restore_point() where pg_is_in_recovery()),'');"
         % {"s": FIELDSEP}
     )
     rc, out, err = _psql(port, sql, host=host)
     if rc != 0 or not out:
         return {"content": content, "ok": False, "err": err or "no response"}
-    parts = (out.split(FIELDSEP) + [""] * 5)[:5]
-    inrec, paused, rp, lsn, age = parts
+    parts = (out.split(FIELDSEP) + [""] * 6)[:6]
+    inrec, paused, rp, lsn, age, served = parts
     truthy = ("t", "true")
     return {
         "content": content, "ok": True,
@@ -180,6 +193,7 @@ def node_state(content, address, port):
         "restore_point": rp,
         "replay_lsn": lsn,
         "replay_age": age,
+        "served_point": served,
     }
 
 
@@ -409,11 +423,24 @@ def cmd_switch_content(restore_point, targets):
               % (_label(state["content"]), state["restore_point"], state["replay_lsn"] or "-"))
     print("ggdr switch: DONE -- %d node(s) stopped at '%s'."
           % (len(targets), restore_point))
-    print("  NOTE: '%s' was NOT published as the served point -- publishing is" % restore_point)
-    print("        cluster-wide by construction, so reads go on answering as of the")
-    print("        point the last whole-cluster switch published.  The cluster is now")
-    print("        skewed: 'stat' reports no consistent serve point and 'promote' refuses")
-    print("        until 'ggdr switch %s' (no --content) brings the rest there." % restore_point)
+
+    # Name the point reads are actually answered as of, rather than describing it.
+    # This is the number the operator came for, and computing it from every node
+    # (not just the ones re-pointed) is the only way to be sure of it.
+    served = set(s["served_point"] for s in (node_state(*n) for n in get_nodes()) if s["ok"])
+    if len(served) == 1 and "" not in served:
+        as_of = "'%s'" % next(iter(served))
+    elif served and served != {""}:
+        as_of = "a SPLIT point (%s -- see 'ggdr stat')" % sorted(x or "none" for x in served)
+    else:
+        as_of = "nothing (no node has published a point yet)"
+    print("  NOTE: this did NOT publish '%s'.  Publishing is cluster-wide by" % restore_point)
+    print("        construction -- a point is only consistent once EVERY node is at it --")
+    print("        so reads go on answering as of %s." % as_of)
+    print("        Run 'ggdr switch %s' (no --content) to bring the rest there and" % restore_point)
+    print("        publish it.  Until then 'ggdr stat' shows the two points separately,")
+    print("        and a promotion would cut at '%s', not at what is served."
+          % restore_point)
     return 0
 
 
@@ -440,9 +467,10 @@ def cmd_stat():
     states = [node_state(*n) for n in nodes]
 
     print("ggdr: DR read-replica recovery status\n")
-    hdr = "  %-8s %-11s %-11s %-6s %-22s %-16s %s"
-    print(hdr % ("content", "role", "in_recovery", "paused", "restore_point", "replay_lsn", "replay_age"))
-    print("  " + " ".join("-" * n for n in (8, 11, 11, 6, 22, 16, 10)))
+    hdr = "  %-8s %-11s %-11s %-6s %-22s %-22s %-16s %s"
+    print(hdr % ("content", "role", "in_recovery", "paused", "serve_at", "stopped_at",
+                 "replay_lsn", "replay_age"))
+    print("  " + " ".join("-" * n for n in (8, 11, 11, 6, 22, 22, 16, 10)))
     for s in states:
         role = "coordinator" if s["content"] == -1 else "segment"
         if not s["ok"]:
@@ -452,14 +480,21 @@ def cmd_stat():
         print(hdr % (s["content"], role,
                      "yes" if s["in_recovery"] else "no",
                      "yes" if s["paused"] else "no",
+                     s["served_point"] or "-",
                      s["restore_point"] or "-", s["replay_lsn"] or "-", age))
 
     reachable = [s for s in states if s["ok"]]
     all_rec = bool(reachable) and all(s["in_recovery"] for s in reachable)
     all_paused = bool(reachable) and all(s["paused"] for s in reachable)
     any_paused = any(s["paused"] for s in reachable)
-    served = set(s["restore_point"] for s in reachable if s["paused"])
-    consistent = all_paused and len(served) == 1 and "" not in served
+    # The serve point is what every node is ANSWERING as of; the paused point is
+    # where replay stopped.  They are rolled up separately because they can
+    # disagree -- a subset switch leaves every node stopped at N and all of them
+    # serving N-1 -- and only the first one may be called safe to serve.
+    served = set(s["served_point"] for s in reachable)
+    stopped = set(s["restore_point"] for s in reachable if s["paused"])
+    consistent = bool(served) and len(served) == 1 and "" not in served
+    consistent_stop = all_paused and len(stopped) == 1 and "" not in stopped
     ages = [int(s["replay_age"]) for s in reachable if s["replay_age"]]
     rpo = max(ages) if ages else None
 
@@ -473,9 +508,22 @@ def cmd_stat():
     print("  cluster: %d node(s), %s, %s"
           % (len(states), "all in recovery" if all_rec else "NOT all in recovery", mode))
     if consistent:
-        print("  consistent serve point: %s   (safe to serve as-of-N reads)" % next(iter(served)))
+        print("  serving reads as of: %s   (safe to serve as-of-N reads)" % next(iter(served)))
+    elif served and served != {""}:
+        print("  serving reads as of: SPLIT %s   (nodes disagree -- run 'switch <rp>' "
+              "to republish one point)" % sorted(x or "none" for x in served))
     else:
-        print("  consistent serve point: none   (advancing, or nodes skewed)")
+        print("  serving reads as of: nothing   (no node has reached a restore point yet)")
+    if consistent_stop:
+        stop = next(iter(stopped))
+        print("  replay stopped at:   %s%s"
+              % (stop, "" if consistent and stop in served
+                 else "   <-- REACHED but NOT SERVED; reads still answer as of the point above"))
+        if consistent and stop not in served:
+            print("        publish it with 'ggdr switch %s' (no --content); a promotion would "
+                  "cut here, not at what is served." % stop)
+    else:
+        print("  replay stopped at:   nodes are not all stopped at one point")
     if rpo is not None:
         print("  RPO: ~%ds behind production's last replayed commit" % rpo)
     return 0
