@@ -531,14 +531,20 @@ actually served.
 
 - **`gg_stat_dr_replica`** — one row per node
   (`gp_segment_id, role, dr_replica, in_recovery, replay_lsn, replay_time, is_paused,
-  restore_point`). The coordinator row `UNION ALL`s the per-segment rows via
-  `gp_dist_random('gp_id')`, so each node reports its own local recovery state.
+  restore_point, served_restore_point`). The coordinator row `UNION ALL`s the per-segment
+  rows via `gp_dist_random('gp_id')`, so each node reports its own local recovery state.
+  The last two columns answer different questions and a replica can answer them
+  differently: `restore_point` (`pg_last_paused_restore_point()`) is where replay stopped,
+  `served_restore_point` (`pg_last_served_restore_point()`) is what reads are answered as
+  of. Only the cluster-wide publish moves the second, so re-pointing a **subset** of nodes
+  (`ggdr switch --content`) leaves them stopped at N and still serving N-1.
 - **`gg_stat_dr_replica_summary`** — one-row rollup:
   `node_count, all_dr_replica, all_in_recovery, all_paused, consistent_restore_point,
-  rpo_seconds`. `consistent_restore_point` is non-`NULL` **only** when every node is paused
-  at the same restore point
-  (`CASE WHEN count(*) = count(restore_point) AND count(DISTINCT restore_point) = 1 THEN
-  max(restore_point) ELSE NULL END`); `rpo_seconds` is
+  consistent_paused_point, rpo_seconds`. `consistent_restore_point` is the **served**
+  rollup — non-`NULL` only when every node is serving the same point, which is what
+  "safe to serve" means — and `consistent_paused_point` is the same rollup over
+  `restore_point`, which is what a promotion would cut at. They differ exactly while a
+  subset switch is outstanding. `rpo_seconds` is
   `extract(epoch FROM now() - min(replay_time))`.
 
 There is deliberately **no cross-node LSN column** — each node has its own WAL/LSN space, so
@@ -841,7 +847,7 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 |---------|---------|
 | `switch <restore_point>` | Stop-and-go: re-point every node to `<restore_point>`, resume, wait until **all** are paused there, and publish that cut for reading. A wrapper around `gg_dr_switch()`; the publish step is why it cannot be done node by node. |
 | `pause` | Immediately pause replay on every node at its current point. **Not** a consistent cut. |
-| `stat` | Per-node recovery statistics + a cluster summary (mode, consistent serve point, RPO). |
+| `stat` | Per-node recovery statistics + a cluster summary (mode, the point reads are served as of, the point replay stopped at, RPO). |
 | `promote [--at <rp>] [--no-restart] [--yes] [--timeout <s>]` | Promote the DR cluster to online read-write at a single consistent restore point. Irreversible. |
 | `create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir> [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]` | Build the whole DR replica from per-instance base backups (§6.1). |
 
@@ -850,14 +856,23 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 ```bash
 # Status — the summary line tells you if it is safe to serve consistent reads:
 $ ggdr stat
-  content  role         in_recovery paused restore_point          replay_lsn        replay_age
-  -1       coordinator  yes         yes    rp_hourly_42            0/9A00028         12s
-  0        segment      yes         yes    rp_hourly_42            0/7C00190         12s
-  1        segment      yes         yes    rp_hourly_42            0/7C00210         13s
+  content  role         in_recovery paused serve_at               stopped_at             replay_lsn        replay_age
+  -1       coordinator  yes         yes    rp_hourly_42           rp_hourly_42            0/9A00028         12s
+  0        segment      yes         yes    rp_hourly_42           rp_hourly_42            0/7C00190         12s
+  1        segment      yes         yes    rp_hourly_42           rp_hourly_42            0/7C00210         13s
 
   cluster: 3 node(s), all in recovery, all paused
-  consistent serve point: rp_hourly_42   (safe to serve as-of-N reads)
+  serving reads as of: rp_hourly_42   (safe to serve as-of-N reads)
+  replay stopped at:   rp_hourly_42
   RPO: ~13s behind production's last replayed commit
+
+# The two point columns agree for a cluster driven only by whole-cluster switches.
+# After 'switch <rp> --content …' they do not, and that is the state to read
+# carefully: every node stopped at the new point, all of them still serving the
+# old one, because nothing published.
+  serving reads as of: rp_hourly_42   (safe to serve as-of-N reads)
+  replay stopped at:   rp_hourly_43   <-- REACHED but NOT SERVED; reads still answer as of the point above
+        publish it with 'ggdr switch rp_hourly_43' (no --content); a promotion would cut here, not at what is served.
 
 # Advance the whole cluster to the next hourly restore point (consistent cut):
 $ ggdr switch rp_hourly_43
