@@ -21,7 +21,7 @@ reach only the coordinator can drive recovery without this tool:
 
 Subcommands
 -----------
-  switch <restore_point>
+  switch <restore_point> [--content <c>[,<c>...]]
         Stop-and-go: make every node pause at restore point <restore_point>, then
         start serving it.  A thin wrapper around gg_dr_switch() on the coordinator
         -- see there for why the serving step has to be cluster-wide.  Reads keep
@@ -30,6 +30,17 @@ Subcommands
         now (recovery only moves forward); arming it before production creates it
         is fine.  Calling it with the point the cluster is already stopped at is
         a no-op re-publish, not a runaway.
+
+        --content re-points ONLY the named nodes (segment content ids; 'coord' or
+        -1 for the coordinator, e.g. --content 0,1 or --content coord) and
+        deliberately does NOT publish the new point: publishing is
+        cluster-wide by construction, so reads go on answering as of the point the
+        last whole-cluster switch published.  What it leaves behind is a SKEWED
+        cluster -- nodes stopped at different points, no consistent cut, 'promote'
+        refuses -- which is what it is for: driving one node by hand (catching up a
+        lagging segment, holding segments ahead of the coordinator for a test)
+        without moving what the cluster serves.  A plain 'switch <rp>' afterwards
+        brings the rest there and publishes.
 
   pause
         Immediately pause replay on every node at its current point.  This is NOT
@@ -192,8 +203,10 @@ def _psql_dispatch(sql, timeout=None):
         return 1, "", str(e)
 
 
-def cmd_switch(restore_point):
+def cmd_switch(restore_point, contents=None):
     nodes = get_nodes()
+    if contents is not None:
+        return cmd_switch_content(restore_point, _select_nodes(contents, nodes))
     print("ggdr switch: re-pointing %d node(s) to restore point '%s'"
           % (len(nodes), restore_point))
     # Driven through gg_dr_switch() rather than node by node.  Re-pointing each
@@ -222,6 +235,186 @@ def cmd_switch(restore_point):
     print("  (is '%s' a restore point production created AHEAD of the current point, "
           "and already archived?)" % restore_point)
     return 1
+
+
+def _select_nodes(spec, nodes):
+    """Resolve a --content spec ('0', '-1,0,2') to node tuples, in cluster order.
+
+    Duplicates collapse and order is the cluster's, not the spec's, so
+    '--content 2,0,0' and '--content 0,2' arm the same two nodes the same way.
+    """
+    known = dict((n[0], n) for n in nodes)
+    wanted = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        # 'coord' as well as -1, because argparse reads a bare '-1,0' as an option
+        # string, not as this flag's value: '--content -1' parses, '--content -1,0'
+        # does not.  'coord,0' spells the same thing without the trap (and
+        # '--content=-1,0' works too, for anyone who prefers the number).
+        if tok.lower() in ("coord", "coordinator"):
+            content = -1
+        else:
+            try:
+                content = int(tok)
+            except ValueError:
+                sys.exit("ggdr switch: --content takes comma-separated content ids "
+                         "('coord' or -1 for the coordinator), not '%s'." % tok)
+        if content not in known:
+            sys.exit("ggdr switch: this cluster has no node with content %d; it has %s."
+                     % (content, ", ".join(str(c) for c in sorted(known))))
+        wanted.add(content)
+    if not wanted:
+        sys.exit("ggdr switch: --content named no nodes.")
+    return [n for n in nodes if n[0] in wanted]
+
+
+def cmd_switch_content(restore_point, targets):
+    """Re-point SOME nodes at `restore_point`, deliberately without publishing it.
+
+    This is the per-node primitive gg_dr_switch() drives cluster-wide, exposed on
+    its own: arm the pause target, reload, resume, wait until the node is stopped
+    there.  What it leaves out is the publish -- and that omission is the whole
+    point of the flag, not a shortcut.  A node may only start serving a point once
+    EVERY node has arrived there (only then is the cut cross-node consistent), so
+    a publish driven from a subset would serve a point half the cluster has not
+    reached.  Reads therefore go on answering as of whatever the last whole-cluster
+    switch published, which is also why this is safe to run while the replica is
+    serving: it moves WAL, not the served image.
+
+    "Does not publish" is exact rather than nearly true, and the precheck below is
+    what makes it so.  Arriving at a restore point does publish it on a node that
+    has served NOTHING since its postmaster started (xlog.c ->
+    DRServedSnapshotPublishIfNothingServed) -- and such a node is refused here, so
+    every node this touches already has an image and keeps the one it has.
+
+    gg_dr_switch() itself is not reachable per node -- on a segment it is the
+    dispatched primitive (Gp_role == GP_ROLE_EXECUTE), and a utility-mode caller
+    lands in dr_control_precheck(), which refuses anything that is not a
+    coordinator in dispatch mode.  So the steps are spelled out here in SQL, in
+    the same order and with the same guards the backend uses.
+    """
+    if not restore_point:
+        sys.exit("ggdr switch: restore point name cannot be empty.")
+    quoted = restore_point.replace("'", "''")
+
+    print("ggdr switch: re-pointing %s to restore point '%s' (NOT publishing it)"
+          % (", ".join(_label(c) for c, _, _ in targets), restore_point))
+
+    before = {}
+    for node in targets:
+        state = node_state(*node)
+        if not state["ok"]:
+            # A node that has not reached its first restore point answers nothing
+            # (ExecutorStart refuses every read on a DR node with no frozen image),
+            # so the reload and the resume below are unreachable too -- only the
+            # ALTER SYSTEM would land, leaving it half-switched.  Say which of the
+            # two failures this is rather than calling it "unreachable".
+            if "no restore point to serve from" in state["err"]:
+                sys.exit("ggdr switch: %s has no served restore point yet, so it refuses "
+                         "the reads this needs -- it can be armed but not reloaded or "
+                         "resumed through SQL.  Let it replay to the target already in its "
+                         "postgresql.auto.conf (it does that unattended), then re-run this."
+                         % _label(node[0]))
+            sys.exit("ggdr switch: %s is unreachable (%s); refusing."
+                     % (_label(node[0]), state["err"]))
+        if not state["in_recovery"]:
+            sys.exit("ggdr switch: %s is not in recovery -- it has been promoted, and "
+                     "recovery only moves forward; refusing." % _label(node[0]))
+        before[node[0]] = state
+
+    # Arm every selected node before resuming any of it, exactly as
+    # dr_node_switch() + dr_reload_and_resume() do, and for the same reason: a node
+    # resumed before it has loaded the new target free-runs to the end of the WAL
+    # with nothing ahead to stop it.
+    #
+    # ALTER SYSTEM (postgresql.auto.conf) rather than an edit of postgresql.conf,
+    # because that is where the backend's dr_write_pause_target() puts it -- and
+    # auto.conf wins, so writing anywhere else would be silently overridden.  It
+    # goes in its own psql -c: several statements in one string form an implicit
+    # transaction block, which ALTER SYSTEM refuses.  Neither it nor the reload
+    # writes WAL, which is what makes both legal on a node in recovery.
+    for content, address, port in targets:
+        host, p = _conn(content, address, port)
+        rc, out, err = _psql(
+            p, "alter system set gp_pause_on_restore_point_replay = '%s';" % quoted, host=host)
+        if rc != 0:
+            sys.exit("ggdr switch: could not arm %s: %s"
+                     % (_label(content), err.splitlines()[0] if err else out or "psql failed"))
+        rc, out, err = _psql(p, "select pg_reload_conf();", host=host)
+        if rc != 0:
+            sys.exit("ggdr switch: %s did not reload its config: %s"
+                     % (_label(content), err.splitlines()[0] if err else out or "psql failed"))
+
+    # The resume is guarded in SQL, not on the reading above: a node already
+    # stopped AT the target must be left alone, because resuming it sends it past
+    # a point it has reached with nothing ahead to stop at -- and the wait below
+    # would then never see it paused.  Nodes do arrive there on their own; one that
+    # restarted replays to its armed target unattended.
+    for content, address, port in targets:
+        host, p = _conn(content, address, port)
+        rc, out, err = _psql(
+            p,
+            "select pg_wal_replay_resume() where pg_is_in_recovery() "
+            "and coalesce(pg_last_paused_restore_point(), '') <> '%s';" % quoted,
+            host=host)
+        if rc != 0:
+            sys.exit("ggdr switch: could not resume %s: %s"
+                     % (_label(content), err.splitlines()[0] if err else out or "psql failed"))
+        state = before[content]
+        if state["paused"] and state["restore_point"] == restore_point:
+            note = "already stopped there -- armed, left alone"
+        else:
+            note = "armed + resumed"
+        print("  %-13s (port %d): %s" % (_label(content), port, note))
+
+    # No timeout, like the cluster-wide switch: how long this takes is a property
+    # of how much WAL lies between here and the target, which the caller cannot
+    # usefully guess.  Ctrl-C is the way out, and it costs nothing -- the target
+    # stays armed, so the node still stops there when the WAL arrives.
+    print("ggdr switch: waiting for %s to stop at '%s' (no timeout -- Ctrl-C stops "
+          "waiting, not the node) ..."
+          % ("it" if len(targets) == 1 else "them", restore_point))
+    try:
+        polls = 0
+        while True:
+            states = [node_state(*n) for n in targets]
+            if all(s["ok"] and s["paused"] and s["restore_point"] == restore_point
+                   for s in states):
+                break
+            # A wait with no timeout must not also be silent: an unreachable node
+            # and a node still chewing through WAL look identical from outside
+            # until something says which it is.
+            polls += 1
+            if polls % 15 == 0:
+                elapsed = polls * 2
+                print("  ... still waiting (%s): %s"
+                      % ("%dm" % (elapsed // 60) if elapsed >= 60 else "%ds" % elapsed,
+                         ", ".join("%s %s" % (_label(s["content"]),
+                                              ("at '%s'" % s["restore_point"] if s["paused"]
+                                               else "replaying %s" % (s["replay_lsn"] or "?"))
+                                              if s["ok"] else "UNREACHABLE")
+                                   for s in states)))
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+        print("ggdr switch: stopped waiting.  '%s' stays armed on those nodes, so each "
+              "still stops" % restore_point)
+        print("             there once the WAL arrives.  'ggdr stat' shows where they are now.")
+        return 1
+
+    for state in states:
+        print("  %-13s: stopped at '%s' (replay lsn %s)"
+              % (_label(state["content"]), state["restore_point"], state["replay_lsn"] or "-"))
+    print("ggdr switch: DONE -- %d node(s) stopped at '%s'."
+          % (len(targets), restore_point))
+    print("  NOTE: '%s' was NOT published as the served point -- publishing is" % restore_point)
+    print("        cluster-wide by construction, so reads go on answering as of the")
+    print("        point the last whole-cluster switch published.  The cluster is now")
+    print("        skewed: 'stat' reports no consistent serve point and 'promote' refuses")
+    print("        until 'ggdr switch %s' (no --content) brings the rest there." % restore_point)
+    return 0
 
 
 def cmd_pause():
@@ -771,6 +964,11 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_switch = sub.add_parser("switch", help="pause every node at <restore_point> (stop-and-go)")
     p_switch.add_argument("restore_point", help="the restore point to pause the whole cluster at")
+    p_switch.add_argument("--content", metavar="C[,C...]",
+                          help="re-point ONLY these nodes (content ids; 'coord' or -1 for the "
+                               "coordinator) and do not publish the new point: reads keep "
+                               "answering as of the last whole-cluster switch, and the cluster "
+                               "is left skewed")
     sub.add_parser("pause", help="immediately pause replay on every node (not a consistent cut)")
     sub.add_parser("stat", help="print recovery statistics")
     p_prom = sub.add_parser("promote", help="promote the DR cluster to a normal online read-write cluster")
@@ -794,7 +992,7 @@ def main():
     p_cr.add_argument("--force", action="store_true", help="overwrite non-empty data directories")
     args = ap.parse_args()
     if args.cmd == "switch":
-        return cmd_switch(args.restore_point)
+        return cmd_switch(args.restore_point, contents=args.content)
     if args.cmd == "pause":
         return cmd_pause()
     if args.cmd == "stat":
