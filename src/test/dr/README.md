@@ -148,6 +148,35 @@ docker-compose -p fo -f src/test/dr/docker-compose.failover.yml logs -f dr
 docker-compose -p fo -f src/test/dr/docker-compose.failover.yml down -v
 ```
 
+### Standby coordinator activation — the topology row disappears
+
+`docker-compose.costandby.yml`. The same fork, on content −1, where there is no FTS: an
+operator stops the coordinator and runs `gpactivatestandby`. It differs from the segment case
+in what it does to the topology — FTS flips a segment's role in place, while
+`segment_config_activate_standby()` (`segadmin.c`) **deletes** the old coordinator's row and
+promotes the standby's. So production's WAL carries the removal of the row for content −1,
+the content the replica's own coordinator occupies.
+
+That makes the two assertions at the centre of the run a matched pair, taken at the same
+instant: the replica's **catalog** loses that row exactly as production's did, and the
+topology it **serves** still has it — same dbid, still `dr`. Verdict line:
+`STANDBY-ACTIVATION VERDICT:`.
+
+Two environment notes, both encoded in the fixture. `gpactivatestandby` reads the standby's
+port from `$PGPORT` and nothing else, which is right when the standby is another host on the
+same port and wrong on a single-host demo — unset, it promotes the standby and then waits to
+connect on the port the coordinator it replaced used to own. And production runs with segment
+mirrors even though this fixture would rather it did not: `gpinitstandby` cannot build a
+standby on a mirrorless cluster, because
+`gppylib/operations/update_pg_hba_on_segments.py:87` dereferences each pair's `mirrorDB`
+without checking there is one.
+
+```bash
+docker-compose -p co -f src/test/dr/docker-compose.costandby.yml up -d
+docker-compose -p co -f src/test/dr/docker-compose.costandby.yml logs -f dr
+docker-compose -p co -f src/test/dr/docker-compose.costandby.yml down -v
+```
+
 ## Files
 
 | File | Purpose |
@@ -164,6 +193,9 @@ docker-compose -p fo -f src/test/dr/docker-compose.failover.yml down -v
 | `docker-compose.failover.yml` | Mirror-failover fixture: production runs **with mirrors** and fails one content over mid-run, forking its WAL. |
 | `scripts/failover-primary-entrypoint.sh` | Build a mirrored cluster, archive on mirrors too, kill a primary between two restore points, write more rows through the promoted mirror. |
 | `scripts/failover-dr-entrypoint.sh` | Advance the replica across the timeline fork and assert it followed it — and that only the failed-over content did. |
+| `docker-compose.costandby.yml` | Standby-coordinator activation fixture: production activates its standby, deleting the old coordinator's topology row. |
+| `scripts/costandby-primary-entrypoint.sh` | Build a cluster with a standby coordinator, stop the coordinator between two restore points, run `gpactivatestandby`, then write past the fork. |
+| `scripts/costandby-dr-entrypoint.sh` | Advance the replica across content −1's fork; assert its catalog lost the coordinator row and its served topology did not. |
 
 ## Notes / status
 

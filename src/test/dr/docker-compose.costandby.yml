@@ -1,0 +1,80 @@
+# Greengage 7 DR -- production activates its standby COORDINATOR while a replica
+# is attached.
+#
+# The sibling fixture (docker-compose.failover.yml) fails a segment over to its
+# mirror.  This one moves the coordinator, which differs in both halves:
+#
+#   * how it happens.  There is no FTS for content -1.  An operator runs
+#     gpactivatestandby on the standby's host after the coordinator is gone.
+#   * what it does to the topology.  FTS flips a segment's role in place; the
+#     coordinator activation DELETES the old coordinator's row and promotes the
+#     standby's, which keeps its own dbid (segment_config_activate_standby(),
+#     segadmin.c).
+#
+# That deletion is why this fixture is worth its runtime.  Production's WAL
+# carries the removal of the row for content -1 -- the content the replica's own
+# coordinator occupies, in the catalog that under the pre-P6 design WAS what the
+# replica read.  The two assertions at the centre of the run are that the
+# replica's CATALOG loses the row exactly as production did, and that the
+# topology it SERVES still has it, from $PGDATA/gg_topology.
+#
+# The coordinator's WAL also forks at the activation, so this is the timeline
+# test on the one content with no FTS behind it:
+#
+#   co_rp_pre --> [replica builds, pauses] --> co_rp_a --> ACTIVATE --> co_rp_b
+#
+# Production runs with segment mirrors as well, which this fixture would rather
+# not have: the sharpest shape is a mirrorless cluster with a standby, so that
+# content -1 is the only thing that can fork.  gpinitstandby cannot build that
+# one (update_pg_hba_on_segments.py:87 dereferences a pair's mirrorDB without
+# checking there is one, so a mirrorless cluster fails standby creation with a
+# NoneType error and rolls it back) -- upstream code, untouched by this branch.
+# Nothing fails a segment over here, so the segments stay the control group
+# regardless; they simply have mirrors behind them while being it.
+#
+#   docker-compose -p co -f src/test/dr/docker-compose.costandby.yml up -d
+#   docker-compose -p co -f src/test/dr/docker-compose.costandby.yml logs -f dr
+#   docker-compose -p co -f src/test/dr/docker-compose.costandby.yml down -v
+#
+# Build the base image first with the default fixture:
+#   docker-compose -f src/test/dr/docker-compose.yml build
+version: "3.8"
+
+x-gpdb: &gpdb
+  image: ${DR_IMAGE:-greengage-dr-test:latest}
+  privileged: true
+  init: true
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile: 65535
+  volumes:
+    - wal_archive:/archive
+    - ./scripts:/dr/scripts:ro
+    # The working tree's ggdr, over the copy baked into the image.  As with the
+    # mirror fixture, what is under test is partly what ggdr create writes:
+    # recovery_target_timeline decides whether the replica can follow the
+    # activated coordinator at all.  The DIRECTORY, not the file -- see
+    # docker-compose.yml for why a single-file mount stops seeing edits.
+    - ../../../gpMgmt/bin:/home/gpadmin/gpdb_src/gpMgmt/bin:ro
+
+services:
+  primary:
+    <<: *gpdb
+    hostname: primary
+    environment:
+      # Every record carries a full-page image, so the replica compares its own
+      # page against production's after redo -- here that covers the catalog
+      # rows the activation rewrites.
+      WAL_CONSISTENCY_CHECKING: "all"
+    command: ["/dr/scripts/costandby-primary-entrypoint.sh"]
+
+  dr:
+    <<: *gpdb
+    hostname: dr
+    depends_on:
+      - primary
+    command: ["/dr/scripts/costandby-dr-entrypoint.sh"]
+
+volumes:
+  wal_archive:
