@@ -23,14 +23,13 @@
 #
 #   co_rp_pre --> [replica builds, pauses] --> co_rp_a --> ACTIVATE --> co_rp_b
 #
-# Production runs with segment mirrors as well, which this fixture would rather
-# not have: the sharpest shape is a mirrorless cluster with a standby, so that
-# content -1 is the only thing that can fork.  gpinitstandby cannot build that
-# one (update_pg_hba_on_segments.py:87 dereferences a pair's mirrorDB without
-# checking there is one, so a mirrorless cluster fails standby creation with a
-# NoneType error and rolls it back) -- upstream code, untouched by this branch.
-# Nothing fails a segment over here, so the segments stay the control group
-# regardless; they simply have mirrors behind them while being it.
+# Segment mirrors are deliberately OFF here (and the standby coordinator ON --
+# gpdemo ties the two together unless both are said on the command line), so the
+# only thing in the cluster that can fork is content -1 and the segments are an
+# untouched control group.  Until update_pg_hba_on_segments_for_standby() learned
+# that a pair may have no mirror, that shape could not be built at all:
+# gpinitstandby died on it and left the cluster standby-less while gpinitsystem
+# still called it successfully created.
 #
 #   docker-compose -p co -f src/test/dr/docker-compose.costandby.yml up -d
 #   docker-compose -p co -f src/test/dr/docker-compose.costandby.yml logs -f dr

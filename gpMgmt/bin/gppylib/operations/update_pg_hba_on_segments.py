@@ -84,13 +84,23 @@ def update_pg_hba_on_segments_for_standby(gpArray, standby_host, hba_hostnames,
     for segmentPair in gpArray.getSegmentList():
         # We cannot update the pg_hba.conf which uses ssh for hosts that are unreachable.
         primary_hostname = segmentPair.primaryDB.getSegmentHostName()
-        mirror_hostname = segmentPair.mirrorDB.getSegmentHostName()
         if segmentPair.primaryDB.unreachable:
             unreachable_seg_primary_hosts.append(primary_hostname)
         else:
             update_cmds.append(SegUpdateHba(standby_pg_hba_entries, segmentPair.primaryDB.datadir,
                                             remoteHost=primary_hostname))
 
+        # A cluster without mirrors has only half of each pair, and the primary
+        # above still needs its entry: what these lines authorise is the STANDBY
+        # COORDINATOR reaching each segment, which has nothing to do with
+        # whether that segment has a mirror.  Skipping the pair outright -- what
+        # update_pg_hba_on_segments() below does -- would be wrong here for the
+        # same reason: that function is authorising primary-to-mirror
+        # replication, so a pair with no mirror genuinely has nothing to do.
+        if segmentPair.mirrorDB is None:
+            continue
+
+        mirror_hostname = segmentPair.mirrorDB.getSegmentHostName()
         if segmentPair.mirrorDB.unreachable:
             unreachable_seg_mirror_hosts.append(mirror_hostname)
         else:

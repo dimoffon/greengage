@@ -162,14 +162,16 @@ instant: the replica's **catalog** loses that row exactly as production's did, a
 topology it **serves** still has it — same dbid, still `dr`. Verdict line:
 `STANDBY-ACTIVATION VERDICT:`.
 
-Two environment notes, both encoded in the fixture. `gpactivatestandby` reads the standby's
-port from `$PGPORT` and nothing else, which is right when the standby is another host on the
-same port and wrong on a single-host demo — unset, it promotes the standby and then waits to
-connect on the port the coordinator it replaced used to own. And production runs with segment
-mirrors even though this fixture would rather it did not: `gpinitstandby` cannot build a
-standby on a mirrorless cluster, because
-`gppylib/operations/update_pg_hba_on_segments.py:87` dereferences each pair's `mirrorDB`
-without checking there is one.
+Production runs **without** segment mirrors here, so content −1 is the only thing in the
+cluster that can fork and the segments are an untouched control group. Getting that shape
+needs `WITH_MIRRORS=false WITH_STANDBY=true` on the command line, since gpdemo ties the two
+together — and it needs `update_pg_hba_on_segments_for_standby()` to tolerate a pair with no
+mirror, which it did not until this fixture asked for it.
+
+One environment note, encoded in the fixture: `gpactivatestandby` reads the standby's port
+from `$PGPORT` and nothing else, which is right when the standby is another host on the same
+port and wrong on a single-host demo — unset, it promotes the standby and then waits to
+connect on the port the coordinator it replaced used to own.
 
 ```bash
 docker-compose -p co -f src/test/dr/docker-compose.costandby.yml up -d

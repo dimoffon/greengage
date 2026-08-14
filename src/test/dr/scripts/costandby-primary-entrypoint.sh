@@ -39,26 +39,23 @@ CPORT=$PORT_BASE
 
 cd "$DEMO"
 rm -f "$DEMO/gpdemo-env.sh"
-# Segment mirrors are on, and not because this fixture wants them.
+# Segment mirrors OFF and the standby coordinator ON -- the inverse of what
+# gpdemo does unaided, which is to tie the two together (mirrors on implies a
+# standby, and nothing gives a standby without mirrors), so both have to be said
+# on the command line.  One without the other is the point: content -1 is then
+# the only thing in this cluster that can fork, and the segments are an
+# untouched control group rather than merely an unused one.
 #
-# The clean shape for this test is a mirrorless cluster WITH a standby
-# coordinator, so that content -1 is the only thing in the cluster that can fork
-# and the segments are an untouched control group.  That shape cannot be built:
-# gpinitstandby dies on it, in update_pg_hba_on_segments_for_standby()
-# (gppylib/operations/update_pg_hba_on_segments.py:87), which reads
+# This shape could not be built until recently.  gpinitstandby died on it in
+# update_pg_hba_on_segments_for_standby(), which read
 # segmentPair.mirrorDB.getSegmentHostName() for every pair without checking
-# whether there is a mirror -- so a mirrorless cluster raises "'NoneType' object
-# has no attribute 'getSegmentHostName'" and the standby is rolled back.  That
-# is upstream code untouched by this branch, and gpdemo's own default (mirrors
-# imply a standby) is the configuration it is exercised in.
-#
-# It costs this fixture nothing: no segment ever fails over here, so the
-# segments remain the control group either way -- they just have mirrors sitting
-# behind them while they do it.
-log "costandby-primary: creating demo cluster (coordinator + STANDBY COORDINATOR + 2 segments + mirrors) ..."
+# whether there was a mirror -- "'NoneType' object has no attribute
+# 'getSegmentHostName'", standby rolled back, and gpinitsystem reporting the
+# whole thing as a warning over a cluster it still called successfully created.
+log "costandby-primary: creating demo cluster (coordinator + STANDBY COORDINATOR + 2 segments, no mirrors) ..."
 LANG=en_US.UTF-8 make create-demo-cluster \
 	PORT_BASE="$PORT_BASE" NUM_PRIMARY_MIRROR_PAIRS=2 \
-	WITH_MIRRORS=true WITH_STANDBY=true 2>&1 | tail -12
+	WITH_MIRRORS=false WITH_STANDBY=true 2>&1 | tail -12
 source "$DEMO/gpdemo-env.sh"
 
 log "costandby-primary: instances:"
@@ -66,17 +63,20 @@ psql -p "$CPORT" -d postgres -Atc \
 	"select 'dbid '||dbid||' content '||content||' role '||role||' port '||port||' '||datadir
 	   from gp_segment_configuration order by content, role desc;" | sed 's/^/    /'
 
-# Asserted, not assumed: gpinitsystem reports a standby that failed to
-# initialize as a WARNING and finishes with a working cluster otherwise, so the
-# only thing that distinguishes "standby ready" from "standby silently absent"
-# is this query.  It is how the mirrorless attempt above was diagnosed.
+# Asserted, not assumed.  gpinitsystem reports a standby that failed to
+# initialise as a WARNING and still finishes with "successfully created", so the
+# exit status cannot tell "standby ready" from "standby silently absent" -- this
+# query is what diagnosed the failure above, and it is also what would catch its
+# return.  The mirror count is in here for the same reason: a fixture that
+# quietly grew mirrors back would still pass everything else.
 SHAPE=$(psql -p "$CPORT" -d postgres -Atc \
 	"select count(*) filter (where content = -1 and role = 'p')||' '||
 	        count(*) filter (where content = -1 and role = 'm')||' '||
-	        count(*) filter (where content >= 0 and role = 'p')
+	        count(*) filter (where content >= 0 and role = 'p')||' '||
+	        count(*) filter (where content >= 0 and role = 'm')
 	   from gp_segment_configuration;")
-[ "$SHAPE" = "1 1 2" ] || \
-	die "expected one coordinator, one standby coordinator and two segment primaries; got '$SHAPE'"
+[ "$SHAPE" = "1 1 2 0" ] || \
+	die "expected one coordinator, one standby coordinator, two segment primaries and no mirrors; got '$SHAPE'"
 
 list_primaries() {
 	psql -p "$CPORT" -d postgres -Atc \

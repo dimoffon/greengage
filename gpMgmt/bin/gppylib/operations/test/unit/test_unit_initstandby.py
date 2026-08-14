@@ -53,8 +53,50 @@ class InitStandbyTestCase(unittest.TestCase):
             m.getSegmentContentId.return_value = (i % 3) + 1
             m.getSegmentDataDirectory.return_value = '/tmp/d%d' % i
             m.primaryDB.unreachable = False
+            # Without this the mirror's .unreachable is a Mock, which is truthy,
+            # so every mirror was recorded as unreachable and the warning below
+            # raised "TypeError: sequence item 0: expected str instance, Mock
+            # found" -- this case has been erroring rather than testing.
+            m.mirrorDB.unreachable = False
             mock_segs.append(m)
         gparray = Mock()
         gparray.getSegmentList = Mock()
         gparray.getSegmentList.return_value = mock_segs
         update_pg_hba_on_segments_for_standby(gparray, 'standby_host', False, batch_size)
+
+    @patch('gppylib.operations.update_pg_hba_on_segments.update_on_segments')
+    @patch('gppylib.operations.update_pg_hba_on_segments.SegUpdateHba')
+    @patch('gppylib.operations.update_pg_hba_on_segments.create_standby_pg_hba_entries', return_value=['standby ip'])
+    def test_update_pg_hba_on_segments_for_standby_without_mirrors(self, mock_entries, mock_hba_cmd, mock_update):
+        """A pair with no mirror updates its primary and skips the missing half.
+
+        The case above cannot cover this: its pairs are Mock()s, so mirrorDB is
+        another auto-created Mock and never None, which is how a mirrorless
+        cluster used to reach getSegmentHostName() on it and die with
+        "'NoneType' object has no attribute 'getSegmentHostName'" -- taking
+        gpinitstandby's standby creation down with it.
+
+        Both halves in one test on purpose: the mirrored pair proves the mirror
+        is still updated, and the mirrorless one that its primary is not
+        silently dropped along with the mirror it does not have.
+        """
+        with_mirror = Mock()
+        with_mirror.primaryDB.unreachable = False
+        with_mirror.primaryDB.datadir = '/tmp/p0'
+        with_mirror.mirrorDB.unreachable = False
+        with_mirror.mirrorDB.datadir = '/tmp/m0'
+
+        without_mirror = Mock()
+        without_mirror.primaryDB.unreachable = False
+        without_mirror.primaryDB.datadir = '/tmp/p1'
+        without_mirror.mirrorDB = None
+
+        gparray = Mock()
+        gparray.getSegmentList.return_value = [with_mirror, without_mirror]
+
+        update_pg_hba_on_segments_for_standby(gparray, 'standby_host', False, 1)
+
+        # Data directory is SegUpdateHba's second positional argument.
+        updated = [call[0][1] for call in mock_hba_cmd.call_args_list]
+        self.assertEqual(['/tmp/p0', '/tmp/m0', '/tmp/p1'], updated)
+        self.assertEqual(1, mock_update.call_count)
