@@ -18,7 +18,7 @@
 
 #include "access/xlog_internal.h"	/* for pg_start/stop_backup */
 #include "catalog/pg_type.h"
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "common/file_perm.h"
 #include "commands/progress.h"
 #include "lib/stringinfo.h"
@@ -234,7 +234,7 @@ static const struct exclude_list_item excludeFiles[] =
 	 * and a node that needs a different one has it overwritten after the copy,
 	 * exactly as internal.auto.conf is.
 	 */
-	{GP_TOPOLOGY_TMP_PREFIX, true},
+	{GG_TOPOLOGY_TMP_PREFIX, true},
 
 	/* Skip current log file temporary file */
 	{LOG_METAINFO_DATAFILE_TMP, false},

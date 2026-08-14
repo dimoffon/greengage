@@ -3,7 +3,7 @@
 # The inverse of the fixture this replaces.  That one (V-20) asked whether a DR
 # replica's frozen-seeded topology survived production's VACUUM truncating the
 # shared catalog it lived in.  The replica's topology no longer lives there: it
-# is in $PGDATA/gp_topology, which production's WAL cannot reach.  So the
+# is in $PGDATA/gg_topology, which production's WAL cannot reach.  So the
 # question becomes the opposite one -- production runs the maintenance that used
 # to be forbidden, and the replica must simply not care.
 #
@@ -18,7 +18,7 @@
 # relfilenode, so the DR side asserts the remap really happened rather than
 # quietly testing nothing.
 #
-# Requires the file topology provider, which is what ggdr create-replica arms.
+# Requires the file topology provider, which is what ggdr create arms.
 #
 #   docker-compose -p maint -f src/test/dr/docker-compose.maint.yml up -d
 #   docker-compose -p maint -f src/test/dr/docker-compose.maint.yml logs -f dr

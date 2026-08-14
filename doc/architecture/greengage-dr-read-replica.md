@@ -75,7 +75,7 @@ The implementation is organized as milestones; this document is structured aroun
 | M2 | Read-only enforcement | §4.3 |
 | M2′ | Standby distributed read (dispatch while in recovery) | §4.4 |
 | M3 | Consistent reads (restore-point-gated, as-of-N snapshot) | §4.5, §5 |
-| M4 | Build a DR replica (`ggdr create-replica`) | §6.1 |
+| M4 | Build a DR replica (`ggdr create`) | §6.1 |
 | M5 | Observability (`gg_stat_dr_replica`, `pg_last_paused_restore_point`) | §4.6 |
 | M6 | Promotion (`ggdr promote`, `gg_dr_promote()`) | §6.3, §6.4 |
 
@@ -98,7 +98,7 @@ The implementation is organized as milestones; this document is structured aroun
      node writes XLOG_RESTORE_POINT                                 └───────────────┬───────────────────┘
                                                                      ggdr drives the whole cluster
                                                                      as one: switch / pause /       
-                                                                     stats / promote / create-replica
+                                                                     stats / promote / create
 ```
 
 ### 2.1 Properties
@@ -697,14 +697,14 @@ coordinator host**, with `PGPORT`/`PGDATABASE` pointing at the DR coordinator.
 cluster:
 
 ```bash
-ggdr create-replica \
-    --topology     /archive/dr_topology.tsv \
-    --basebackup-dir /archive/basebackup \
-    --wal-archive  /archive/wal \
-    --pause-at     rp_initial          # optional: pause at this restore point
+ggdr create \
+    --topology /archive/dr_topology.tsv \
+    --backup   /archive/basebackup \
+    --wal      /archive/wal \
+    --pause-at rp_initial              # optional: pause at this restore point
 ```
 
-What it does, in order (`cmd_create_replica`):
+What it does, in order (`cmd_create`):
 
 1. **Safety / idempotence.** Refuse if any target datadir has a `postmaster.pid`; refuse a
    non-empty datadir unless `--force`.
@@ -853,7 +853,7 @@ connections are **utility mode** (`PGOPTIONS='-c gp_role=utility'`), so `switch`
 | `pause` | Immediately pause replay on every node at its current point. **Not** a consistent cut. |
 | `stat` | Per-node recovery statistics + a cluster summary (mode, the point reads are served as of, the point replay stopped at, RPO). |
 | `promote [--at <rp>] [--no-restart] [--yes] [--timeout <s>]` | Promote the DR cluster to online read-write at a single consistent restore point. Irreversible. |
-| `create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir> [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]` | Build the whole DR replica from per-instance base backups (§6.1). |
+| `create -t/--topology <tsv> -b/--backup <dir> -w/--wal <dir> [-r/--restore-command <cmd>] [-p/--pause-at <rp>] [--no-start] [-f/--force]` | Build the whole DR replica from per-instance base backups (§6.1). |
 
 ### 7.3 Examples
 
@@ -888,11 +888,10 @@ $ ggdr switch  rp_failover
 $ ggdr promote --at rp_failover --yes
 
 # Build a fresh DR replica (overwrite existing datadirs), armed but not started:
-$ ggdr create-replica \
-      --topology /archive/dr_topology.tsv \
-      --basebackup-dir /archive/basebackup \
-      --wal-archive /archive/wal \
-      --pause-at rp_initial --force --no-start
+$ ggdr create -t /archive/dr_topology.tsv \
+      -b /archive/basebackup \
+      -w /archive/wal \
+      -p rp_initial -f --no-start
 ```
 
 ---
@@ -991,7 +990,7 @@ $ ggdr create-replica \
 **Seeding / create**
 
 - **Timeline-fork hazard around the seed.** The single-user seed consumes `backup_label`
-  and advances `pg_control`; `create-replica` preserves and restores the recovery-start
+  and advances `pg_control`; `create` preserves and restores the recovery-start
   state and **re-fetches** backup-tail WAL from the archive, and it **gates fail-closed** on
   the backup's START WAL segment being present in the archive. Without those, an archive
   miss could replay the seed's forked WAL and permanently fork the timeline.
@@ -1014,7 +1013,7 @@ $ ggdr create-replica \
   history-file archiving is required; "mirror failover while DR is attached" is a scenario to
   test explicitly. DR nodes are configured with `recovery_target_timeline = 'current'`.
 - **Re-sync is a full re-base-backup.** There is no cross-WAN `pg_rewind`; a fallen-behind or
-  gap-hit DR node is rebuilt with `create-replica` for that node + re-seed.
+  gap-hit DR node is rebuilt with `create` for that node + re-seed.
 
 **Version / contract**
 
@@ -1056,7 +1055,7 @@ $ ggdr create-replica \
 |-----|---------|---------|------|
 | `hot_standby` | `PGC_POSTMASTER` | `false` | On a node in recovery, makes it a DR replica: read-only enforcement, topology redo filter, standby distributed read. Disengages with recovery. |
 | `gp_pause_on_restore_point_replay` | `PGC_SUSET` | `''` | Pause replay when the named restore point is replayed; re-point + resume to advance. `gg_dr_switch()` maintains it. |
-| `max_standby_archive_delay` | `PGC_SIGHUP` | `0` on a DR node (`ggdr create-replica` writes it) | A frozen `xmin` makes recovery conflicts routine; the stock 30 s would be added to every advance that hits one. `-1` is a trap, not the other extreme — it blocks the startup process inside redo. |
+| `max_standby_archive_delay` | `PGC_SIGHUP` | `0` on a DR node (`ggdr create` writes it) | A frozen `xmin` makes recovery conflicts routine; the stock 30 s would be added to every advance that hits one. `-1` is a trap, not the other extreme — it blocks the startup process inside redo. |
 
 ### 10.3 Catalog / function objects
 
@@ -1070,7 +1069,7 @@ $ ggdr create-replica \
 ### 10.4 Test fixture
 
 `src/test/dr/` — a two-container fixture (production + DR sharing an `/archive` volume) that
-builds the DR via `ggdr create-replica` and exercises M1/M2/M2′/M3/M5 plus
+builds the DR via `ggdr create` and exercises M1/M2/M2′/M3/M5 plus
 `ggdr` `switch`/`pause`/`stats` plus the SQL control functions end-to-end
 (`docker-compose -f src/test/dr/docker-compose.yml up --build`).
 

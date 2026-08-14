@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
- * gp_topology_file.c
- *	  Reading and writing $PGDATA/gp_topology, the file-backed cluster
+ * gg_topology_file.c
+ *	  Reading and writing $PGDATA/gg_topology, the file-backed cluster
  *	  topology store.
  *
- * See common/gp_topology_file.h for the format and why it is text.  This file
+ * See common/gg_topology_file.h for the format and why it is text.  This file
  * is shared between the backend and frontends -- initdb writes the bootstrap
  * copy, gg_topology exports and repairs, the provider in
  * src/backend/cdb/cdbtopology_file.c reads and writes at runtime -- so it never
@@ -15,7 +15,7 @@
  * Portions Copyright (c) 2026-Present, Greengage contributors.
  *
  * IDENTIFICATION
- *	  src/common/gp_topology_file.c
+ *	  src/common/gg_topology_file.c
  *
  *-------------------------------------------------------------------------
  */
@@ -31,7 +31,7 @@
 #include <unistd.h>
 
 #include "common/file_perm.h"
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "common/string.h"
 #include "lib/stringinfo.h"
 #include "port/pg_crc32c.h"
@@ -42,45 +42,45 @@
 #include "common/file_utils.h"
 #endif
 
-#define GP_TOPOLOGY_MAGIC		"GPTOPOLOGY"
+#define GG_TOPOLOGY_MAGIC		"GPTOPOLOGY"
 
 /*
  * A generous ceiling on the whole file, so a reader cannot be made to allocate
  * arbitrarily by a corrupt or hostile one.  Ten thousand segments at the
  * ~300 bytes a long datadir costs is comfortably under this.
  */
-#define GP_TOPOLOGY_MAX_SIZE	(16 * 1024 * 1024)
+#define GG_TOPOLOGY_MAX_SIZE	(16 * 1024 * 1024)
 
 const char *
-gp_topology_file_error_str(GpTopologyFileError err)
+gg_topology_file_error_str(GgTopologyFileError err)
 {
 	switch (err)
 	{
-		case GP_TOPOFILE_OK:
+		case GG_TOPOFILE_OK:
 			return "success";
-		case GP_TOPOFILE_ENOENT:
+		case GG_TOPOFILE_ENOENT:
 			return "file does not exist";
-		case GP_TOPOFILE_IO:
+		case GG_TOPOFILE_IO:
 			return "I/O error";
-		case GP_TOPOFILE_TRUNCATED:
+		case GG_TOPOFILE_TRUNCATED:
 			return "file is truncated";
-		case GP_TOPOFILE_BAD_MAGIC:
+		case GG_TOPOFILE_BAD_MAGIC:
 			return "not a cluster topology file";
-		case GP_TOPOFILE_BAD_VERSION:
+		case GG_TOPOFILE_BAD_VERSION:
 			return "unsupported format version";
-		case GP_TOPOFILE_BAD_CRC:
+		case GG_TOPOFILE_BAD_CRC:
 			return "checksum mismatch";
-		case GP_TOPOFILE_BAD_COUNT:
+		case GG_TOPOFILE_BAD_COUNT:
 			return "entry count does not match the entries present";
-		case GP_TOPOFILE_BAD_HEADER:
+		case GG_TOPOFILE_BAD_HEADER:
 			return "invalid header";
-		case GP_TOPOFILE_BAD_SYNTAX:
+		case GG_TOPOFILE_BAD_SYNTAX:
 			return "invalid entry";
-		case GP_TOPOFILE_UNSERIALIZABLE:
+		case GG_TOPOFILE_UNSERIALIZABLE:
 			return "entry cannot be represented in the file format";
-		case GP_TOPOFILE_TOO_LARGE:
+		case GG_TOPOFILE_TOO_LARGE:
 			return "file is larger than a cluster topology can be";
-		case GP_TOPOFILE_SYSID_CONFLICT:
+		case GG_TOPOFILE_SYSID_CONFLICT:
 			return "file belongs to a different database system";
 	}
 
@@ -194,7 +194,7 @@ topo_parse_uint64(const char *s, uint64 *out)
 #elif defined(HAVE_STRTOULL)
 	*out = strtoull(s, &endptr, 10);
 #else
-#error "gp_topology requires 64-bit integer support"
+#error "gg_topology requires 64-bit integer support"
 #endif
 
 	return errno == 0 && endptr != s && *endptr == '\0';
@@ -289,7 +289,7 @@ topo_free(void *p)
 }
 
 void
-gp_topology_file_free(GpTopologyFile *topo)
+gg_topology_file_free(GgTopologyFile *topo)
 {
 	int			i;
 
@@ -322,8 +322,8 @@ gp_topology_file_free(GpTopologyFile *topo)
  * version", instead of a corrupt version byte sending the operator hunting for
  * a newer binary.
  */
-GpTopologyFileError
-gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline)
+GgTopologyFileError
+gg_topology_parse(const char *buf, size_t len, GgTopologyFile *out, int *errline)
 {
 	char	   *copy;
 	char	   *p;
@@ -338,7 +338,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	int			nentries;
 	int			lineno = 0;
 	int			i;
-	GpTopologyFile topo;
+	GgTopologyFile topo;
 
 	memset(out, 0, sizeof(*out));
 	memset(&topo, 0, sizeof(topo));
@@ -357,7 +357,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 #define PARSE_FAIL(code) \
 	do { \
 		topo_free(copy); \
-		gp_topology_file_free(&topo); \
+		gg_topology_file_free(&topo); \
 		return (code); \
 	} while (0)
 
@@ -365,10 +365,10 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	line = topo_next_line(&p, end);
 	lineno++;
 	if (line == NULL)
-		PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
-	value = topo_header_value(line, GP_TOPOLOGY_MAGIC);
+		PARSE_FAIL(GG_TOPOFILE_TRUNCATED);
+	value = topo_header_value(line, GG_TOPOLOGY_MAGIC);
 	if (value == NULL)
-		PARSE_FAIL(GP_TOPOFILE_BAD_MAGIC);
+		PARSE_FAIL(GG_TOPOFILE_BAD_MAGIC);
 
 	/*
 	 * Find and verify the checksum before believing anything else.  The
@@ -380,11 +380,11 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		size_t		covered;
 
 		if (len == 0 || buf[len - 1] != '\n')
-			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
+			PARSE_FAIL(GG_TOPOFILE_TRUNCATED);
 
 		last_nl = topo_last_newline(buf, len - 1);
 		if (last_nl == NULL)
-			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
+			PARSE_FAIL(GG_TOPOFILE_TRUNCATED);
 
 		covered = (size_t) (last_nl + 1 - buf);
 		crc_line = copy + covered;
@@ -395,22 +395,22 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		 * a length -- as the header contract says it may.
 		 */
 		if (strncmp(crc_line, "crc32c ", 7) != 0)
-			PARSE_FAIL(GP_TOPOFILE_TRUNCATED);
+			PARSE_FAIL(GG_TOPOFILE_TRUNCATED);
 
 		if (sscanf(crc_line + 7, "%8x", &recorded_crc) != 1)
-			PARSE_FAIL(GP_TOPOFILE_BAD_CRC);
+			PARSE_FAIL(GG_TOPOFILE_BAD_CRC);
 
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, buf, covered);
 		FIN_CRC32C(crc);
 
 		if ((uint32) crc != recorded_crc)
-			PARSE_FAIL(GP_TOPOFILE_BAD_CRC);
+			PARSE_FAIL(GG_TOPOFILE_BAD_CRC);
 	}
 
 	/* version, now that the bytes are known good */
-	if (!topo_parse_int(value, &version, 1, GP_TOPOLOGY_FORMAT_VERSION))
-		PARSE_FAIL(GP_TOPOFILE_BAD_VERSION);
+	if (!topo_parse_int(value, &version, 1, GG_TOPOLOGY_FORMAT_VERSION))
+		PARSE_FAIL(GG_TOPOFILE_BAD_VERSION);
 	topo.version = version;
 
 	/* system_identifier */
@@ -418,7 +418,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	lineno++;
 	value = topo_header_value(line, "system_identifier");
 	if (value == NULL || !topo_parse_uint64(value, &u64))
-		PARSE_FAIL(GP_TOPOFILE_BAD_HEADER);
+		PARSE_FAIL(GG_TOPOFILE_BAD_HEADER);
 	topo.system_identifier = u64;
 
 	/* generation */
@@ -426,7 +426,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	lineno++;
 	value = topo_header_value(line, "generation");
 	if (value == NULL || !topo_parse_uint64(value, &u64))
-		PARSE_FAIL(GP_TOPOFILE_BAD_HEADER);
+		PARSE_FAIL(GG_TOPOFILE_BAD_HEADER);
 	topo.generation = u64;
 
 	/* nentries */
@@ -434,14 +434,14 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	lineno++;
 	value = topo_header_value(line, "nentries");
 	if (value == NULL || !topo_parse_int(value, &nentries, 0, PG_INT16_MAX))
-		PARSE_FAIL(GP_TOPOFILE_BAD_HEADER);
+		PARSE_FAIL(GG_TOPOFILE_BAD_HEADER);
 
 	/*
 	 * generation 0 is initdb's "nobody has ever written this" marker, so it
 	 * cannot carry entries.  Only a hand edit or a broken writer produces this.
 	 */
 	if (u64 == 0 && nentries > 0)
-		PARSE_FAIL(GP_TOPOFILE_BAD_HEADER);
+		PARSE_FAIL(GG_TOPOFILE_BAD_HEADER);
 
 	if (nentries > 0)
 		topo.entries = topo_alloc0(sizeof(GpSegConfigEntry) * nentries);
@@ -458,7 +458,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_COUNT);
+			PARSE_FAIL(GG_TOPOFILE_BAD_COUNT);
 		}
 
 		topo.nentries = i;		/* so a failure frees only what was filled */
@@ -467,14 +467,14 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_SYNTAX);
+			PARSE_FAIL(GG_TOPOFILE_BAD_SYNTAX);
 		}
 
 		if (!topo_parse_int(tok[0], &ival, 1, PG_INT16_MAX))
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_SYNTAX);
+			PARSE_FAIL(GG_TOPOFILE_BAD_SYNTAX);
 		}
 		e->dbid = (int16) ival;
 
@@ -482,7 +482,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_SYNTAX);
+			PARSE_FAIL(GG_TOPOFILE_BAD_SYNTAX);
 		}
 		e->segindex = (int16) ival;
 
@@ -491,7 +491,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_SYNTAX);
+			PARSE_FAIL(GG_TOPOFILE_BAD_SYNTAX);
 		}
 		e->role = tok[2][0];
 		e->preferred_role = tok[3][0];
@@ -502,7 +502,7 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 		{
 			if (errline)
 				*errline = lineno;
-			PARSE_FAIL(GP_TOPOFILE_BAD_SYNTAX);
+			PARSE_FAIL(GG_TOPOFILE_BAD_SYNTAX);
 		}
 		e->port = ival;
 
@@ -521,25 +521,25 @@ gp_topology_parse(const char *buf, size_t len, GpTopologyFile *out, int *errline
 	 */
 	line = topo_next_line(&p, end);
 	if (line == NULL || line != crc_line)
-		PARSE_FAIL(GP_TOPOFILE_BAD_COUNT);
+		PARSE_FAIL(GG_TOPOFILE_BAD_COUNT);
 
 #undef PARSE_FAIL
 
 	topo_free(copy);
 	*out = topo;
-	return GP_TOPOFILE_OK;
+	return GG_TOPOFILE_OK;
 }
 
 char *
-gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
-					  GpTopologyFileError *err, int *errentry)
+gg_topology_serialize(const GgTopologyFile *topo, size_t *len,
+					  GgTopologyFileError *err, int *errentry)
 {
 	StringInfoData buf;
 	pg_crc32c	crc;
 	int			i;
 
 	if (err)
-		*err = GP_TOPOFILE_OK;
+		*err = GG_TOPOFILE_OK;
 	if (errentry)
 		*errentry = 0;
 
@@ -566,7 +566,7 @@ gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
 			!topo_string_ok(e->datadir))
 		{
 			if (err)
-				*err = GP_TOPOFILE_UNSERIALIZABLE;
+				*err = GG_TOPOFILE_UNSERIALIZABLE;
 			if (errentry)
 				*errentry = i;
 			return NULL;
@@ -575,8 +575,8 @@ gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
 
 	initStringInfo(&buf);
 
-	appendStringInfo(&buf, "%s %d\n", GP_TOPOLOGY_MAGIC,
-					 GP_TOPOLOGY_FORMAT_VERSION);
+	appendStringInfo(&buf, "%s %d\n", GG_TOPOLOGY_MAGIC,
+					 GG_TOPOLOGY_FORMAT_VERSION);
 	appendStringInfo(&buf, "system_identifier " UINT64_FORMAT "\n",
 					 topo->system_identifier);
 	appendStringInfo(&buf, "generation " UINT64_FORMAT "\n", topo->generation);
@@ -607,11 +607,11 @@ gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
 static void
 topo_file_path(char *path, size_t pathlen, const char *datadir)
 {
-	snprintf(path, pathlen, "%s/%s", datadir, GP_TOPOLOGY_FILENAME);
+	snprintf(path, pathlen, "%s/%s", datadir, GG_TOPOLOGY_FILENAME);
 }
 
-GpTopologyFileError
-gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
+GgTopologyFileError
+gg_topology_read_file(const char *datadir, GgTopologyFile *out, int *errline)
 {
 	char		path[MAXPGPATH];
 	char	   *buf;
@@ -619,7 +619,7 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 	size_t		len = 0;
 	int			fd;
 	struct stat st;
-	GpTopologyFileError err;
+	GgTopologyFileError err;
 
 	memset(out, 0, sizeof(*out));
 	topo_file_path(path, sizeof(path), datadir);
@@ -635,7 +635,7 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 	fd = open(path, O_RDONLY | PG_BINARY, 0);
 #endif
 	if (fd < 0)
-		return errno == ENOENT ? GP_TOPOFILE_ENOENT : GP_TOPOFILE_IO;
+		return errno == ENOENT ? GG_TOPOFILE_ENOENT : GG_TOPOFILE_IO;
 
 	/*
 	 * Size the buffer from the file, with slack: this is read once per
@@ -646,12 +646,12 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 	if (fstat(fd, &st) != 0)
 	{
 		close(fd);
-		return GP_TOPOFILE_IO;
+		return GG_TOPOFILE_IO;
 	}
-	if (st.st_size < 0 || (uint64) st.st_size > GP_TOPOLOGY_MAX_SIZE)
+	if (st.st_size < 0 || (uint64) st.st_size > GG_TOPOLOGY_MAX_SIZE)
 	{
 		close(fd);
-		return GP_TOPOFILE_TOO_LARGE;
+		return GG_TOPOFILE_TOO_LARGE;
 	}
 	bufsize = (size_t) st.st_size + 1024;
 
@@ -667,7 +667,7 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 			/* the file grew under us; treat it as unreadable rather than torn */
 			topo_free(buf);
 			close(fd);
-			return GP_TOPOFILE_IO;
+			return GG_TOPOFILE_IO;
 		}
 
 		nread = read(fd, buf + len, bufsize - len);
@@ -677,7 +677,7 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 				continue;
 			topo_free(buf);
 			close(fd);
-			return GP_TOPOFILE_IO;
+			return GG_TOPOFILE_IO;
 		}
 		if (nread == 0)
 			break;
@@ -687,14 +687,14 @@ gp_topology_read_file(const char *datadir, GpTopologyFile *out, int *errline)
 
 	close(fd);
 
-	err = gp_topology_parse(buf, len, out, errline);
+	err = gg_topology_parse(buf, len, out, errline);
 	topo_free(buf);
 
 	return err;
 }
 
-GpTopologyFileError
-gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
+GgTopologyFileError
+gg_topology_write_file(const char *datadir, const GgTopologyFile *topo,
 					   bool force, int *errentry)
 {
 	char		path[MAXPGPATH];
@@ -703,7 +703,7 @@ gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
 	size_t		len = 0;
 	int			fd;
 	int			save_errno;
-	GpTopologyFileError err = GP_TOPOFILE_OK;
+	GgTopologyFileError err = GG_TOPOFILE_OK;
 
 	topo_file_path(path, sizeof(path), datadir);
 
@@ -714,7 +714,7 @@ gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
 	 * -- after it has replaced a live cluster's topology.
 	 */
 	snprintf(tmppath, sizeof(tmppath), "%s/%s.%d", datadir,
-			 GP_TOPOLOGY_TMP_PREFIX, (int) getpid());
+			 GG_TOPOLOGY_TMP_PREFIX, (int) getpid());
 
 	/*
 	 * Refuse to write over another database system's topology.  Only checked
@@ -724,21 +724,21 @@ gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
 	 */
 	if (!force)
 	{
-		GpTopologyFile cur;
+		GgTopologyFile cur;
 
-		if (gp_topology_read_file(datadir, &cur, NULL) == GP_TOPOFILE_OK)
+		if (gg_topology_read_file(datadir, &cur, NULL) == GG_TOPOFILE_OK)
 		{
 			bool		conflict = (cur.system_identifier != 0 &&
 									topo->system_identifier != 0 &&
 									cur.system_identifier != topo->system_identifier);
 
-			gp_topology_file_free(&cur);
+			gg_topology_file_free(&cur);
 			if (conflict)
-				return GP_TOPOFILE_SYSID_CONFLICT;
+				return GG_TOPOFILE_SYSID_CONFLICT;
 		}
 	}
 
-	buf = gp_topology_serialize(topo, &len, &err, errentry);
+	buf = gg_topology_serialize(topo, &len, &err, errentry);
 	if (buf == NULL)
 		return err;
 
@@ -751,7 +751,7 @@ gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
 	if (fd < 0)
 	{
 		topo_free(buf);
-		return GP_TOPOFILE_IO;
+		return GG_TOPOFILE_IO;
 	}
 
 	if (write(fd, buf, len) != (ssize_t) len)
@@ -796,10 +796,10 @@ gp_topology_write_file(const char *datadir, const GpTopologyFile *topo,
 #endif
 	{
 		unlink(tmppath);
-		return GP_TOPOFILE_IO;
+		return GG_TOPOFILE_IO;
 	}
 
-	return GP_TOPOFILE_OK;
+	return GG_TOPOFILE_OK;
 
 io_error:
 	save_errno = errno;
@@ -814,5 +814,5 @@ io_error:
 	unlink(tmppath);
 	topo_free(buf);
 	errno = save_errno;
-	return GP_TOPOFILE_IO;
+	return GG_TOPOFILE_IO;
 }

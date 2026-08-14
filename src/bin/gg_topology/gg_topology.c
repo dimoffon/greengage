@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * gg_topology.c
- *	  Read, create and replace $PGDATA/gp_topology.
+ *	  Read, create and replace $PGDATA/gg_topology.
  *
  * The cluster topology store is a file, so the tool that inspects and repairs
  * it is a frontend program rather than a SQL function.  That is not only
@@ -27,7 +27,7 @@
 
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "common/logging.h"
 #include "getopt_long.h"
 
@@ -38,16 +38,18 @@ usage(void)
 {
 	printf(_("%s reads and writes a Greengage cluster topology store.\n\n"), progname);
 	printf(_("Usage:\n"));
-	printf(_("  %s dump      -D DATADIR\n"), progname);
+	printf(_("  %s dump      -D DATADIR [-f FILE]\n"), progname);
 	printf(_("  %s bootstrap -D DATADIR [--force]\n"), progname);
 	printf(_("  %s write     -D DATADIR [-f FILE] [--force] [--generation N]\n"), progname);
+	printf(_("\nOptions may be given before or after the command.\n"));
 	printf(_("\nCommands:\n"));
 	printf(_("  dump       print the store, one entry per line\n"));
 	printf(_("  bootstrap  write an empty store, as initdb does\n"));
 	printf(_("  write      replace the store from FILE, or from stdin\n"));
 	printf(_("\nOptions:\n"));
 	printf(_("  -D, --pgdata=DATADIR   data directory holding the store\n"));
-	printf(_("  -f, --file=FILE        read entries from FILE (\"-\" means stdin)\n"));
+	printf(_("  -f, --file=FILE        dump: write the dump to FILE; write: read the\n"));
+	printf(_("                         entries from it (\"-\" is the terminal, the default)\n"));
 	printf(_("      --force            overwrite a store belonging to another cluster\n"));
 	printf(_("      --generation=N     record generation N instead of one past the current\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
@@ -57,17 +59,32 @@ usage(void)
 			 "hostname address datadir\n"));
 }
 
+/*
+ * Refuse an option the command has no use for.
+ *
+ * Accepting it silently is the failure this exists to prevent: a "dump
+ * --generation 7" that prints the store and changes nothing looks exactly like
+ * one that worked.
+ */
 static void
-die_topofile(const char *what, const char *datadir, GpTopologyFileError err,
+reject_option(const char *command, const char *option)
+{
+	pg_log_error("the \"%s\" command does not take %s", command, option);
+	fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+	exit(1);
+}
+
+static void
+die_topofile(const char *what, const char *datadir, GgTopologyFileError err,
 			 int errline)
 {
 	if (errline > 0)
 		pg_log_error("%s \"%s/%s\": %s at line %d", what, datadir,
-					 GP_TOPOLOGY_FILENAME, gp_topology_file_error_str(err),
+					 GG_TOPOLOGY_FILENAME, gg_topology_file_error_str(err),
 					 errline);
 	else
-		pg_log_error("%s \"%s/%s\": %s", what, datadir, GP_TOPOLOGY_FILENAME,
-					 gp_topology_file_error_str(err));
+		pg_log_error("%s \"%s/%s\": %s", what, datadir, GG_TOPOLOGY_FILENAME,
+					 gg_topology_file_error_str(err));
 	exit(1);
 }
 
@@ -127,33 +144,58 @@ read_system_identifier(const char *datadir)
 	return sysid;
 }
 
+/*
+ * -f is where the entries go here and where they come from in write, which is
+ * the pg_dump/pg_restore reading of it: the store is always the other end.
+ * "-" is stdout here and stdin there -- the terminal either way, and the
+ * default for both.
+ */
 static void
-do_dump(const char *datadir)
+do_dump(const char *datadir, const char *outfile)
 {
-	GpTopologyFile topo;
-	GpTopologyFileError err;
+	GgTopologyFile topo;
+	GgTopologyFileError err;
+	FILE	   *out;
 	int			errline = 0;
 	int			i;
 
-	err = gp_topology_read_file(datadir, &topo, &errline);
-	if (err != GP_TOPOFILE_OK)
+	err = gg_topology_read_file(datadir, &topo, &errline);
+	if (err != GG_TOPOFILE_OK)
 		die_topofile("could not read", datadir, err, errline);
 
-	printf("version %d\n", topo.version);
-	printf("system_identifier " UINT64_FORMAT "\n", topo.system_identifier);
-	printf("generation " UINT64_FORMAT "\n", topo.generation);
-	printf("nentries %d\n", topo.nentries);
+	if (outfile == NULL || strcmp(outfile, "-") == 0)
+		out = stdout;
+	else if ((out = fopen(outfile, "w")) == NULL)
+	{
+		pg_log_error("could not open file \"%s\": %m", outfile);
+		exit(1);
+	}
+
+	fprintf(out, "version %d\n", topo.version);
+	fprintf(out, "system_identifier " UINT64_FORMAT "\n", topo.system_identifier);
+	fprintf(out, "generation " UINT64_FORMAT "\n", topo.generation);
+	fprintf(out, "nentries %d\n", topo.nentries);
 
 	for (i = 0; i < topo.nentries; i++)
 	{
 		const GpSegConfigEntry *e = &topo.entries[i];
 
-		printf("%d %d %c %c %c %c %d %s %s %s\n",
-			   e->dbid, e->segindex, e->role, e->preferred_role, e->mode,
-			   e->status, e->port, e->hostname, e->address, e->datadir);
+		fprintf(out, "%d %d %c %c %c %c %d %s %s %s\n",
+				e->dbid, e->segindex, e->role, e->preferred_role, e->mode,
+				e->status, e->port, e->hostname, e->address, e->datadir);
 	}
 
-	gp_topology_file_free(&topo);
+	/*
+	 * fclose reports the write errors a buffered fprintf could not, so a full
+	 * filesystem is an exit code rather than a truncated dump.
+	 */
+	if (out != stdout && fclose(out) != 0)
+	{
+		pg_log_error("could not write file \"%s\": %m", outfile);
+		exit(1);
+	}
+
+	gg_topology_file_free(&topo);
 }
 
 /*
@@ -230,7 +272,7 @@ parse_field_char(const char *s, const char *what, int lineno)
  * rather than a truncation later.
  */
 static void
-read_entries(FILE *fp, GpTopologyFile *topo)
+read_entries(FILE *fp, GgTopologyFile *topo)
 {
 	char		line[MAXPGPATH * 4];
 	int			nalloc = 16;
@@ -298,7 +340,7 @@ read_entries(FILE *fp, GpTopologyFile *topo)
  * where every writer reaches it.
  */
 static void
-validate_topology(const GpTopologyFile *topo)
+validate_topology(const GgTopologyFile *topo)
 {
 	int			i,
 				j;
@@ -349,7 +391,7 @@ validate_topology(const GpTopologyFile *topo)
 					 "cannot support");
 		pg_log_info("The file store is not WAL-logged, so a standby's copy of "
 					"the topology could not be kept in step.  A node started "
-					"with gp_topology_source=file and this topology would "
+					"with gg_topology_source=file and this topology would "
 					"refuse to start.");
 		exit(1);
 	}
@@ -359,16 +401,16 @@ static void
 do_write(const char *datadir, const char *infile, bool force,
 		 const char *generation)
 {
-	GpTopologyFile topo;
-	GpTopologyFile cur;
-	GpTopologyFileError err;
+	GgTopologyFile topo;
+	GgTopologyFile cur;
+	GgTopologyFileError err;
 	FILE	   *fp;
 	int			errentry = 0;
 
 	prepare_for_write(datadir);
 
 	memset(&topo, 0, sizeof(topo));
-	topo.version = GP_TOPOLOGY_FORMAT_VERSION;
+	topo.version = GG_TOPOLOGY_FORMAT_VERSION;
 	topo.system_identifier = read_system_identifier(datadir);
 
 	if (infile == NULL || strcmp(infile, "-") == 0)
@@ -420,10 +462,10 @@ do_write(const char *datadir, const char *infile, bool force,
 			exit(1);
 		}
 	}
-	else if (gp_topology_read_file(datadir, &cur, NULL) == GP_TOPOFILE_OK)
+	else if (gg_topology_read_file(datadir, &cur, NULL) == GG_TOPOFILE_OK)
 	{
 		topo.generation = cur.generation + 1;
-		gp_topology_file_free(&cur);
+		gg_topology_file_free(&cur);
 	}
 	else
 		topo.generation = 1;
@@ -435,36 +477,36 @@ do_write(const char *datadir, const char *infile, bool force,
 		exit(1);
 	}
 
-	err = gp_topology_write_file(datadir, &topo, force, &errentry);
-	if (err == GP_TOPOFILE_SYSID_CONFLICT)
+	err = gg_topology_write_file(datadir, &topo, force, &errentry);
+	if (err == GG_TOPOFILE_SYSID_CONFLICT)
 	{
 		pg_log_error("\"%s/%s\" belongs to a different database system",
-					 datadir, GP_TOPOLOGY_FILENAME);
+					 datadir, GG_TOPOLOGY_FILENAME);
 		pg_log_info("Use --force to replace it.");
 		exit(1);
 	}
-	if (err == GP_TOPOFILE_UNSERIALIZABLE)
+	if (err == GG_TOPOFILE_UNSERIALIZABLE)
 	{
 		pg_log_error("entry %d cannot be written: a hostname, address or data "
 					 "directory contains whitespace, or a field is out of range",
 					 errentry + 1);
 		exit(1);
 	}
-	if (err != GP_TOPOFILE_OK)
+	if (err != GG_TOPOFILE_OK)
 		die_topofile("could not write", datadir, err, 0);
 
 	printf(_("wrote %d entries at generation " UINT64_FORMAT "\n"),
 		   topo.nentries, topo.generation);
 
-	gp_topology_file_free(&topo);
+	gg_topology_file_free(&topo);
 }
 
 static void
 do_bootstrap(const char *datadir, bool force)
 {
-	GpTopologyFile topo;
-	GpTopologyFile cur;
-	GpTopologyFileError err;
+	GgTopologyFile topo;
+	GgTopologyFile cur;
+	GgTopologyFileError err;
 
 	prepare_for_write(datadir);
 
@@ -477,35 +519,35 @@ do_bootstrap(const char *datadir, bool force)
 	 * anything.
 	 */
 	if (!force &&
-		gp_topology_read_file(datadir, &cur, NULL) == GP_TOPOFILE_OK &&
+		gg_topology_read_file(datadir, &cur, NULL) == GG_TOPOFILE_OK &&
 		cur.generation > 0)
 	{
 		uint64		gen = cur.generation;
 		int			n = cur.nentries;
 
-		gp_topology_file_free(&cur);
+		gg_topology_file_free(&cur);
 		pg_log_error("\"%s/%s\" already holds %d entries at generation "
-					 UINT64_FORMAT, datadir, GP_TOPOLOGY_FILENAME, n, gen);
+					 UINT64_FORMAT, datadir, GG_TOPOLOGY_FILENAME, n, gen);
 		pg_log_info("Use \"gg_topology write\" to replace it, or --force to "
 					"reset it to empty.");
 		exit(1);
 	}
 
 	memset(&topo, 0, sizeof(topo));
-	topo.version = GP_TOPOLOGY_FORMAT_VERSION;
+	topo.version = GG_TOPOLOGY_FORMAT_VERSION;
 	topo.system_identifier = read_system_identifier(datadir);
 	topo.generation = 0;
 	topo.nentries = 0;
 
-	err = gp_topology_write_file(datadir, &topo, force, NULL);
-	if (err == GP_TOPOFILE_SYSID_CONFLICT)
+	err = gg_topology_write_file(datadir, &topo, force, NULL);
+	if (err == GG_TOPOFILE_SYSID_CONFLICT)
 	{
 		pg_log_error("\"%s/%s\" belongs to a different database system",
-					 datadir, GP_TOPOLOGY_FILENAME);
+					 datadir, GG_TOPOLOGY_FILENAME);
 		pg_log_info("Use --force to replace it.");
 		exit(1);
 	}
-	if (err != GP_TOPOFILE_OK)
+	if (err != GG_TOPOFILE_OK)
 		die_topofile("could not write", datadir, err, 0);
 
 	printf(_("wrote an empty cluster topology store\n"));
@@ -522,9 +564,9 @@ main(int argc, char *argv[])
 		{NULL, 0, NULL, 0}
 	};
 	const char *datadir = NULL;
-	const char *infile = NULL;
+	const char *file = NULL;
 	const char *generation = NULL;
-	const char *command;
+	const char *command = NULL;
 	bool		force = false;
 	int			c;
 
@@ -546,37 +588,60 @@ main(int argc, char *argv[])
 		}
 	}
 
-	if (argc < 2)
+	/*
+	 * The command is the first non-option argument, wherever it appears: this
+	 * loop alternates between options and operands instead of fixing the
+	 * command at argv[1], so "gg_topology -D dir dump" and "gg_topology dump -D
+	 * dir" are the same invocation.  Written the pg_ctl way rather than relying
+	 * on GNU permutation, because src/port/getopt_long.c stops at the first
+	 * operand and would leave everything after the command unparsed.
+	 */
+	optind = 1;
+
+	while (optind < argc)
+	{
+		while ((c = getopt_long(argc, argv, "D:f:", long_options, NULL)) != -1)
+		{
+			switch (c)
+			{
+				case 'D':
+					datadir = optarg;
+					break;
+				case 'f':
+					file = optarg;
+					break;
+				case 1:
+					force = true;
+					break;
+				case 2:
+					generation = optarg;
+					break;
+				default:
+					fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+							progname);
+					exit(1);
+			}
+		}
+
+		if (optind < argc)
+		{
+			if (command != NULL)
+			{
+				pg_log_error("too many command-line arguments (first is \"%s\")",
+							 argv[optind]);
+				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+						progname);
+				exit(1);
+			}
+			command = argv[optind++];
+		}
+	}
+
+	if (command == NULL)
 	{
 		pg_log_error("no command specified");
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
 		exit(1);
-	}
-
-	command = argv[1];
-	optind = 2;
-
-	while ((c = getopt_long(argc, argv, "D:f:", long_options, NULL)) != -1)
-	{
-		switch (c)
-		{
-			case 'D':
-				datadir = optarg;
-				break;
-			case 'f':
-				infile = optarg;
-				break;
-			case 1:
-				force = true;
-				break;
-			case 2:
-				generation = optarg;
-				break;
-			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-						progname);
-				exit(1);
-		}
 	}
 
 	if (datadir == NULL)
@@ -590,11 +655,23 @@ main(int argc, char *argv[])
 	}
 
 	if (strcmp(command, "dump") == 0)
-		do_dump(datadir);
+	{
+		if (force)
+			reject_option(command, "--force");
+		if (generation != NULL)
+			reject_option(command, "--generation");
+		do_dump(datadir, file);
+	}
 	else if (strcmp(command, "bootstrap") == 0)
+	{
+		if (file != NULL)
+			reject_option(command, "-f/--file");
+		if (generation != NULL)
+			reject_option(command, "--generation");
 		do_bootstrap(datadir, force);
+	}
 	else if (strcmp(command, "write") == 0)
-		do_write(datadir, infile, force, generation);
+		do_write(datadir, file, force, generation);
 	else
 	{
 		pg_log_error("unrecognized command \"%s\"", command);

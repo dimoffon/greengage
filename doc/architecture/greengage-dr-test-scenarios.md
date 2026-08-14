@@ -22,7 +22,7 @@ them (T-3, HA-1) predict *failures*.
 
 Base fixture: `docker-compose -f src/test/dr/docker-compose.yml up --build` — a production
 container (coordinator + 2 segments, archiving per content) and a DR container sharing an
-`/archive` volume, built with `ggdr create-replica`.
+`/archive` volume, built with `ggdr create`.
 
 ---
 
@@ -30,12 +30,12 @@ container (coordinator + 2 segments, archiving per content) and a DR container s
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **A-1** | `ggdr create-replica` from per-content base backups + WAL archive | Every node restored, coordinator frozen-seeded with DR-local topology, replica armed (`hot_standby`, `restore_command`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build topology check confirming the seed describes this cluster (V-21). | AUTO | PASS |
+| **A-1** | `ggdr create` from per-content base backups + WAL archive | Every node restored, coordinator frozen-seeded with DR-local topology, replica armed (`hot_standby`, `restore_command`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build topology check confirming the seed describes this cluster (V-21). | AUTO | PASS |
 | **A-2** | DR describes **itself**, not production | `gp_segment_configuration.hostname` on the DR reads `dr`, never production's host. The frozen-tuple seed (`xmin = FrozenTransactionId`) is unconditionally visible with no CLOG dependency, and the redo filter blocks production's records from overwriting it. | AUTO | PASS |
 | **A-3** | Production mutates `gp_segment_configuration` (hostname change) | DR value is **unchanged**. `DRRedoShouldFilter()` sees every referenced block in the protected set and skips `rm_redo`; `lastReplayedEndRecPtr` still advances, so the DR stays in LSN lock-step. | AUTO | PASS |
 | **A-4** | Redo filter is **selective** — a user table created on production *after* the base backup | Table appears on the DR. Proof the filter only skips the topology catalogs, not ordinary WAL. | AUTO | PASS |
-| **A-5** | `create-replica` refuses to clobber a live cluster | Aborts if any target datadir has `postmaster.pid`; refuses a non-empty datadir without `--force`. | NEW | REFUSE |
-| **A-6** | `create-replica` with an **incomplete WAL archive** (backup's START WAL segment absent) | Aborts fail-closed *before* starting any node. Without this gate, recovery could replay the seed's forked WAL and permanently fork the timeline. | NEW | REFUSE |
+| **A-5** | `create` refuses to clobber a live cluster | Aborts if any target datadir has `postmaster.pid`; refuses a non-empty datadir without `--force`. | NEW | REFUSE |
+| **A-6** | `create` with an **incomplete WAL archive** (backup's START WAL segment absent) | Aborts fail-closed *before* starting any node. Without this gate, recovery could replay the seed's forked WAL and permanently fork the timeline. | NEW | REFUSE |
 | **A-7** | `pg_wal` on the DR is **byte-identical** to production's for the same content | `pg_waldump` diff / checksum of a replayed segment matches production's archived copy. The filter changes what is *applied*, never the bytes — this is what keeps the archive reusable for production PITR and for a second DR. | NEW | PASS |
 | **A-8** | Two DR replicas built from **one** archive | Both build and serve independently. No replication slot exists, so neither pins production WAL nor interferes with the other. | NEW (MANUAL) | PASS |
 | **A-9** | Segment-count mismatch (DR topology has N+1 contents) | Build must fail or the DR must refuse to serve. Per-content replay requires an exact content-count match; host layout is free. | NEW | REFUSE |
@@ -121,7 +121,7 @@ replica?*
 
 **This group changed shape in P6/P7.** It used to be dominated by one answer: production must
 not touch the topology catalogs, because the replica's own topology lived in them and a
-rewrite halted it. The replica's topology now lives in `$PGDATA/gp_topology`, outside the WAL
+rewrite halted it. The replica's topology now lives in `$PGDATA/gg_topology`, outside the WAL
 entirely, so those catalogs are ordinary relations again — production maintains them freely and
 the replica replays the result without reading it. V-13′ is the scenario that demonstrates it;
 V-5 is deleted because the frozen seed that caused it no longer exists.
@@ -143,7 +143,7 @@ V-5 is deleted because the frozen seed that caused it no longer exists.
 | **V-10** | `VACUUM FULL` a large **user** table on production | Correct on the DR, but with three costs: (1) the whole table is re-WAL'd (`wal_level = replica` forces it) → **archive burst and an RPO spike proportional to table size**; (2) the replayed **AccessExclusiveLock** cancels DR queries touching that table after `max_standby_archive_delay` — [measured](#appendix--c-7--v-10-measured-vacuum-full-under-a-live-reader); (3) transient **2× disk** on the DR while both relfilenodes exist. Schedule inside a paused window and advance afterwards. | NEW | DEGRADE |
 | **V-11** | `CLUSTER` a user table | Identical to V-10 — same rewrite mechanics. | NEW | DEGRADE |
 | **V-12** | `REINDEX` a user index | Index rebuilt via WAL on the DR; lock conflict for queries using that index during the advance. | NEW | DEGRADE |
-| **V-13′** | **`VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE` on the topology catalog** (`gp_segment_configuration_internal`, its indexes and TOAST) while a DR is attached | **Nothing happens to the DR, and that is the point.** The replica's topology lives in `$PGDATA/gp_topology`, which production's WAL cannot reach, so these rewrites replay onto its copy of the catalog like any other record and it does not read that copy. Until P7 this was the sharpest operational contract in the feature — `relmap_redo()` → `DRRejectForbiddenRemap()` raised `FATAL` before any on-disk write and took the node down, recoverable only by rebuilding it. That guard is deleted. Reproduced by `src/test/dr/docker-compose.maint.yml`, which runs all four operations one restore point at a time and asserts, per advance: same postmaster PID, seg0 hostname still `dr`, node count unchanged, **a distributed read still dispatches**, no `FATAL`, and the old guard's log line **zero** times — plus that production's relfilenode really moved, so a run that did nothing cannot pass. | **REWRITTEN (P8)** | PASS |
+| **V-13′** | **`VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE` on the topology catalog** (`gp_segment_configuration_internal`, its indexes and TOAST) while a DR is attached | **Nothing happens to the DR, and that is the point.** The replica's topology lives in `$PGDATA/gg_topology`, which production's WAL cannot reach, so these rewrites replay onto its copy of the catalog like any other record and it does not read that copy. Until P7 this was the sharpest operational contract in the feature — `relmap_redo()` → `DRRejectForbiddenRemap()` raised `FATAL` before any on-disk write and took the node down, recoverable only by rebuilding it. That guard is deleted. Reproduced by `src/test/dr/docker-compose.maint.yml`, which runs all four operations one restore point at a time and asserts, per advance: same postmaster PID, seg0 hostname still `dr`, node count unchanged, **a distributed read still dispatches**, no `FATAL`, and the old guard's log line **zero** times — plus that production's relfilenode really moved, so a run that did nothing cannot pass. | **REWRITTEN (P8)** | PASS |
 | **V-14** | `VACUUM FULL pg_class` (or any *non*-protected mapped catalog) on production | Replays normally — `DRRejectForbiddenRemap` only rejects remaps of the protected set. | NEW | PASS |
 
 ### D.3 — Confirmed by the maintenance fixture
@@ -151,7 +151,7 @@ V-5 is deleted because the frozen seed that caused it no longer exists.
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **V-20′** | Production `VACUUM` **truncates trailing pages of the topology catalog** | Inverted by P7. The replica applies the truncation now, because its own topology is not in that relation. The `smgr_redo` guard that used to skip it (`DRRedoShouldFilterRelFileNode()`) is deleted along with the rest of the filter, and `docker-compose.maint.yml` asserts its log line appears **zero** times — a build that still skips the truncation fails the fixture. The original defect and its fix are kept under *Superseded* below: they are the record of a real bug, and deleting them would destroy the evidence. | **INVERTED (P8)** | PASS |
-| **V-21′** | Assert the replica describes **itself**, and is serving that from the file store | `ggdr create-replica` step 7 (`_check_topology()`) reads `gp_segment_configuration` back from the running coordinator — the view over whichever provider is active — and requires it to match the topology file on `dbid`/`content`/`port`/`hostname`; it also requires **every** node to report `gp_topology_source = file`, because that GUC is exempt from the QD/QE sync check and a segment left on `catalog` would read production's replayed rows with nothing else reporting it. The heap-page half of the old check is gone: `ctid` and `pg_relation_size` are heap concepts and mean nothing for a view. | **REWRITTEN (P8)** | PASS |
+| **V-21′** | Assert the replica describes **itself**, and is serving that from the file store | `ggdr create` step 7 (`_check_topology()`) reads `gp_segment_configuration` back from the running coordinator — the view over whichever provider is active — and requires it to match the topology file on `dbid`/`content`/`port`/`hostname`; it also requires **every** node to report `gg_topology_source = file`, because that GUC is exempt from the QD/QE sync check and a segment left on `catalog` would read production's replayed rows with nothing else reporting it. The heap-page half of the old check is gone: `ctid` and `pg_relation_size` are heap concepts and mean nothing for a view. | **REWRITTEN (P8)** | PASS |
 
 ---
 
@@ -197,7 +197,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
 | **G-1** | Archive becomes unreachable (unmount / network partition) | DR stops advancing; `restore_command` retries; already-served reads are unaffected while paused. `rpo_seconds` grows. Recovers on its own when the archive returns. | NEW | DEGRADE |
-| **G-2** | A WAL segment is **missing** from the archive (retention deleted it, or archiving failed) | That node stalls permanently at the gap. There is no cross-WAN `pg_rewind` — **recovery is a full re-`create-replica` of that node.** Demonstrate the detection path (stall + growing RPO) and the rebuild. | NEW | HALT → rebuild |
+| **G-2** | A WAL segment is **missing** from the archive (retention deleted it, or archiving failed) | That node stalls permanently at the gap. There is no cross-WAN `pg_rewind` — **recovery is a full re-`create` of that node.** Demonstrate the detection path (stall + growing RPO) and the rebuild. | NEW | HALT → rebuild |
 | **G-3** | A WAL segment in the archive is **corrupt** | Replay raises a CRC / invalid-record error and stops at that LSN. Same rebuild recovery. Demonstrate the DR does not silently skip it. | NEW | HALT |
 | **G-4** | Production `archive_command` fails for a while, then succeeds | Production's `pg_wal` grows (that is the point of archive transport with **no replication slot** — the DR can never pin production WAL); the DR catches up once archiving resumes. | NEW | PASS |
 | **G-5** | DR is offline for a long window, then restarted with the archive intact | Catches up from where it stopped. No production-side impact whatsoever — the key operational advantage over a slot-based standby on PG 12 (no `max_slot_wal_keep_size`). | NEW | PASS |
@@ -300,7 +300,7 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 The prediction that a production mirror failover silently stalls the DR was traced link by
 link. Each step is a direct code reference, not an inference:
 
-1. **The DR is armed with `'current'`, unconditionally.** `cmd_create_replica` writes
+1. **The DR is armed with `'current'`, unconditionally.** `cmd_create` writes
    `recovery_target_timeline = 'current'` into every node's `postgresql.conf`
    (`gpMgmt/bin/ggdr:586`). There is no CLI flag to override it.
 2. **`'current'` means "do not follow forks".** `check_recovery_target_timeline()` maps the
@@ -339,7 +339,7 @@ That is what the HA-1/HA-2 test run has to establish.
 
 The three appendices below are the record of a real defect (V-20), its diagnosis and its
 fix. **The code they describe no longer exists**: P6 moved the cluster topology out of the
-replicated catalog and into `$PGDATA/gp_topology`, and P7 deleted the apply-time redo filter,
+replicated catalog and into `$PGDATA/gg_topology`, and P7 deleted the apply-time redo filter,
 the `relmapper.c` remap guard and the `smgr_redo` truncate guard along with it. A replica now
 replays production's topology catalog in full and simply does not read it.
 
@@ -398,7 +398,7 @@ measured; see the V-21 appendix below.
 ## Appendix — V-21 measured on the fixture
 
 Run against `src/test/dr/docker-compose.yml` (production: coordinator + 2 segments, no
-mirrors; DR built by `ggdr create-replica`). The rest of the suite passed 28/28 on
+mirrors; DR built by `ggdr create`). The rest of the suite passed 28/28 on
 the same run, so the DR was in its normal, healthy state when measured.
 
 **Same relfilenode — confirmed in a live system, not just from reading the seed script:**
@@ -485,7 +485,7 @@ Measured identically on both runs:
 | production catalog before densify | 1 page |
 | after 5000 filler rows inserted + deleted in one txn | **12 pages**, 3 live rows still on block 0 |
 | production still dispatches distributed queries | yes |
-| DR catalog after `create-replica` | 12 pages, 3 live rows, **highest live block 11** |
+| DR catalog after `create` | 12 pages, 3 live rows, **highest live block 11** |
 | production after `VACUUM` | **1 page** — `XLOG_SMGR_TRUNCATE … to 1 block` emitted |
 
 The DR's entire topology therefore sits 10 blocks above production's truncation target.

@@ -12,7 +12,7 @@
  * with an apply-time WAL filter, two payload-named redo guards, and a standing
  * contract that production must not VACUUM FULL its own catalogs.
  *
- * So the storage is a provider, chosen per node by the gp_topology_source GUC:
+ * So the storage is a provider, chosen per node by the gg_topology_source GUC:
  *
  *	  catalog   the shared catalog, as always (the default; nothing changes)
  *	  file      a flat file in $PGDATA, readable with no transaction, no
@@ -33,17 +33,17 @@
 #ifndef CDBTOPOLOGY_H
 #define CDBTOPOLOGY_H
 
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "utils/palloc.h"
 
-/* Values of the gp_topology_source GUC. */
-typedef enum GpTopologySourceKind
+/* Values of the gg_topology_source GUC. */
+typedef enum GgTopologySourceKind
 {
-	GP_TOPOLOGY_SOURCE_CATALOG = 0,
-	GP_TOPOLOGY_SOURCE_FILE
-} GpTopologySourceKind;
+	GG_TOPOLOGY_SOURCE_CATALOG = 0,
+	GG_TOPOLOGY_SOURCE_FILE
+} GgTopologySourceKind;
 
-extern int	gp_topology_source;		/* GpTopologySourceKind; int for the GUC machinery */
+extern int	gg_topology_source;		/* GgTopologySourceKind; int for the GUC machinery */
 
 /*
  * How hard a writer needs to serialise.

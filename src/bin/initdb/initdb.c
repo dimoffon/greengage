@@ -66,7 +66,7 @@
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
 #include "common/username.h"
@@ -882,7 +882,7 @@ write_version_file(const char *extrapath)
 /*
  * Write the empty cluster topology store.
  *
- * Unconditionally, whatever gp_topology_source will be set to -- initdb cannot
+ * Unconditionally, whatever gg_topology_source will be set to -- initdb cannot
  * know a PGC_POSTMASTER GUC, and the point of always writing it is that its
  * absence later means "deleted" rather than an ambiguous "empty".  generation 0
  * is what says nobody has written it for real yet; the file store refuses to
@@ -895,9 +895,9 @@ static void
 write_topology_file(void)
 {
 	ControlFileData *controlfile;
-	GpTopologyFile topo;
+	GgTopologyFile topo;
 	bool		crc_ok;
-	GpTopologyFileError err;
+	GgTopologyFileError err;
 
 	controlfile = get_controlfile(pg_data, &crc_ok);
 	if (controlfile == NULL || !crc_ok)
@@ -907,16 +907,16 @@ write_topology_file(void)
 	}
 
 	memset(&topo, 0, sizeof(topo));
-	topo.version = GP_TOPOLOGY_FORMAT_VERSION;
+	topo.version = GG_TOPOLOGY_FORMAT_VERSION;
 	topo.system_identifier = controlfile->system_identifier;
 	topo.generation = 0;
 	topo.nentries = 0;
 
-	err = gp_topology_write_file(pg_data, &topo, true, NULL);
-	if (err != GP_TOPOFILE_OK)
+	err = gg_topology_write_file(pg_data, &topo, true, NULL);
+	if (err != GG_TOPOFILE_OK)
 	{
 		pg_log_error("could not write file \"%s/%s\": %s", pg_data,
-					 GP_TOPOLOGY_FILENAME, gp_topology_file_error_str(err));
+					 GG_TOPOLOGY_FILENAME, gg_topology_file_error_str(err));
 		exit(1);
 	}
 

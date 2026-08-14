@@ -108,7 +108,7 @@ done
 # This used to be done after the fact, by UPDATEing gp_segment_configuration on
 # the restored coordinator under allow_system_table_mods -- which only worked
 # because that catalog happened to be where topology lived.  It is now written to
-# each node's own $PGDATA/gp_topology before the node ever starts, so the cluster
+# each node's own $PGDATA/gg_topology before the node ever starts, so the cluster
 # describes itself from its first boot rather than being corrected afterwards.
 # This is the first non-DR user of the file topology provider, and the case it
 # was designed for.
@@ -122,7 +122,7 @@ PITR_DBID["0"]=$REPLICA_PRIMARY1_DBID; PITR_DATADIR["0"]=$REPLICA_PRIMARY1
 PITR_DBID["1"]=$REPLICA_PRIMARY2_DBID; PITR_DATADIR["1"]=$REPLICA_PRIMARY2
 PITR_DBID["2"]=$REPLICA_PRIMARY3_DBID; PITR_DATADIR["2"]=$REPLICA_PRIMARY3
 
-PITR_TOPOLOGY=$TEMP_DIR/gp_topology.txt
+PITR_TOPOLOGY=$TEMP_DIR/gg_topology.txt
 echo "Building the PITR cluster's topology..."
 psql -p $MASTER_PORT -d postgres -Atc \
   "select content||' '||role||' '||preferred_role||' '||mode||' '||status||' '||port||' '||hostname||' '||address
@@ -164,11 +164,11 @@ recovery_end_command = 'touch ${!REPLICA_VAR}/recovery_finished'" >> ${!REPLICA_
 echo "" > ${!REPLICA_VAR}/postgresql.auto.conf
 
   # Point this node at its own topology store and write it, before it starts.
-  # Both halves have to happen here: gp_topology_source is PGC_POSTMASTER, and
+  # Both halves have to happen here: gg_topology_source is PGC_POSTMASTER, and
   # gg_topology refuses to write a store while a postmaster owns the directory.
   # The base backup brought production's copy of the file along; this overwrites
   # it, which is exactly what it is there for.
-  echo "gp_topology_source = file" >> ${!REPLICA_VAR}/postgresql.conf
+  echo "gg_topology_source = file" >> ${!REPLICA_VAR}/postgresql.conf
   gg_topology write -D ${!REPLICA_VAR} - < $PITR_TOPOLOGY
   if [ $? != 0 ]; then
     echo "FAIL: could not write the topology store for ${!REPLICA_VAR}"

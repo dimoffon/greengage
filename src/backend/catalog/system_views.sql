@@ -824,7 +824,7 @@ $$
 $$
 LANGUAGE SQL EXECUTE ON ALL SEGMENTS;
 
--- The cluster topology, from whatever store gp_topology_source names.
+-- The cluster topology, from whatever store gg_topology_source names.
 --
 -- The shared catalog behind the "catalog" provider is
 -- gp_segment_configuration_internal.  Nothing outside that provider should read

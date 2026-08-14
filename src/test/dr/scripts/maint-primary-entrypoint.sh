@@ -4,7 +4,7 @@
 # V-13' asks the inverse of the question the dense/V-20 fixture asked.  That one
 # tested whether a DR replica's frozen-seeded topology survived production
 # truncating the shared catalog it lived in.  The replica's topology is not in
-# that catalog any more -- it is in $PGDATA/gp_topology, which production's WAL
+# that catalog any more -- it is in $PGDATA/gg_topology, which production's WAL
 # cannot reach -- so the question is now simply: can production run ordinary
 # maintenance on its topology catalog while a replica is attached?
 #

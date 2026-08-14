@@ -74,10 +74,10 @@ for content in $ALL_CONTENTS; do NODES+=("${DR_DATADIR[$content]}:${DR_PORT[$con
 GG="python3 $SRC/gpMgmt/bin/ggdr"
 log "maint-dr: building the replica (paused at maint_rp_pre, before any maintenance) ..."
 set +e
-$GG create-replica \
+$GG create \
 	--topology "$TOPO_FILE" \
-	--basebackup-dir "$BASEBACKUP" \
-	--wal-archive "$WAL_ARCHIVE" \
+	--backup "$BASEBACKUP" \
+	--wal "$WAL_ARCHIVE" \
 	--pause-at maint_rp_pre \
 	--force 2>&1 | sed 's/^/    ggdr: /'
 set -e
@@ -147,7 +147,7 @@ echo "================ V-13' PRECONDITION (replica built, before any maintenance
 # replica reads, and the question would be a different one.
 BAD=
 for content in $ALL_CONTENTS; do
-	src=$(PGOPTIONS='-c gp_role=utility' psql -p "${DR_PORT[$content]}" -d postgres -Atc "show gp_topology_source;" 2>/dev/null)
+	src=$(PGOPTIONS='-c gp_role=utility' psql -p "${DR_PORT[$content]}" -d postgres -Atc "show gg_topology_source;" 2>/dev/null)
 	[ "$src" = file ] || BAD="$BAD content=$content:'${src:-<unreachable>}'"
 done
 if [ -z "$BAD" ]; then

@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * gp_topology_file.h
+ * gg_topology_file.h
  *	  One entry of the cluster topology, and the on-disk format of the
  *	  file-backed topology store.
  *
@@ -18,12 +18,12 @@
  * Portions Copyright (c) 2026-Present, Greengage contributors.
  *
  * IDENTIFICATION
- *	  src/include/common/gp_topology_file.h
+ *	  src/include/common/gg_topology_file.h
  *
  *-------------------------------------------------------------------------
  */
-#ifndef GP_TOPOLOGY_FILE_H
-#define GP_TOPOLOGY_FILE_H
+#ifndef GG_TOPOLOGY_FILE_H
+#define GG_TOPOLOGY_FILE_H
 
 /*
  * How many addresses getDnsCachedAddress() will cache for one host.  Lives
@@ -62,7 +62,7 @@ typedef struct GpSegConfigEntry
 
 
 /* ----------------------------------------------------------------
- *				$PGDATA/gp_topology
+ *				$PGDATA/gg_topology
  * ----------------------------------------------------------------
  *
  * The on-disk form of a whole topology, for the file-backed store:
@@ -100,37 +100,37 @@ typedef struct GpSegConfigEntry
  * exit(1) in initdb, and only the caller knows which.
  */
 
-#define GP_TOPOLOGY_FILENAME		"gp_topology"
-#define GP_TOPOLOGY_TMP_PREFIX		"gp_topology.tmp"
-#define GP_TOPOLOGY_FORMAT_VERSION	1
+#define GG_TOPOLOGY_FILENAME		"gg_topology"
+#define GG_TOPOLOGY_TMP_PREFIX		"gg_topology.tmp"
+#define GG_TOPOLOGY_FORMAT_VERSION	1
 
-typedef struct GpTopologyFile
+typedef struct GgTopologyFile
 {
 	int			version;		/* as read; always _FORMAT_VERSION on write */
 	uint64		system_identifier;	/* 0 == not recorded, not comparable */
 	uint64		generation;		/* CAS token; 0 == never written for real */
 	int			nentries;
 	GpSegConfigEntry *entries;	/* NULL iff nentries == 0 */
-} GpTopologyFile;
+} GgTopologyFile;
 
-typedef enum GpTopologyFileError
+typedef enum GgTopologyFileError
 {
-	GP_TOPOFILE_OK = 0,
-	GP_TOPOFILE_ENOENT,			/* read: no such file; errno preserved */
-	GP_TOPOFILE_IO,				/* open/read/write/rename failed; errno kept */
-	GP_TOPOFILE_TRUNCATED,		/* ended before the crc32c line */
-	GP_TOPOFILE_BAD_MAGIC,
-	GP_TOPOFILE_BAD_VERSION,
-	GP_TOPOFILE_BAD_CRC,
-	GP_TOPOFILE_BAD_COUNT,		/* nentries disagrees with the lines present */
-	GP_TOPOFILE_BAD_HEADER,		/* generation 0 with entries */
-	GP_TOPOFILE_BAD_SYNTAX,		/* an entry line; *errline names it */
-	GP_TOPOFILE_TOO_LARGE,		/* past the ceiling a topology can reach */
-	GP_TOPOFILE_UNSERIALIZABLE,	/* write: a field that could not be read back */
-	GP_TOPOFILE_SYSID_CONFLICT	/* write: would overwrite another cluster's */
-} GpTopologyFileError;
+	GG_TOPOFILE_OK = 0,
+	GG_TOPOFILE_ENOENT,			/* read: no such file; errno preserved */
+	GG_TOPOFILE_IO,				/* open/read/write/rename failed; errno kept */
+	GG_TOPOFILE_TRUNCATED,		/* ended before the crc32c line */
+	GG_TOPOFILE_BAD_MAGIC,
+	GG_TOPOFILE_BAD_VERSION,
+	GG_TOPOFILE_BAD_CRC,
+	GG_TOPOFILE_BAD_COUNT,		/* nentries disagrees with the lines present */
+	GG_TOPOFILE_BAD_HEADER,		/* generation 0 with entries */
+	GG_TOPOFILE_BAD_SYNTAX,		/* an entry line; *errline names it */
+	GG_TOPOFILE_TOO_LARGE,		/* past the ceiling a topology can reach */
+	GG_TOPOFILE_UNSERIALIZABLE,	/* write: a field that could not be read back */
+	GG_TOPOFILE_SYSID_CONFLICT	/* write: would overwrite another cluster's */
+} GgTopologyFileError;
 
-extern const char *gp_topology_file_error_str(GpTopologyFileError err);
+extern const char *gg_topology_file_error_str(GgTopologyFileError err);
 
 /*
  * Parse `len` bytes of `buf`.  The caller owns buf throughout and may free it
@@ -139,8 +139,8 @@ extern const char *gp_topology_file_error_str(GpTopologyFileError err);
  * frontend) and the read-side scratch fields are zeroed.  On any failure *out
  * is left zeroed and nothing is allocated.
  */
-extern GpTopologyFileError gp_topology_parse(const char *buf, size_t len,
-											 GpTopologyFile *out, int *errline);
+extern GgTopologyFileError gg_topology_parse(const char *buf, size_t len,
+											 GgTopologyFile *out, int *errline);
 
 /*
  * Render `topo`, CRC included.  Returns a NUL-terminated buffer the caller
@@ -149,11 +149,11 @@ extern GpTopologyFileError gp_topology_parse(const char *buf, size_t len,
  * be written and read back -- whitespace in a string, a NULL string, a dbid or
  * port out of range.  Never mutates *topo.
  */
-extern char *gp_topology_serialize(const GpTopologyFile *topo, size_t *len,
-								   GpTopologyFileError *err, int *errentry);
+extern char *gg_topology_serialize(const GgTopologyFile *topo, size_t *len,
+								   GgTopologyFileError *err, int *errentry);
 
-extern GpTopologyFileError gp_topology_read_file(const char *datadir,
-												 GpTopologyFile *out,
+extern GgTopologyFileError gg_topology_read_file(const char *datadir,
+												 GgTopologyFile *out,
 												 int *errline);
 
 /*
@@ -162,10 +162,10 @@ extern GpTopologyFileError gp_topology_read_file(const char *datadir,
  * the caller's decision.  Unless `force`, refuses when the file already there
  * records a different system identifier.
  */
-extern GpTopologyFileError gp_topology_write_file(const char *datadir,
-												  const GpTopologyFile *topo,
+extern GgTopologyFileError gg_topology_write_file(const char *datadir,
+												  const GgTopologyFile *topo,
 												  bool force, int *errentry);
 
-extern void gp_topology_file_free(GpTopologyFile *topo);
+extern void gg_topology_file_free(GgTopologyFile *topo);
 
-#endif							/* GP_TOPOLOGY_FILE_H */
+#endif							/* GG_TOPOLOGY_FILE_H */

@@ -18,7 +18,7 @@
 #define CDBUTIL_H
 
 #include "catalog/gp_segment_configuration_internal.h"
-#include "common/gp_topology_file.h"
+#include "common/gg_topology_file.h"
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
 

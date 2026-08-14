@@ -1,5 +1,5 @@
 #!/bin/bash
-# dr-entrypoint.sh -- build the DR cluster with `ggdr create-replica`
+# dr-entrypoint.sh -- build the DR cluster with `ggdr create`
 # (restore base backups + write the DR-local topology store + arm DR mode + start
 # every node in continuous archive recovery), then run the milestone regression suite:
 # T1-T6 (topology store + unrestricted replay) / M2 (read-only) / M2' (distributed
@@ -54,7 +54,7 @@ COORD=${DR_DATADIR[-1]}
 # the DR cluster is built by ggdr (not gpdemo), so no such file exists here.
 # Export it (so this script's own gpstart/gpstop work) AND persist it as a sourceable
 # env file + ~/.bashrc line (so a fresh `docker exec dr bash` shell has it too) -- e.g.
-# to gpstop the promoted cluster before rebuilding the replica with create-replica --force.
+# to gpstop the promoted cluster before rebuilding the replica with create --force.
 export COORDINATOR_DATA_DIRECTORY="$COORD"
 export MASTER_DATA_DIRECTORY="$COORD"
 export PGPORT="$PORT_BASE"
@@ -77,10 +77,10 @@ log "dr: waiting for production to create + archive the restore point ..."
 for _ in $(seq 1 300); do [ -f "$ARCHIVE/restorepoint_ready" ] && break; sleep 2; done
 
 # --- M4: build the whole DR cluster in one shot via the ggdr utility.
-#     create-replica restores each instance's base backup, writes the DR-local
-#     topology (hostname 'dr') into every node's own $PGDATA/gp_topology, gates on
+#     'ggdr create' restores each instance's base backup, writes the DR-local
+#     topology (hostname 'dr') into every node's own $PGDATA/gg_topology, gates on
 #     the WAL archive being complete enough to reach consistency, arms DR mode
-#     (gp_topology_source=file + hot_standby + restore_command + standby.signal) on
+#     (gg_topology_source=file + hot_standby + restore_command + standby.signal) on
 #     every node with the M3 pause target dr_rp1, and starts each in archive
 #     recovery.  This exercises the SAME code path an operator would run, instead
 #     of open-coding the restore/write/arm/start inline. ---
@@ -101,17 +101,17 @@ else
 	die "gg_walfilter tests FAILED; refusing to build the DR cluster"
 fi
 
-log "dr: building the DR replica via 'ggdr create-replica' (M4) ..."
+log "dr: building the DR replica via 'ggdr create' (M4) ..."
 set +e
-$GG create-replica \
+$GG create \
 	--topology "$TOPO_FILE" \
-	--basebackup-dir "$BASEBACKUP" \
-	--wal-archive "$WAL_ARCHIVE" \
+	--backup "$BASEBACKUP" \
+	--wal "$WAL_ARCHIVE" \
 	--pause-at dr_rp1 \
 	--force 2>&1 | sed 's/^/    ggdr: /'
 cr_rc=${PIPESTATUS[0]}
 set -e
-[ "$cr_rc" = 0 ] || log "dr: WARNING create-replica exit=$cr_rc (continuing; assertions below will show the real state)"
+[ "$cr_rc" = 0 ] || log "dr: WARNING create exit=$cr_rc (continuing; assertions below will show the real state)"
 
 q()     { PGOPTIONS='-c gp_role=utility' psql -p "$PORT_BASE" -d postgres -Atc "$1" 2>/dev/null; }
 # Returns 0 even when the statement errors (that is the expected case here), so
@@ -152,7 +152,7 @@ echo "================ T1-T6 + M2 assertions on the LIVE DR coordinator (in reco
 # T1 topology independence: production changed seg0's hostname to
 # $PRODUCTION_SEG0_HOSTNAME after the base backup.  The DR must not show it -- not
 # because anything filters that record (nothing does, as of P7), but because the
-# topology the DR serves lives in $PGDATA/gp_topology, which production's WAL
+# topology the DR serves lives in $PGDATA/gg_topology, which production's WAL
 # cannot reach.
 drhost=$(q "select hostname from gp_segment_configuration where content=0;")
 if [ -n "$drhost" ] && [ "$drhost" != "$PRODUCTION_SEG0_HOSTNAME" ]; then
@@ -187,15 +187,15 @@ else
 	no_ "T3 replay is unrestricted: user table 'dr_wal_applied' NOT present on the DR"
 fi
 # T4: every node -- not just the coordinator -- runs the file provider.  A node left
-# on 'catalog' would describe production, and gp_topology_source is exempt from the
+# on 'catalog' would describe production, and gg_topology_source is exempt from the
 # QD/QE GUC-sync check, so nothing else would say so.
 t4_bad=
 for content in $ALL_CONTENTS; do
-	src=$(PGOPTIONS='-c gp_role=utility' psql -p "${DR_PORT[$content]}" -d postgres -Atc "show gp_topology_source;" 2>/dev/null)
+	src=$(PGOPTIONS='-c gp_role=utility' psql -p "${DR_PORT[$content]}" -d postgres -Atc "show gg_topology_source;" 2>/dev/null)
 	[ "$src" = "file" ] || t4_bad="$t4_bad content=$content:'${src:-<unreachable>}'"
 done
 if [ -z "$t4_bad" ]; then
-	ok_ "T4 every node reports gp_topology_source=file"
+	ok_ "T4 every node reports gg_topology_source=file"
 else
 	no_ "T4 nodes not on the file provider:$t4_bad"
 fi
@@ -251,7 +251,7 @@ refused "M2 DDL (CREATE TABLE)"    "create table dr_should_not_exist (x int);"
 # M2'' a topology WRITE must be refused too, and this one is not covered by the
 # read-only executor gate: the segadmin functions are plain CMD_SELECTs, and under
 # the file provider persisting needs no XID, so nothing else would stop a superuser
-# durably rewriting $PGDATA/gp_topology on a replica in recovery.  The catalog
+# durably rewriting $PGDATA/gg_topology on a replica in recovery.  The catalog
 # provider used to refuse it only as a side effect of needing a transaction id.
 tw_out=$(qfail "select gp_update_segment_mode_status(2::int2, 'n'::\"char\", 'd'::\"char\");")
 if echo "$tw_out" | grep -qi "during recovery"; then
@@ -282,7 +282,7 @@ log "dr: DR coordinator left RUNNING in recovery (utility-mode reads). Connect w
 log "dr:   sudo docker-compose -f src/test/dr/docker-compose.yml exec dr \\"
 log "dr:        env PGOPTIONS='-c gp_role=utility' psql -p ${PORT_BASE} postgres"
 
-# --- M2' I-0: every DR SEGMENT is already up in recovery (create-replica started
+# --- M2' I-0: every DR SEGMENT is already up in recovery (ggdr create started
 #     the whole cluster).  Verify each accepts utility reads so the coordinator can
 #     dispatch a read-only distributed query to them. ---
 sok=1

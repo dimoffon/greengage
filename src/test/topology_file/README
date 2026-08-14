@@ -2,7 +2,7 @@ src/test/topology_file
 ======================
 
 End-to-end coverage for the file-backed cluster topology store
-($PGDATA/gp_topology, gp_topology_source = file).
+($PGDATA/gg_topology, gg_topology_source = file).
 
     ./run.sh /path/to/greengage/bin
 

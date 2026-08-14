@@ -87,7 +87,7 @@ log "primary: created table dr_wal_applied (post-base-backup; DR must replay it 
 # --- generate WAL that changes the topology CATALOG.  The DR replays that record
 #     like any other (nothing filters it as of P7) and so its catalog carries
 #     production's value -- while the topology it actually serves, which lives in
-#     its own $PGDATA/gp_topology, does not.  T1 and T3 assert both halves. ---
+#     its own $PGDATA/gg_topology, does not.  T1 and T3 assert both halves. ---
 #
 # We change seg0's *hostname*, NOT its port/address.  The coordinator connects to
 # a segment by `address` (resolved to hostaddr) + `port` (cdbconn.c); `hostname`

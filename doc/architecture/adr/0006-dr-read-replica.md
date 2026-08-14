@@ -319,7 +319,7 @@ The policy is deliberately **the right answer or none**: no retention holder, no
 throttling, and a cancelled QE fails the whole distributed query.
 
 That also makes conflicts routine rather than exceptional, so the stock 30 s delay would be
-added to every advance that hits one. `ggdr create-replica` writes
+added to every advance that hits one. `ggdr create` writes
 `max_standby_archive_delay = 0` (and the streaming twin). `-1` is not the opposite extreme
 but a trap: it blocks the startup process inside redo, so replay stops altogether.
 
@@ -345,8 +345,8 @@ are additive and orthogonal to the cross-cluster mechanics this had to prove.
   operators already have for every long query. `gg_dr_promote()` takes no arguments either:
   a replica is promoted from where it *is*, and it validates and reports that point rather
   than asking to be told.
-- **Utility** — `ggdr` (`create-replica` / `switch` / `pause` / `stat` / `promote`) treats
-  the whole cluster as one object; `create-replica` restores per-instance base backups,
+- **Utility** — `ggdr` (`create` / `switch` / `pause` / `stat` / `promote`) treats
+  the whole cluster as one object; `create` restores per-instance base backups,
   frozen-seeds the topology, arms every node and starts it, with a fail-closed
   archive-completeness gate and a post-build topology check.
 - **Observability** — `gg_stat_dr_replica` / `gg_stat_dr_replica_summary`, and
@@ -404,7 +404,7 @@ Two implementation notes worth preserving, both found the hard way:
 - **Advances can cancel long queries** (D11), and a cancelled QE fails the whole distributed
   query. Mitigation is cadence tuning, not elimination.
 - **The archive becomes production-critical infrastructure.** Availability, retention and
-  completeness now matter operationally; `create-replica` fails closed on archive gaps
+  completeness now matter operationally; `create` fails closed on archive gaps
   rather than risking a timeline fork.
 - **Topology catalogs are contractually immutable on production** while a replica is
   attached: `VACUUM FULL` / `CLUSTER` / `REINDEX` / `TRUNCATE` of one halts the replica with
@@ -444,7 +444,7 @@ Two implementation notes worth preserving, both found the hard way:
 ## Validation
 
 `src/test/dr/` — two containers, production and DR, one coordinator plus two segments each,
-sharing an `/archive` volume, with the replica built by `ggdr create-replica`:
+sharing an `/archive` volume, with the replica built by `ggdr create`:
 
 - **M1 + M2 (7/7)** — topology filtered *selectively*: production's catalog change is
   invisible while its post-backup user table is visible; DR-local hostnames survive replay;

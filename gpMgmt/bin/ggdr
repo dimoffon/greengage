@@ -75,14 +75,14 @@ Subcommands
         that is about to write its own.  It is replaced with a single 'DR promoted
         at <rp>' row; --keep-history leaves production's rows for forensics.
 
-  create-replica --topology <tsv> --basebackup-dir <dir> --wal-archive <dir>
-                 [--restore-command <cmd>] [--pause-at <rp>] [--no-start] [--force]
+  create -t <tsv> -b <dir> -w <dir> [-r <cmd>] [-p <rp>] [--no-start] [-f]
+        (--topology / --backup / --wal / --restore-command / --pause-at / --force)
         Build a DR replica: restore each instance's base backup (taken on
         production with pg_basebackup --target-gp-dbid) into its DR data dir, gate
         on the WAL archive being complete enough to reach consistency, write the
         DR-local cluster topology into every node's own topology store
-        ($PGDATA/gp_topology, via gg_topology), arm the replica
-        (gp_topology_source=file + hot_standby + restore_command + standby.signal)
+        ($PGDATA/gg_topology, via gg_topology), arm the replica
+        (gg_topology_source=file + hot_standby + restore_command + standby.signal)
         on every node, start each in archive recovery, and verify the replica
         describes itself.  Runs before any node is up, so the node list comes from
         the topology tsv.
@@ -792,12 +792,12 @@ def _parse_topology(path):
                 continue
             cols = line.split("\t")
             if len(cols) < 10:
-                sys.exit("ggdr create-replica: %s:%d has %d columns, need >=10" % (path, ln, len(cols)))
+                sys.exit("ggdr create: %s:%d has %d columns, need >=10" % (path, ln, len(cols)))
             r = dict(zip(TOPO_FIELDS, cols[:10]))
             r["dbid"], r["content"], r["port"] = int(r["dbid"]), int(r["content"]), int(r["port"])
             rows.append(r)
     if not any(r["content"] == -1 for r in rows):
-        sys.exit("ggdr create-replica: topology has no coordinator (content=-1) row")
+        sys.exit("ggdr create: topology has no coordinator (content=-1) row")
     return sorted(rows, key=lambda r: r["content"])
 
 
@@ -811,7 +811,7 @@ def _topology_store_lines(rows):
         vals = [str(r[f]) for f in TOPO_FIELDS]
         for f, v in zip(TOPO_FIELDS, vals):
             if not v or v.split() != [v]:
-                sys.exit("ggdr create-replica: dbid %s has an empty or "
+                sys.exit("ggdr create: dbid %s has an empty or "
                          "whitespace-containing %s (%r); the topology store is a "
                          "space-separated text file and cannot represent it."
                          % (r["dbid"], f, v))
@@ -822,14 +822,14 @@ def _topology_store_lines(rows):
 def _check_topology(rows):
     """Post-build check: does the live replica describe *this* cluster?
 
-    gp_segment_configuration is a view over whichever store gp_topology_source
+    gp_segment_configuration is a view over whichever store gg_topology_source
     names, so asking the running coordinator answers the question that matters --
     not "was the file written" (gg_topology already said so) but "is the running
     coordinator serving it".  A replica that answers production's topology would
     dispatch to production's segments, which is the single thing the DR contract
     must never allow, so a mismatch fails the build.
 
-    Every node is checked for the provider, because gp_topology_source is exempt
+    Every node is checked for the provider, because gg_topology_source is exempt
     from the QD/QE GUC-sync check: a segment left on 'catalog' would read the
     catalog production's WAL keeps overwriting, and nothing else would report it.
     The topology contents are compared on the coordinator only -- that is the node
@@ -877,7 +877,7 @@ def _check_topology(rows):
 
 def _topology_source(port):
     """Which provider the node is actually running, or None if it will not say."""
-    rc, out, err = _psql(port, "show gp_topology_source;")
+    rc, out, err = _psql(port, "show gg_topology_source;")
     return out if rc == 0 and out else None
 
 
@@ -924,7 +924,7 @@ def _pid_alive(pid):
 def _stop_node(datadir):
     """Stop any postmaster running in datadir so it can be safely overwritten.
 
-    Used by create-replica --force to rebuild a DR cluster that is currently up
+    Used by create --force to rebuild a DR cluster that is currently up
     -- typically one that has just been 'promote'd to online read-write, whose
     live postmaster (and its postmaster.pid) would otherwise block the rebuild.
     Returns True once no live postmaster holds the datadir; False if one remains.
@@ -946,8 +946,8 @@ def _stop_node(datadir):
     return True
 
 
-def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=None,
-                       pause_at=None, no_start=False, force=False):
+def cmd_create(topology, basebackup_dir, wal_archive, restore_command=None,
+               pause_at=None, no_start=False, force=False):
     rows = _parse_topology(topology)
     if restore_command is None:
         restore_command = "cp %s/seg%%c/%%f %%p" % wal_archive
@@ -960,9 +960,9 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         os.path.join(here, "gg_topology"),
     ) if c and os.path.exists(c)), None)
     if not topo_prog:
-        sys.exit("ggdr create-replica: cannot find gg_topology "
+        sys.exit("ggdr create: cannot find gg_topology "
                  "(looked on PATH, in $GPHOME/bin, and next to ggdr)")
-    print("ggdr create-replica: building a DR replica for %d instance(s) from %s"
+    print("ggdr create: building a DR replica for %d instance(s) from %s"
           % (len(rows), basebackup_dir))
 
     # --- 1. safety / idempotence ---
@@ -975,13 +975,13 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         has_pid = os.path.exists(os.path.join(dd, "postmaster.pid"))
         if not force:
             if has_pid:
-                sys.exit("ggdr create-replica: %s has a postmaster.pid (running?); "
+                sys.exit("ggdr create: %s has a postmaster.pid (running?); "
                          "stop the cluster or pass --force to stop+overwrite it." % dd)
             if os.path.exists(dd) and os.listdir(dd):
-                sys.exit("ggdr create-replica: %s is non-empty; use --force to overwrite." % dd)
+                sys.exit("ggdr create: %s is non-empty; use --force to overwrite." % dd)
             continue
         if has_pid and not _stop_node(dd):
-            sys.exit("ggdr create-replica: a live postmaster still holds %s after "
+            sys.exit("ggdr create: a live postmaster still holds %s after "
                      "'pg_ctl stop'; refusing to overwrite it." % dd)
 
     # --- 2. restore each instance's base backup ---
@@ -989,14 +989,14 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         dd, c = r["datadir"], r["content"]
         src = os.path.join(basebackup_dir, "seg%d" % c)
         if not os.path.isdir(src):
-            sys.exit("ggdr create-replica: base backup %s not found" % src)
+            sys.exit("ggdr create: base backup %s not found" % src)
         _run(["rm", "-rf", dd]); os.makedirs(os.path.dirname(dd), exist_ok=True)
         rc, out, err = _run(["cp", "-a", src, dd])
         if rc != 0:
-            sys.exit("ggdr create-replica: restore of content %d failed: %s" % (c, err))
+            sys.exit("ggdr create: restore of content %d failed: %s" % (c, err))
         os.chmod(dd, 0o700)
         if not os.path.exists(os.path.join(dd, "backup_label")):
-            sys.exit("ggdr create-replica: content %d base backup has no backup_label "
+            sys.exit("ggdr create: content %d base backup has no backup_label "
                      "(was it taken with pg_basebackup --target-gp-dbid?)" % c)
         print("  restored content %d -> %s" % (c, dd))
 
@@ -1014,20 +1014,20 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         adir = _archive_dir(wal_archive, c)
         start_file = _backup_label_start_file(dd)
         if not os.path.isdir(adir) or not os.listdir(adir):
-            sys.exit("ggdr create-replica: WAL archive %s is missing/empty; refusing (fail-closed)." % adir)
+            sys.exit("ggdr create: WAL archive %s is missing/empty; refusing (fail-closed)." % adir)
         if start_file and not os.path.exists(os.path.join(adir, start_file)):
-            sys.exit("ggdr create-replica: archive %s lacks the backup START WAL segment %s; "
+            sys.exit("ggdr create: archive %s lacks the backup START WAL segment %s; "
                      "refusing (fail-closed)." % (adir, start_file))
         print("  archive gate OK for content %d (start=%s)" % (c, start_file or "?"))
 
     # --- 4. write the DR-local cluster topology into EVERY node's own store ---
     #
-    #     The base backup carried production's $PGDATA/gp_topology into every data
+    #     The base backup carried production's $PGDATA/gg_topology into every data
     #     directory (basebackup.c excludes only the in-progress temp file, on the
     #     stated grounds that a node needing a different topology has it
     #     overwritten after the copy).  This is that overwrite, and it has to
     #     happen before any node starts: a coordinator armed with
-    #     gp_topology_source=file refuses to start in dispatch mode on a store that
+    #     gg_topology_source=file refuses to start in dispatch mode on a store that
     #     has never been written, which is the right way round -- a replica that
     #     cannot describe itself must not come up describing production.
     #
@@ -1035,7 +1035,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
     #     coordinator's copy is read while the replica serves reads, but a segment
     #     left holding production's entries would start describing the wrong
     #     cluster the moment this replica is promoted and its FTS begins writing
-    #     the store.  gp_topology_source is also exempt from the QD/QE GUC-sync
+    #     the store.  gg_topology_source is also exempt from the QD/QE GUC-sync
     #     check, so a half-armed cluster would come up silently; writing and arming
     #     in one loop is what keeps the two from drifting.
     store = _topology_store_lines(rows)
@@ -1043,7 +1043,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         dd, c = r["datadir"], r["content"]
         rc, out, err = _run([topo_prog, "write", "-D", dd, "-"], stdin=store)
         if rc != 0:
-            sys.exit("ggdr create-replica: could not write the topology store for "
+            sys.exit("ggdr create: could not write the topology store for "
                      "content %d (%s): %s" % (c, dd, (err or out).strip()))
         print("  topology store written for content %d: %s" % (c, (out or "").strip()))
 
@@ -1052,11 +1052,11 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
         dd = r["datadir"]
         open(os.path.join(dd, "postgresql.auto.conf"), "w").close()   # drop production sync-rep settings
         with open(os.path.join(dd, "postgresql.conf"), "a") as f:
-            f.write("\n# --- GREENGAGE DR REPLICA (ggdr create-replica) ---\n")
+            f.write("\n# --- GREENGAGE DR REPLICA (ggdr create) ---\n")
             # The topology this node just had written, rather than the catalog
             # production's WAL keeps overwriting.  PGC_POSTMASTER, so it belongs in
             # postgresql.conf and survives gpstart/gpstop, unlike a pg_ctl -o flag.
-            f.write("gp_topology_source = file\n")
+            f.write("gg_topology_source = file\n")
             f.write("hot_standby = on\n")
             f.write("restore_command = '%s'\n" % restore_command)
             f.write("recovery_target_timeline = 'current'\n")
@@ -1072,7 +1072,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
             if pause_at:
                 f.write("gp_pause_on_restore_point_replay = '%s'\n" % pause_at)
         open(os.path.join(dd, "standby.signal"), "w").close()
-    print("  armed DR mode (gp_topology_source=file + hot_standby + restore_command"
+    print("  armed DR mode (gg_topology_source=file + hot_standby + restore_command"
           " + standby.signal)")
     if not pause_at:
         # A replica serves from the image it freezes at a restore point. With no
@@ -1089,7 +1089,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
           % next(r["datadir"] for r in rows if r["content"] == -1))
 
     if no_start:
-        print("ggdr create-replica: DONE (armed, not started; --no-start).")
+        print("ggdr create: DONE (armed, not started; --no-start).")
         return 0
 
     # --- 6. start each node in recovery + poll for liveness ---
@@ -1109,7 +1109,7 @@ def cmd_create_replica(topology, basebackup_dir, wal_archive, restore_command=No
             time.sleep(3)
     # --- 7. post-build check: the running replica describes THIS cluster ---
     topo_rc = _check_topology(rows) if ok == len(rows) else 0
-    print("ggdr create-replica: DONE -- %d/%d node(s) live in recovery." % (ok, len(rows)))
+    print("ggdr create: DONE -- %d/%d node(s) live in recovery." % (ok, len(rows)))
     return 0 if (ok == len(rows) and topo_rc == 0) else 1
 
 
@@ -1134,18 +1134,19 @@ def main():
     p_prom.add_argument("--keep-history", action="store_true",
                         help="leave gp_configuration_history as production wrote it "
                              "(default: replace it with one 'DR promoted at ...' row)")
-    p_cr = sub.add_parser("create-replica", help="build a DR replica from per-instance base backups")
-    p_cr.add_argument("--topology", required=True, metavar="TSV",
+    p_cr = sub.add_parser("create", help="build a DR replica from per-instance base backups")
+    p_cr.add_argument("-t", "--topology", required=True, metavar="TSV",
                       help="dr_topology.tsv (dbid content role prefrole mode status port host addr datadir)")
-    p_cr.add_argument("--basebackup-dir", required=True, metavar="DIR",
+    p_cr.add_argument("-b", "--backup", required=True, metavar="DIR",
                       help="directory containing seg<content>/ base backups (pg_basebackup --target-gp-dbid)")
-    p_cr.add_argument("--wal-archive", required=True, metavar="DIR",
+    p_cr.add_argument("-w", "--wal", required=True, metavar="DIR",
                       help="per-content WAL archive root (seg<content>/ segments)")
-    p_cr.add_argument("--restore-command", metavar="CMD",
-                      help="restore_command (default: cp <wal-archive>/seg%%c/%%f %%p)")
-    p_cr.add_argument("--pause-at", metavar="RP", help="arm gp_pause_on_restore_point_replay at this restore point")
+    p_cr.add_argument("-r", "--restore-command", metavar="CMD",
+                      help="restore_command (default: cp <wal>/seg%%c/%%f %%p)")
+    p_cr.add_argument("-p", "--pause-at", metavar="RP",
+                      help="arm gp_pause_on_restore_point_replay at this restore point")
     p_cr.add_argument("--no-start", action="store_true", help="arm the replica but do not start it")
-    p_cr.add_argument("--force", action="store_true", help="overwrite non-empty data directories")
+    p_cr.add_argument("-f", "--force", action="store_true", help="overwrite non-empty data directories")
     args = ap.parse_args()
     if args.cmd == "switch":
         return cmd_switch(args.restore_point, contents=args.content)
@@ -1156,11 +1157,11 @@ def main():
     if args.cmd == "promote":
         return cmd_promote(at=args.at, assume_yes=args.yes, timeout=args.timeout,
                            keep_history=args.keep_history)
-    if args.cmd == "create-replica":
-        return cmd_create_replica(topology=args.topology, basebackup_dir=args.basebackup_dir,
-                                  wal_archive=args.wal_archive, restore_command=args.restore_command,
-                                  pause_at=args.pause_at,
-                                  no_start=args.no_start, force=args.force)
+    if args.cmd == "create":
+        return cmd_create(topology=args.topology, basebackup_dir=args.backup,
+                          wal_archive=args.wal, restore_command=args.restore_command,
+                          pause_at=args.pause_at,
+                          no_start=args.no_start, force=args.force)
     return 2
 
 

@@ -4,7 +4,7 @@ A minimal, dependency-light test for the disaster-recovery (DR) read-replica
 feature — **T1–T6** (the replica's topology is its own, and its replay of
 production's WAL is unrestricted), **M2** (read-only enforcement on a live,
 in-recovery DR coordinator), and **M4** (building the replica with
-`ggdr create-replica`). Two single-host
+`ggdr create`). Two single-host
 Greengage demo clusters run in separate containers that share a `/archive`
 volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
 `archive_command`, the DR cluster reads it back with `restore_command`.
@@ -14,7 +14,7 @@ volume — **no pgBackRest or WAL-G**: the primary writes WAL to the volume with
  ┌─ primary ───────────────┐                         ┌─ dr ──────────────────────────┐
  │ demo cluster            │   archive_command  cp    │ restored from primary's base  │
  │ (coordinator + 1 seg)   │ ───────────────────────▶ │ backup; hot_standby=on;       │
- │ archive_mode=on         │   /archive/wal/seg%c/    │ own gp_topology store;        │
+ │ archive_mode=on         │   /archive/wal/seg%c/    │ own gg_topology store;        │
  │ base-backups itself ───▶│   /archive/basebackup/   │ restore_command  cp  ◀────────│
  │ then changes topology   │                          │ continuous recovery           │
  └─────────────────────────┘                          └───────────────────────────────┘
@@ -47,9 +47,9 @@ a while; subsequent runs reuse the image.
    It also creates a user table (`dr_wal_applied`) *after* the base backup, so
    that table exists only in the WAL (not the backup).
 2. The **dr** container restores each instance's base backup; **writes the
-   DR-local topology** into every node's own `$PGDATA/gp_topology` (via
+   DR-local topology** into every node's own `$PGDATA/gg_topology` (via
    `gg_topology`, overwriting the copy of production's store that came in the base
-   backup); arms `gp_topology_source = file` + `hot_standby` + `standby.signal` +
+   backup); arms `gg_topology_source = file` + `hot_standby` + `standby.signal` +
    `restore_command`; and starts the coordinator as a **live, continuous
    hot-standby**. `hot_standby = on` *is* what puts a node in DR mode — there is
    no separate GUC or marker file. It then waits to replay past the recorded
@@ -58,7 +58,7 @@ a while; subsequent runs reuse the image.
    - **M1** — `gp_segment_configuration` does **not** show production's change.
    - **M4 topology store** — seg0 has the DR-local hostname `dr` (genuine
      topology independence, not merely "ignored production's change"), and
-     `gp_topology_source` really is `file`.
+     `gg_topology_source` really is `file`.
    - **P6 independence** — `gp_segment_configuration_internal` still holds
      *production's* rows, because nothing seeds it any more, while the replica
      serves `dr`. This is the assertion that shows the replica does not read the
@@ -158,7 +158,7 @@ of reporting a pass, so an inconclusive run can never look green.
 - Reference recipe for the archive / basebackup / restore mechanics:
   `src/test/gpdb_pitr/test_gpdb_pitr.sh`.
 - **The frozen seed is gone** (P6). The replica's topology lives in
-  `$PGDATA/gp_topology`, which production's WAL cannot reach, so there is nothing
+  `$PGDATA/gg_topology`, which production's WAL cannot reach, so there is nothing
   to freeze and nothing to protect. With it went `ggseed_dr_topology`, the
   `DR_SEED` knob, the `backup_label`/`pg_control` save-restore, the backup-tail
   WAL re-fetch, the permanent-timeline-fork hazard those existed to contain, and

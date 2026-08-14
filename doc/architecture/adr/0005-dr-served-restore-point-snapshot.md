@@ -163,7 +163,7 @@ has removed. That is the agreed policy — the right answer or none — with no 
 no replay throttling.
 
 It also makes conflicts common rather than exceptional, so the 30 s default would add 30 s
-to every advance that hits one. `ggdr create-replica` writes `max_standby_archive_delay = 0`
+to every advance that hits one. `ggdr create` writes `max_standby_archive_delay = 0`
 (and the streaming twin). `-1` is not the opposite extreme but a trap: it blocks the startup
 process inside redo, so replay stops altogether.
 
@@ -205,7 +205,7 @@ policy: correctness only, advance latency unchanged.
   from the ADR-0004 build.
 - Index-only and bitmap-heap scans lose their all-visible fast path on a replica (D4).
 - A replica catching up to its first restore point refuses queries instead of answering
-  from free-running replay state (D3). `ggdr create-replica` already waits for each node to
+  from free-running replay state (D3). `ggdr create` already waits for each node to
   come up before its post-build checks, so this shows up as a longer wait, not a failure —
   but a replica built with no `--pause-at` never reaches a servable state.
 - One restart window stays open by design (D3, last paragraph).

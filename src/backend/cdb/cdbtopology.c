@@ -29,7 +29,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
-int			gp_topology_source = GP_TOPOLOGY_SOURCE_CATALOG;
+int			gg_topology_source = GG_TOPOLOGY_SOURCE_CATALOG;
 
 /*
  * The generation watermark.  See cdbtopology.h for what it is and, more
@@ -106,12 +106,12 @@ extern const GpTopologyRoutine gp_topology_catalog_routine;
 extern const GpTopologyRoutine gp_topology_file_routine;
 
 /*
- * Indexed by GpTopologySourceKind, in the smgrsw[] style: a fixed set of
+ * Indexed by GgTopologySourceKind, in the smgrsw[] style: a fixed set of
  * backends selected by an enum, no dynamic registration, no catalog involved.
  */
 static const GpTopologyRoutine *const gp_topology_routines[] = {
-	&gp_topology_catalog_routine,	/* GP_TOPOLOGY_SOURCE_CATALOG */
-	&gp_topology_file_routine		/* GP_TOPOLOGY_SOURCE_FILE */
+	&gp_topology_catalog_routine,	/* GG_TOPOLOGY_SOURCE_CATALOG */
+	&gp_topology_file_routine		/* GG_TOPOLOGY_SOURCE_FILE */
 };
 
 #define NGpTopologyRoutines lengthof(gp_topology_routines)
@@ -121,10 +121,10 @@ static bool gp_topology_started = false;
 const GpTopologyRoutine *
 GpTopoActiveProvider(void)
 {
-	if (gp_topology_source < 0 || gp_topology_source >= NGpTopologyRoutines)
-		elog(PANIC, "invalid gp_topology_source value %d", gp_topology_source);
+	if (gg_topology_source < 0 || gg_topology_source >= NGpTopologyRoutines)
+		elog(PANIC, "invalid gg_topology_source value %d", gg_topology_source);
 
-	return gp_topology_routines[gp_topology_source];
+	return gp_topology_routines[gg_topology_source];
 }
 
 /*
@@ -363,7 +363,7 @@ GpTopoBeginWrite(MemoryContext cxt, GpTopoWriteLevel level)
 	 * needs an XID, and GetNewTransactionId() refuses one during recovery.  A
 	 * file needs no XID, so under the file provider that refusal simply was not
 	 * there any more, and a superuser on a read-only DR replica could durably
-	 * rewrite $PGDATA/gp_topology -- an entry removed, or a segment marked down,
+	 * rewrite $PGDATA/gg_topology -- an entry removed, or a segment marked down,
 	 * with no gp_configuration_history row to explain it, surviving the
 	 * promotion the replica exists for.  ExecCheckXactReadOnly() does not catch
 	 * it either: SELECT gp_update_segment_mode_status(...) is a plain CMD_SELECT.

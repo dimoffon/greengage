@@ -45,7 +45,7 @@ catalog.
 ### D1 — A provider dispatch table, selected by a postmaster GUC
 
 `GpTopologyRoutine` (`src/include/cdb/cdbtopology.h`) is a table of function pointers,
-modelled on `smgrsw[]`. `gp_topology_source` (`PGC_POSTMASTER`, values `catalog` and
+modelled on `smgrsw[]`. `gg_topology_source` (`PGC_POSTMASTER`, values `catalog` and
 `file`) picks one for the life of the postmaster.
 
 `PGC_POSTMASTER` rather than something reloadable: the provider is consulted before
@@ -105,9 +105,9 @@ The callbacks are keyed on transaction nest level, following the `postgres_fdw` 
 
 ### D6 — The `file` provider, and what its `generation` field is for
 
-`$PGDATA/gp_topology` is a text file — one entry per line, CRC-32C over everything but
+`$PGDATA/gg_topology` is a text file — one entry per line, CRC-32C over everything but
 the last line, read and written from both backend and frontend through
-`src/common/gp_topology_file.c` (the `#ifdef FRONTEND` split follows
+`src/common/gg_topology_file.c` (the `#ifdef FRONTEND` split follows
 `controldata_utils.c`).
 
 `generation` is deliberately two things at once:
@@ -428,14 +428,14 @@ contract is a property of the relation, not of who wrote it last.
 
 **What the new design does not protect.** After promotion the replica's
 `gp_segment_configuration_internal` holds production's replayed rows, so anyone flipping a
-promoted DR back to `gp_topology_source = catalog` gets a cluster describing production.
-`create-replica` arms `file` in `postgresql.conf` so it survives promotion, which is the
+promoted DR back to `gg_topology_source = catalog` gets a cluster describing production.
+`create` arms `file` in `postgresql.conf` so it survives promotion, which is the
 mitigation; the failure needs a deliberate configuration change to reach.
 
 ### D9 — the DR replica keeps its topology in a file, and the seed is gone (P6)
 
-`ggdr create-replica` now writes the DR-local topology into **every** node's
-`$PGDATA/gp_topology` and arms `gp_topology_source = file`, instead of running
+`ggdr create` now writes the DR-local topology into **every** node's
+`$PGDATA/gg_topology` and arms `gg_topology_source = file`, instead of running
 `ggseed_dr_topology` — a single-user `postgres --single` that DELETEd, re-INSERTed and
 `VACUUM FREEZE`d the shared catalog on the coordinator.
 
@@ -449,14 +449,14 @@ the seed's forked WAL and the fork was unrecoverable.
 
 Three details are worth keeping:
 
-- **The base backup carries production's `gp_topology`.** P4 deliberately did not exclude
+- **The base backup carries production's `gg_topology`.** P4 deliberately did not exclude
   it from `basebackup.c`, on the grounds that a node needing a different topology has it
-  overwritten after the copy. A DR node is that node, and `create-replica` is that
+  overwritten after the copy. A DR node is that node, and `create` is that
   overwrite. It happens before the first start, which matters: production never writes the
   file, so it arrives at initdb's generation 0, and a coordinator armed with `file` refuses
   to start in dispatch mode on a generation-0 store. Fail-closed in the right direction.
 - **Every node gets the file, not just the coordinator.** Only the coordinator's copy is
-  read while the replica serves. But `gp_topology_source` is exempt from the QD/QE GUC-sync
+  read while the replica serves. But `gg_topology_source` is exempt from the QD/QE GUC-sync
   check (`unsync_guc_name.h`), so a half-armed cluster comes up silently, and a segment
   left holding production's entries would start describing the wrong cluster the moment the
   replica is promoted and FTS begins writing. Writing and arming happen in one loop.
@@ -466,7 +466,7 @@ Three details are worth keeping:
   first version of this record stopped there and was wrong. `file_persist()` is also
   reachable from segadmin's SQL functions, and those are plain `CMD_SELECT`s that
   `ExecCheckXactReadOnly()` lets through — so `SELECT gp_update_segment_mode_status(...)`
-  on a read-only replica durably rewrote `$PGDATA/gp_topology`.
+  on a read-only replica durably rewrote `$PGDATA/gg_topology`.
 
   The catalog provider had refused it, but only as a side effect: writing a catalog needs
   an XID and `GetNewTransactionId()` refuses one during recovery. A file needs no XID, so

@@ -1,9 +1,9 @@
 #!/bin/bash
 # run-dr-test.sh -- the M1 assertion: production changed its topology (seg0 port
 # +1000) AFTER the base backup; the DR replica must NOT pick that up, because the
-# replica's topology lives in its own $PGDATA/gp_topology and production's WAL
+# replica's topology lives in its own $PGDATA/gg_topology and production's WAL
 # carries only the catalog.  The DR coordinator's hostname should likewise be the
-# DR-local 'dr' that create-replica wrote.
+# DR-local 'dr' that create wrote.
 set -uo pipefail
 source /dr/scripts/lib.sh
 source "$GPHOME/greengage_path.sh" 2>/dev/null || true

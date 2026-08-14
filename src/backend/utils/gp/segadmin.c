@@ -550,7 +550,7 @@ gp_add_coordinator_standby(PG_FUNCTION_ARGS)
 						GpTopoActiveProvider()->name),
 				 errdetail("That store is not WAL-logged, so the standby's copy "
 						   "of the topology could not be kept in step."),
-				 errhint("Use gp_topology_source = catalog, or an external "
+				 errhint("Use gg_topology_source = catalog, or an external "
 						 "topology store.")));
 
 	/*

@@ -22,7 +22,7 @@
  * Defines for the topology catalog.
  *
  * The relation is gp_segment_configuration_internal; gp_segment_configuration
- * is the view over whatever provider gp_topology_source names, and is what
+ * is the view over whatever provider gg_topology_source names, and is what
  * everything outside src/backend/cdb/cdbtopology_catalog.c should read.
  *
  * GpSegmentConfigRelationName deliberately keeps the *view's* name: its only

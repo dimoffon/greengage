@@ -445,9 +445,9 @@ double		optimizer_jit_optimize_above_cost;
 /* Switch to toggle block-directory based sampling for AO/CO tables */
 bool		gp_enable_blkdir_sampling;
 
-static const struct config_enum_entry gp_topology_source_options[] = {
-	{"catalog", GP_TOPOLOGY_SOURCE_CATALOG},
-	{"file", GP_TOPOLOGY_SOURCE_FILE},
+static const struct config_enum_entry gg_topology_source_options[] = {
+	{"catalog", GG_TOPOLOGY_SOURCE_CATALOG},
+	{"file", GG_TOPOLOGY_SOURCE_FILE},
 	{NULL, 0}
 };
 
@@ -4778,10 +4778,10 @@ struct config_enum ConfigureNamesEnum_gp[] =
 	},
 
 	{
-		{"gp_topology_source", PGC_POSTMASTER, PRESET_OPTIONS,
+		{"gg_topology_source", PGC_POSTMASTER, PRESET_OPTIONS,
 			gettext_noop("Where this node reads the cluster topology from."),
 			gettext_noop("\"catalog\" is the shared gp_segment_configuration, the "
-						 "default. \"file\" is $PGDATA/gp_topology, which is not "
+						 "default. \"file\" is $PGDATA/gg_topology, which is not "
 						 "replicated -- so a replica describes itself rather than "
 						 "the cluster whose WAL it replays -- but is not visible to "
 						 "the gpMgmt utilities, which read gp_segment_configuration "
@@ -4789,8 +4789,8 @@ struct config_enum ConfigureNamesEnum_gp[] =
 						 "postmaster start because backends cache the topology per "
 						 "transaction.")
 		},
-		&gp_topology_source,
-		GP_TOPOLOGY_SOURCE_CATALOG, gp_topology_source_options,
+		&gg_topology_source,
+		GG_TOPOLOGY_SOURCE_CATALOG, gg_topology_source_options,
 		NULL, NULL, NULL
 	},
 

@@ -3,8 +3,8 @@
  * cdbtopology_file.c
  *	  The file-backed cluster-topology provider.
  *
- * Topology lives in $PGDATA/gp_topology, described in
- * common/gp_topology_file.h.  What this buys, and the only reason it exists:
+ * Topology lives in $PGDATA/gg_topology, described in
+ * common/gg_topology_file.h.  What this buys, and the only reason it exists:
  * the file is not replicated, so a node that replays another cluster's WAL
  * still describes itself.  Everything the disaster-recovery replica built to
  * survive topology arriving in a replicated catalog -- an apply-time redo
@@ -76,18 +76,18 @@
  * in the postmaster and a failed query in a backend.
  */
 static void
-file_report(int elevel, GpTopologyFileError err, int errline, const char *path)
+file_report(int elevel, GgTopologyFileError err, int errline, const char *path)
 {
 	StringInfoData detail;
 
 	initStringInfo(&detail);
-	appendStringInfoString(&detail, gp_topology_file_error_str(err));
+	appendStringInfoString(&detail, gg_topology_file_error_str(err));
 	if (errline > 0)
 		appendStringInfo(&detail, " at line %d", errline);
 
 	switch (err)
 	{
-		case GP_TOPOFILE_ENOENT:
+		case GG_TOPOFILE_ENOENT:
 			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("cluster topology file \"%s\" does not exist", path),
@@ -98,7 +98,7 @@ file_report(int elevel, GpTopologyFileError err, int errline, const char *path)
 							 "with \"gg_topology write\".", DataDir)));
 			break;
 
-		case GP_TOPOFILE_IO:
+		case GG_TOPOFILE_IO:
 			ereport(elevel,
 					(errcode_for_file_access(),
 					 errmsg("could not read cluster topology file \"%s\": %m",
@@ -119,7 +119,7 @@ file_report(int elevel, GpTopologyFileError err, int errline, const char *path)
 static void
 file_topology_path(char *path, size_t pathlen)
 {
-	snprintf(path, pathlen, "%s/%s", DataDir, GP_TOPOLOGY_FILENAME);
+	snprintf(path, pathlen, "%s/%s", DataDir, GG_TOPOLOGY_FILENAME);
 }
 
 /*
@@ -129,16 +129,16 @@ file_topology_path(char *path, size_t pathlen)
  * currently uses; every one of them passes FATAL or ERROR.
  */
 static bool
-file_read(GpTopologyFile *topo, int elevel)
+file_read(GgTopologyFile *topo, int elevel)
 {
 	char		path[MAXPGPATH];
-	GpTopologyFileError err;
+	GgTopologyFileError err;
 	int			errline = 0;
 
 	file_topology_path(path, sizeof(path));
 
-	err = gp_topology_read_file(DataDir, topo, &errline);
-	if (err != GP_TOPOFILE_OK)
+	err = gg_topology_read_file(DataDir, topo, &errline);
+	if (err != GG_TOPOFILE_OK)
 	{
 		file_report(elevel, err, errline, path);
 		return false;
@@ -158,7 +158,7 @@ file_read(GpTopologyFile *topo, int elevel)
  * teeth are in the writer, which refuses to overwrite a foreign file.
  */
 static void
-file_check_system_identifier(const GpTopologyFile *topo)
+file_check_system_identifier(const GgTopologyFile *topo)
 {
 	uint64		mine = GetSystemIdentifier();
 
@@ -176,7 +176,7 @@ file_check_system_identifier(const GpTopologyFile *topo)
 static void
 file_startup(void)
 {
-	GpTopologyFile topo;
+	GgTopologyFile topo;
 	char		path[MAXPGPATH];
 	int			i;
 
@@ -208,11 +208,11 @@ file_startup(void)
 			ereport(FATAL,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cluster topology holds a standby coordinator, which "
-							"gp_topology_source = file cannot support"),
+							"gg_topology_source = file cannot support"),
 					 errdetail("dbid %d is a standby coordinator, and the file "
 							   "store is not WAL-logged, so its copy of the "
 							   "topology would go stale.", e->dbid),
-					 errhint("Use gp_topology_source = catalog, or an external "
+					 errhint("Use gg_topology_source = catalog, or an external "
 							 "topology store.")));
 	}
 
@@ -246,14 +246,14 @@ file_startup(void)
 
 	GpTopoGenerationObserve(topo.generation);
 
-	gp_topology_file_free(&topo);
+	gg_topology_file_free(&topo);
 }
 
 static GpSegConfigEntry *
 file_read_all(MemoryContext cxt, int *nentries, uint64 *gen)
 {
 	MemoryContext oldcxt;
-	GpTopologyFile topo;
+	GgTopologyFile topo;
 
 	oldcxt = MemoryContextSwitchTo(cxt);
 
@@ -285,7 +285,7 @@ file_read_all(MemoryContext cxt, int *nentries, uint64 *gen)
 static void
 file_begin_write(GpTopoWriteSet *ws)
 {
-	GpTopologyFile topo;
+	GgTopologyFile topo;
 
 	/*
 	 * Deliberately without GpTopologyLock.  The window from here to persist()
@@ -305,16 +305,16 @@ file_begin_write(GpTopoWriteSet *ws)
 static void
 file_persist(GpTopoWriteSet *ws)
 {
-	GpTopologyFile cur;
-	GpTopologyFile next;
+	GgTopologyFile cur;
+	GgTopologyFile next;
 	char		path[MAXPGPATH];
-	GpTopologyFileError err;
+	GgTopologyFileError err;
 	int			errentry = 0;
 
 	file_topology_path(path, sizeof(path));
 
 	memset(&next, 0, sizeof(next));
-	next.version = GP_TOPOLOGY_FORMAT_VERSION;
+	next.version = GG_TOPOLOGY_FORMAT_VERSION;
 	next.system_identifier = GetSystemIdentifier();
 	next.entries = ws->work;
 	next.nentries = ws->nwork;
@@ -339,7 +339,7 @@ file_persist(GpTopoWriteSet *ws)
 	{
 		uint64		found = cur.generation;
 
-		gp_topology_file_free(&cur);
+		gg_topology_file_free(&cur);
 		LWLockRelease(GpTopologyLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -361,7 +361,7 @@ file_persist(GpTopoWriteSet *ws)
 		uint64		found = cur.generation;
 		uint64		seen = GpTopoGenerationSeen();
 
-		gp_topology_file_free(&cur);
+		gg_topology_file_free(&cur);
 		LWLockRelease(GpTopologyLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -374,15 +374,15 @@ file_persist(GpTopoWriteSet *ws)
 						 "the current one.")));
 	}
 
-	gp_topology_file_free(&cur);
+	gg_topology_file_free(&cur);
 	next.generation = ws->gen + 1;
 
-	err = gp_topology_write_file(DataDir, &next, false, &errentry);
-	if (err != GP_TOPOFILE_OK)
+	err = gg_topology_write_file(DataDir, &next, false, &errentry);
+	if (err != GG_TOPOFILE_OK)
 	{
 		LWLockRelease(GpTopologyLock);
 
-		if (err == GP_TOPOFILE_UNSERIALIZABLE && errentry < ws->nwork)
+		if (err == GG_TOPOFILE_UNSERIALIZABLE && errentry < ws->nwork)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("cannot write cluster topology: dbid %d cannot be "
