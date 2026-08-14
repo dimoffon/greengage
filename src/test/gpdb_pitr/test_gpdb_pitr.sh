@@ -169,7 +169,7 @@ echo "" > ${!REPLICA_VAR}/postgresql.auto.conf
   # The base backup brought production's copy of the file along; this overwrites
   # it, which is exactly what it is there for.
   echo "gg_topology_source = file" >> ${!REPLICA_VAR}/postgresql.conf
-  gg_topology write -D ${!REPLICA_VAR} - < $PITR_TOPOLOGY
+  gg_topology write -D ${!REPLICA_VAR} -f $PITR_TOPOLOGY
   if [ $? != 0 ]; then
     echo "FAIL: could not write the topology store for ${!REPLICA_VAR}"
     exit 1

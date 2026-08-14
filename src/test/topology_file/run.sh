@@ -65,35 +65,35 @@ chk "  recording this cluster"         "$SYSID" "$($GGTOPO dump -D "$D" | awk '/
 
 TOPO3=$(printf '1 -1 p p s u 6000 cdw cdw /d/coord\n2 0 p p s u 6001 sdw1 sdw1 /d/seg0\n3 1 p p s u 6002 sdw2 sdw2 /d/seg1\n')
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 chk "write records three entries"      "3" "$($GGTOPO dump -D "$D" | awk '/^nentries/{print $2}')"
 chk "  and advances the generation"    "1" "$($GGTOPO dump -D "$D" | awk '/^generation/{print $2}')"
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 chk "  again on the next write"        "2" "$($GGTOPO dump -D "$D" | awk '/^generation/{print $2}')"
 
-printf '1 -1 p p s u 6000 cdw cdw /d/has a space\n' | $GGTOPO write -D "$D" - >/dev/null 2>&1
+printf '1 -1 p p s u 6000 cdw cdw /d/has a space\n' | $GGTOPO write -D "$D" >/dev/null 2>&1
 chk "a space in a datadir is refused"  "1" "$?"
 
 printf '1 -1 p p s u 6000 cdw cdw /d/c\n9 -1 m m s u 6009 sby sby /d/s\n' \
-	| $GGTOPO write -D "$D" - >/dev/null 2>&1
+	| $GGTOPO write -D "$D" >/dev/null 2>&1
 chk "a standby coordinator is refused" "1" "$?"
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 sed -i 's#/d/seg0#/d/segX#' "$D/gg_topology"
 $GGTOPO dump -D "$D" >/dev/null 2>&1
 chk "a flipped byte fails the checksum" "1" "$?"
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 head -n -1 "$D/gg_topology" > "$D/x" && mv "$D/x" "$D/gg_topology"
 $GGTOPO dump -D "$D" >/dev/null 2>&1
 chk "a missing checksum line is caught" "1" "$?"
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 $GGTOPO bootstrap -D "$D" >/dev/null 2>&1
 chk "bootstrap will not reset a live store" "1" "$?"
 
 touch "$D/postmaster.pid"
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null 2>&1
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null 2>&1
 chk "write refuses while a server owns it" "1" "$?"
 rm -f "$D/postmaster.pid"
 
@@ -125,7 +125,7 @@ start_expect() {   # start_expect <label> <START|REFUSE> <extra args...>
 	sleep 1
 }
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 start_expect "catalog mode ignores the store"   START  -c gp_role=dispatch
 start_expect "a valid store serves a dispatcher" START -c gp_role=dispatch -c gg_topology_source=file
 start_expect "and a utility-mode node"           START -c gp_role=utility  -c gg_topology_source=file
@@ -134,16 +134,16 @@ $GGTOPO bootstrap -D "$D" --force >/dev/null
 start_expect "generation 0 starts in utility mode"  START  -c gp_role=utility  -c gg_topology_source=file
 start_expect "generation 0 refuses a dispatcher"    REFUSE -c gp_role=dispatch -c gg_topology_source=file
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 sed -i 's#/d/seg0#/d/segX#' "$D/gg_topology"
 start_expect "a corrupt store refuses to start"     REFUSE -c gp_role=dispatch -c gg_topology_source=file
 
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 rm -f "$D/gg_topology"
 start_expect "a deleted store refuses to start"     REFUSE -c gp_role=dispatch -c gg_topology_source=file
 
 # a standby coordinator has to be planted past gg_topology, which refuses it
-echo "$TOPO3" | $GGTOPO write -D "$D" - >/dev/null
+echo "$TOPO3" | $GGTOPO write -D "$D" >/dev/null
 sed -i 's#^1 -1 p p #1 -1 p m #' "$D/gg_topology"
 python3 - "$D/gg_topology" <<'PY' 2>/dev/null || true
 import sys, binascii
@@ -170,7 +170,7 @@ echo "== writes =="
 W=$TMPROOT/wr
 PORT=$((PORT+1))
 $INITDB -D "$W" -N --no-locale -E UTF8 >/dev/null 2>&1
-printf '1 -1 p p s u %d cdw cdw %s\n' "$PORT" "$W" | $GGTOPO write -D "$W" - >/dev/null
+printf '1 -1 p p s u %d cdw cdw %s\n' "$PORT" "$W" | $GGTOPO write -D "$W" >/dev/null
 
 $POSTGRES -D "$W" -p $PORT -c gp_dbid=1 -c gp_contentid=-1 \
 	-c gp_role=utility -c gg_topology_source=file > "$TMPROOT/wr.log" 2>&1 &

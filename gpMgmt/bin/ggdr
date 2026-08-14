@@ -1041,7 +1041,7 @@ def cmd_create(topology, basebackup_dir, wal_archive, restore_command=None,
     store = _topology_store_lines(rows)
     for r in rows:
         dd, c = r["datadir"], r["content"]
-        rc, out, err = _run([topo_prog, "write", "-D", dd, "-"], stdin=store)
+        rc, out, err = _run([topo_prog, "write", "-D", dd], stdin=store)
         if rc != 0:
             sys.exit("ggdr create: could not write the topology store for "
                      "content %d (%s): %s" % (c, dd, (err or out).strip()))
