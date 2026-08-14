@@ -1058,8 +1058,39 @@ def cmd_create(topology, basebackup_dir, wal_archive, restore_command=None,
             # postgresql.conf and survives gpstart/gpstop, unlike a pg_ctl -o flag.
             f.write("gg_topology_source = file\n")
             f.write("hot_standby = on\n")
+            # The base backup carries production's archive_mode and its
+            # archive_command, which names production's archive.  A node in
+            # recovery archives nothing, so this changes nothing until the day
+            # the replica is promoted -- and then it starts writing its own WAL,
+            # on a timeline of its own invention, into the archive production is
+            # still filling.
+            #
+            # That is not merely untidy.  A replica follows the newest timeline
+            # in the archive (recovery_target_timeline above), so the history
+            # file a promoted replica leaves behind is the one the NEXT replica
+            # built from that archive would choose -- and it would recover onto
+            # the old replica's timeline instead of production's.  One promotion
+            # would quietly poison every rebuild after it.
+            #
+            # A promoted replica that should archive is an operator decision
+            # with an archive location of its own, made after promotion, not a
+            # setting inherited from the cluster it replaced.
+            f.write("archive_mode = off\n")
             f.write("restore_command = '%s'\n" % restore_command)
-            f.write("recovery_target_timeline = 'current'\n")
+            # 'latest', because production fails over.  When a mirror is
+            # promoted the content keeps its identity but its WAL forks: the
+            # promoted node writes a new timeline, archives its history file,
+            # and every record after that point exists only there.  A replica
+            # pinned to 'current' would sit on the dead timeline waiting for
+            # WAL nobody will ever write again -- no error, just a node that
+            # stops advancing.  The archive is per content (%c), so the new
+            # timeline lands in the same directory this node already reads.
+            #
+            # 'current' came from M4, when the topology seed wrote WAL of its
+            # own and the fear was recovery wandering onto that fork.  The seed
+            # is gone (P6) and with it the only fork this replica could meet
+            # that was not production's.
+            f.write("recovery_target_timeline = 'latest'\n")
             # Reads are served from the image frozen at the restore point, so a
             # reader's xmin sits well behind replay and conflicts are the norm,
             # not the exception. The 30s default would add 30s to every advance

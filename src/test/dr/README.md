@@ -103,32 +103,50 @@ the M1.3 protected-set resolution (the shared relmap isn't loaded during redo)
 and the M2 `IsDRReplicaMode()` flag (set only in the startup process, invisible
 to the backends where the enforcement runs).
 
-## V-20 regression fixture (dense topology catalog)
+## Opt-in fixtures
 
-`docker-compose.dense.yml` is a second, opt-in fixture for scenario **V-20**: production's
-`VACUUM` truncating trailing pages of a protected topology catalog must not truncate the
-DR's copy of it. The default fixture cannot show this — with 3 segment rows in a 32 KB page
-the DR's seed has ample room on block 0, so production's truncation has nothing of the DR's
-to discard. The dense fixture fills the catalog with filler rows that are inserted **and
-deleted in one transaction** (dead on arrival, never visible to FTS, but still occupying
-their pages), base-backs up in that state, and vacuums only after the DR is built.
-
-It runs against a prebuilt image so the same fixture can be pointed at a guarded and an
-unguarded build:
+Two further fixtures cover things the default one deliberately does not do to its
+production cluster. Both run against the image the default fixture builds, and both take
+their own compose project so they leave a running default stand alone:
 
 ```bash
 docker-compose -f src/test/dr/docker-compose.yml build        # base image, once
-
-DR_IMAGE=greengage-dr-test:latest \
-  docker-compose -p dense -f src/test/dr/docker-compose.dense.yml up -d
-docker-compose -p dense -f src/test/dr/docker-compose.dense.yml logs -f dr
-docker-compose -p dense -f src/test/dr/docker-compose.dense.yml down -v
 ```
 
-The DR container prints a `V-20 VERDICT:` line — `TOPOLOGY SURVIVED` on a build with the
-`smgr_redo` guard, `TOPOLOGY DESTROYED` without it. It **fails closed**: if the catalog is
-not dense enough and the seed's rows land on block 0, the precondition check aborts instead
-of reporting a pass, so an inconclusive run can never look green.
+### V-13′ — production maintenance on the topology catalog
+
+`docker-compose.maint.yml`. Production runs `VACUUM`, `VACUUM FULL`, `REINDEX` and
+`TRUNCATE` on `gp_segment_configuration_internal` with a replica attached, each with its own
+restore point so the replica advances across them one at a time. The last three rewrite a
+mapped shared catalog's relfilenode and emit a shared relmap update — the record the old
+design halted the replica on. Production publishes each post-op relfilenode so the DR side
+asserts the rewrite really happened; a fixture that quietly did nothing fails instead.
+Verdict line: `V-13' VERDICT:`.
+
+```bash
+docker-compose -p maint -f src/test/dr/docker-compose.maint.yml up -d
+docker-compose -p maint -f src/test/dr/docker-compose.maint.yml logs -f dr
+docker-compose -p maint -f src/test/dr/docker-compose.maint.yml down -v
+```
+
+### Mirror failover — production's WAL forks under the replica
+
+`docker-compose.failover.yml`. The only fixture whose production cluster has **mirrors**.
+A segment's primary is killed between two restore points, FTS promotes its mirror, and the
+promoted node starts a new timeline: everything after the promotion exists only there. The
+replica is stopped at the earlier point when it happens, so the advance to the later one has
+to cross the fork — which it can only do because `ggdr create` arms
+`recovery_target_timeline = 'latest'`. Verdict line: `FAILOVER VERDICT:`.
+
+The failure mode being guarded against is silence, not error: a replica that will not follow
+the switch simply waits for WAL nobody will write again. The DR side wraps its advance in a
+`timeout` so that presents as a failed check rather than a hung container.
+
+```bash
+docker-compose -p fo -f src/test/dr/docker-compose.failover.yml up -d
+docker-compose -p fo -f src/test/dr/docker-compose.failover.yml logs -f dr
+docker-compose -p fo -f src/test/dr/docker-compose.failover.yml down -v
+```
 
 ## Files
 
@@ -140,9 +158,12 @@ of reporting a pass, so an inconclusive run can never look green.
 | `scripts/primary-entrypoint.sh` | Build cluster, archive, base-backup, change topology, record change LSN. |
 | `scripts/dr-entrypoint.sh` | Restore, arm DR mode, start the coordinator as a live hot-standby, run the M1+M2 assertions. |
 | `scripts/run-dr-test.sh` | Earlier standalone M1 assertion (superseded; assertions now inline in `dr-entrypoint.sh`). |
-| `docker-compose.dense.yml` | V-20 regression fixture (dense topology catalog); uses a prebuilt image via `$DR_IMAGE`. |
-| `scripts/dense-primary-entrypoint.sh` | Densify `gp_segment_configuration`, base-backup in that state, then vacuum to trigger the truncation. |
-| `scripts/dense-dr-entrypoint.sh` | Build the replica, assert it is exposed (live rows on a trailing block), replay past the truncation, report the verdict. |
+| `docker-compose.maint.yml` | V-13′ fixture: production maintenance on the topology catalog; uses a prebuilt image via `$DR_IMAGE`. |
+| `scripts/maint-primary-entrypoint.sh` | Densify the topology catalog, base-backup, then `VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE`, publishing each relfilenode. |
+| `scripts/maint-dr-entrypoint.sh` | Advance the replica across each operation and assert it did not notice; promote at the end. |
+| `docker-compose.failover.yml` | Mirror-failover fixture: production runs **with mirrors** and fails one content over mid-run, forking its WAL. |
+| `scripts/failover-primary-entrypoint.sh` | Build a mirrored cluster, archive on mirrors too, kill a primary between two restore points, write more rows through the promoted mirror. |
+| `scripts/failover-dr-entrypoint.sh` | Advance the replica across the timeline fork and assert it followed it — and that only the failed-over content did. |
 
 ## Notes / status
 

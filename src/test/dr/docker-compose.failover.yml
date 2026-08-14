@@ -1,0 +1,78 @@
+# Greengage 7 DR -- production fails over to a mirror while a replica is attached.
+#
+# The other two fixtures run production without mirrors, so every content's WAL
+# is one unbroken timeline for the life of the run.  A real production cluster
+# has mirrors and eventually uses one, and that is the case this fixture covers:
+# a segment's primary dies, FTS promotes its mirror, and the promoted node
+# starts a NEW TIMELINE.  From the archive's point of view the content's WAL
+# forks -- everything after the promotion exists only on timeline 2, in the same
+# per-content directory (%c keys on content, which the promotion does not
+# change), reachable only by a replica willing to follow it.
+#
+# The failover happens BETWEEN two restore points, with the replica stopped at
+# the first one:
+#
+#   fo_rp_pre --> [replica builds, pauses] --> fo_rp_a --> FAILOVER --> fo_rp_b
+#
+# so the advance from fo_rp_a to fo_rp_b is the one that must cross the fork.
+# Crossing it is the whole assertion: the replica reaches fo_rp_b, serves the
+# rows production wrote through the promoted mirror, and does it without any
+# node restarting or logging a FATAL.
+#
+# Production also rewrites its own topology catalog as part of failing over --
+# FTS flips role and status for both halves of the pair -- so this doubles as
+# the sharpest available case of the P6/P7 property: that catalog change
+# replays into the replica's catalog while the topology it serves, which lives
+# in $PGDATA/gg_topology, does not move.
+#
+#   docker-compose -p fo -f src/test/dr/docker-compose.failover.yml up -d
+#   docker-compose -p fo -f src/test/dr/docker-compose.failover.yml logs -f dr
+#   docker-compose -p fo -f src/test/dr/docker-compose.failover.yml down -v
+#
+# Build the base image first with the default fixture:
+#   docker-compose -f src/test/dr/docker-compose.yml build
+version: "3.8"
+
+x-gpdb: &gpdb
+  image: ${DR_IMAGE:-greengage-dr-test:latest}
+  privileged: true
+  init: true
+  sysctls:
+    kernel.sem: "500 1024000 200 4096"
+  ulimits:
+    nofile: 65535
+  volumes:
+    - wal_archive:/archive
+    - ./scripts:/dr/scripts:ro
+    # As in the other two fixtures: the working tree's ggdr, mounted over the
+    # copy baked into the image.  It matters more here than anywhere else --
+    # recovery_target_timeline is written by ggdr create, and following the
+    # promoted mirror's timeline is what this fixture tests.  The DIRECTORY and
+    # not the file; see docker-compose.yml for why a single-file mount silently
+    # stops seeing edits.
+    - ../../../gpMgmt/bin:/home/gpadmin/gpdb_src/gpMgmt/bin:ro
+
+services:
+  primary:
+    <<: *gpdb
+    hostname: primary
+    environment:
+      # Which content loses its primary.  Content 0 by default, so the
+      # unaffected segment (content 1) and the coordinator stay on timeline 1
+      # and the DR side can assert the fork was local rather than global.
+      FAILOVER_CONTENT: "0"
+      # Every record carries a full-page image, so the replica compares its own
+      # page against production's after redo.  Here that covers the records the
+      # promoted mirror writes on the new timeline.
+      WAL_CONSISTENCY_CHECKING: "all"
+    command: ["/dr/scripts/failover-primary-entrypoint.sh"]
+
+  dr:
+    <<: *gpdb
+    hostname: dr
+    depends_on:
+      - primary
+    command: ["/dr/scripts/failover-dr-entrypoint.sh"]
+
+volumes:
+  wal_archive:
