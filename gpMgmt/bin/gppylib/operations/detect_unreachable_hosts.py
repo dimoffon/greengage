@@ -55,6 +55,13 @@ def mark_segments_down_for_unreachable_hosts(segmentPairs, unreachable_hosts):
     # an inconsistent state and may prevent the database from starting.
     for segmentPair in segmentPairs:
         for seg in [segmentPair.primaryDB, segmentPair.mirrorDB]:
+            # A pair on a cluster without mirrors has no second half, and
+            # update_unreachable_flag_for_segments() above already says so about
+            # both halves.  Without this, gpstart raises AttributeError on such a
+            # cluster the moment any segment host is unreachable -- which is the
+            # one situation this function exists to handle.
+            if seg is None:
+                continue
             host = seg.getSegmentHostName()
             if host in unreachable_hosts:
                 logger.warning("Marking segment %d down because %s is unreachable" % (seg.dbid, host))
