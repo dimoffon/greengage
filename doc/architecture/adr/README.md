@@ -10,10 +10,18 @@ the only ADR you need to understand or review the implementation.
 
 **[ADR-0007 — Cluster Topology Behind a Pluggable Store](0007-pluggable-cluster-topology.md)**
 
-Current and in progress. Topology moves out of a replicated catalog and behind a provider,
-which is why several of ADR-0006's mechanisms are on a path to deletion rather than
-maintenance. Read it before changing anything that reads or writes
+Current and complete (P0–P8). Topology moved out of the replicated catalog and behind a
+provider, which is why several of ADR-0006's mechanisms were deleted rather than maintained
+— **including D4, its apply-time topology redo filter and frozen-tuple seed**, which no
+longer exist in the tree. Read it before changing anything that reads or writes
 `gp_segment_configuration`.
+
+**[ADR-0008 — A DR Replica Follows Production Through Its HA Events](0008-dr-follows-production-ha.md)**
+
+Current. What happens to a replica when production fails a segment over to its mirror or
+activates its standby coordinator: both fork a timeline, the replica follows it
+(`recovery_target_timeline = 'latest'`), and it must not archive into production's archive
+while doing so. Read it before changing what `ggdr create` writes into `postgresql.conf`.
 
 Companions, both current:
 

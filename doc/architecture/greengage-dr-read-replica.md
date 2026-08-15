@@ -71,7 +71,7 @@ The implementation is organized as milestones; this document is structured aroun
 
 | Milestone | Concern | Where in this doc |
 |-----------|---------|-------------------|
-| M1 | Topology independence (redo filter + frozen seed) | §4.2 |
+| M1 | Topology independence (file-backed topology store) | §4.2 |
 | M2 | Read-only enforcement | §4.3 |
 | M2′ | Standby distributed read (dispatch while in recovery) | §4.4 |
 | M3 | Consistent reads (restore-point-gated, as-of-N snapshot) | §4.5, §5 |
@@ -106,7 +106,8 @@ The implementation is organized as milestones; this document is structured aroun
 - **Per-content continuous restore.** DR coordinator replays production's coordinator
   WAL; DR segment *cN* replays production primary *cN*'s WAL. The **segment count must
   match**; host layout is free. Each node has its **own independent WAL/LSN space**.
-- **DR-local topology**, protected from replayed WAL by the apply-time redo filter (§4.2).
+- **DR-local topology**, out of reach of replayed WAL because it is not in the catalog at
+  all (§4.2).
 - **Read-only** end-to-end (§4.3), enforced with a DR-specific error, but still able to
   **dispatch distributed reads** to segments in recovery (§4.4).
 - **Restore-point-gated consistency** (§4.5): the cluster recovers **up to** a distributed
@@ -123,13 +124,14 @@ Being explicit about provenance matters for maintenance:
 
 **DR-new code** (2026 commits on `7.x-dr`):
 
-- `IsDRReplicaMode()` + the M1 topology redo filter (`dr_redo_filter.c`).
+- `IsDRReplicaMode()`, and the file-backed topology provider the replica runs on
+  (`cdbtopology_file.c`, ADR-0007).
 - M2 read-only enforcement.
 - The `DTX_CONTEXT_QD_STANDBY_READER` distributed-transaction context.
 - The M3 served restore-point snapshot (`dr_served_snapshot.c`, ADR-0006 D8).
 - The M5 served-restore-point accessor + `gg_stat_dr_replica` views.
 - The `gg_dr_switch()` / `gg_dr_promote()` recovery-control functions (§6.4).
-- The `ggdr` / `ggseed_dr_topology` utilities.
+- The `ggdr` utility and the `gg_topology` store tool.
 
 **Reused upstream Greengage hot-standby dispatch** (commit `35e95b9c`, 2023, *"Enable hot
 standby dispatch"* — predates and is independent of DR):
@@ -151,7 +153,7 @@ static snapshot and the upstream dispatch suffices — see §5.5.)
 | # | Decision | Rationale |
 |---|----------|-----------|
 | 1 | **Archive / continuous-restore transport** (PITR), not streaming replication | No replication slot ⇒ no production WAL pinning (PG12 lacks `max_slot_wal_keep_size`); one faithful archive is reusable for production PITR *and* N DR replicas; WAN-latency tolerant. |
-| 2 | **Topology independence via an apply-time redo filter + frozen-tuple seed**, not a WAL rewriter | You cannot delete bytes from physical WAL (LSN = byte offset; `xl_prev` chain; page `pd_lsn` interlock). Rewriting records in place would corrupt the canonical archive or force a second copy. Filtering at *apply* time keeps `pg_wal` byte-identical to production. |
+| 2 | **Topology independence by moving topology out of the replicated catalog**, into `$PGDATA/gg_topology` behind a provider | Production's rows travel in the WAL because the topology is a *shared catalog*; a store production cannot address needs no protection at all. The filter-and-seed design this replaced (ADR-0006 D4) worked, but cost a redo hook, two guards, a seed step and a timeline-fork hazard. Rewriting the WAL itself was never an option: LSN = byte offset, plus the `xl_prev` chain and the page `pd_lsn` interlock. |
 | 3 | **Stop-and-go consistency** (pause at restore point *N*, serve, advance to *N+1*), reusing the shipped `gp_pause_on_restore_point_replay` GUC | Greengage already ships the pause primitive. It gives a clean as-of-N image with **zero recovery-conflict exposure during serve windows** (replay is stopped); conflicts are confined to advance bursts. Each node also *freezes* that image (ADR-0006 D8), so the window holds while the cluster advances rather than only while it sits still. |
 | 4 | **Reuse upstream hot-standby dispatch**; add only the no-gxid standby-reader context | Minimizes new core surface; the risky gang/snapshot machinery already exists and is tested. |
 | 5 | **Whole-cluster failover only** for the PoC (mirrorless DR) | Keeps the novel cross-cluster work in focus; DR-local mirrors + DR-local FTS are deferred. |
@@ -173,7 +175,7 @@ IsDRReplicaMode(void)          /* src/backend/access/transam/xlog.c */
 ```
 
 There is **no separate DR mode**. Enabling `hot_standby` on a node in recovery gives it the
-whole DR behaviour: the apply-time topology redo filter (§4.2), read-only enforcement
+whole DR behaviour: reads served from its own topology store (§4.2), read-only enforcement
 (§4.3), and the standby distributed-read path (§4.4). Earlier revisions carried a
 `gp_dr_replica` GUC plus a `dr_replica.signal` marker alongside `hot_standby`; both are
 gone.
@@ -191,163 +193,115 @@ Three consequences are worth stating explicitly:
   ends, so promotion disengages DR behaviour by itself — no restart, no GUC to unset, no
   marker to delete. This is what removed the old two-phase promote (§6.3).
 - **It is visible everywhere without plumbing.** `EnableHotStandby` is a `PGC_POSTMASTER`
-  GUC, so the startup process (which runs the redo filter) and every backend (which runs the
+  GUC, so the startup process and every backend (which runs the
   read-only enforcement) see the same value. The old design needed a lazily-`stat()`ed,
   per-backend cache of the marker file precisely because a backend never runs recovery.
 - **`hot_standby` defaults to `off`**, so ordinary mirrors and the standby coordinator are
-  unaffected. **Do not turn it on for them.** The topology filter would freeze their
-  `gp_segment_configuration`, and a later FTS failover (or `gpactivatestandby`) would promote
-  a node describing a stale cluster. `hot_standby = on` means *"this node is a separate DR
-  cluster"*.
+  unaffected. **Do not turn it on for them.** A mirror is a node *inside* a cluster and must
+  stay ready to be promoted into it; DR mode gives it a replica's semantics instead — reads
+  served only from a published restore point, writes refused, and (with
+  `gg_topology_source = file`) a topology of its own rather than the cluster's.
+  `hot_standby = on` means *"this node is a separate DR cluster"*.
 
-### 4.2 M1 — Topology independence
+### 4.2 Topology independence — the replica describes itself
 
-Two cooperating mechanisms let the DR cluster describe *itself* while replaying
-production's WAL.
+A DR replica is a *different cluster* from the one whose WAL it replays: its own dbids,
+hosts, ports and data directories. Production's `gp_segment_configuration` is a **shared
+catalog**, so its rows travel in the WAL like any other heap tuple, and something has to
+stop the replica from adopting them.
 
-#### 4.2.1 Apply-time redo filter
+The answer is that the replica does not read that catalog. Cluster topology sits behind a
+**provider** (ADR-0007), and a replica selects the file-backed one:
 
-In the redo loop, before dispatching a record to its resource-manager `rm_redo`:
+- **`gg_topology_source = file`** (`PGC_POSTMASTER`) on every node, written by
+  `ggdr create` — coordinator *and* segments, because the GUC is exempt from the QD/QE sync
+  check and a half-armed cluster would otherwise come up silently;
+- the store is **`$PGDATA/gg_topology`**: text, CRC-32C over everything but the last line,
+  and **not WAL-logged**, so nothing production writes can reach it;
+- **`gp_segment_configuration` is a view** over `gp_get_segment_configuration()`, which
+  reads the active provider — so gpMgmt, in-tree SQL and user queries all see the store the
+  node actually runs on, under either provider.
 
-```c
-/* src/backend/access/transam/xlog.c:7730-7742 */
-if (!DRRedoShouldFilter(xlogreader))
-{
-    RmgrTable[record->xl_rmid].rm_redo(xlogreader);
+Production's rows still arrive. They replay into `gp_segment_configuration_internal` — the
+renamed catalog — which on a replica **nothing reads**. The fixtures assert both halves at
+once: the replica's catalog carries production's change, and the topology it serves does
+not move (T1/T3, `src/test/dr/scripts/dr-entrypoint.sh`).
 
-    if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
-        checkXLogConsistency(xlogreader);
-}
-```
+**What this replaced.** Until P6/P7 the replica kept its topology by *filtering production's
+topology records out of redo* and seeding its own catalog with frozen tuples. It worked, and
+it cost: a hook in the redo loop, a `relmapper.c` remap guard, a `storage.c` truncate guard,
+a single-user seed step inside `create`, and a permanent timeline-fork hazard around that
+seed. Putting topology somewhere production cannot address deleted all of it. The replica
+now replays production's WAL **in full**, which `wal_consistency_checking = 'all'` on
+production turns into a byte-level proof that it does (T6: 1043 full-page images in the
+first segment, zero inconsistencies). ADR-0006 D4 and the §4.2 of earlier revisions of this
+document describe the filter; it is history, not code.
 
-The consistency check (`wal_consistency_checking` on production sets
-`XLR_CHECK_CONSISTENCY` on records) is skipped **together with** redo: a filtered
-record's pages were deliberately left untouched, so comparing them against
-production's page images would spuriously `FATAL`.
+One consequence is worth stating plainly, because it used to be a prohibition: production
+may now run `VACUUM`, `VACUUM FULL`, `REINDEX` and `TRUNCATE` on its topology catalog with
+a replica attached. Each rewrites a mapped shared catalog's relfilenode and emits a shared
+relmap update — the record the old design halted on with `FATAL` — and the replica replays
+them and notices nothing (§10.4, V-13′).
 
-`DRRedoShouldFilter()` (`src/backend/access/transam/dr_redo_filter.c:195-225`):
+#### 4.2.1 Production HA events fork a timeline
 
-- returns `false` (apply normally) unless `IsDRReplicaMode()`;
-- iterates the record's block references; if **every** referenced block falls in a
-  **protected set**, it returns `true` and the record's `rm_redo` is **skipped**. If *any*
-  referenced block is outside the set, the record is applied normally. A record with no
-  block references is always applied.
+Production's topology also changes for reasons of its own, and two of those move a content's
+WAL onto a **new timeline**:
 
-The **protected set** is the cluster-topology catalogs, resolved from raw BKI OIDs
-(`dr_redo_filter.c:43-52`) to relfilenodes via the **shared relmapper**
-(`DRResolveProtectedRelfilenodes()`, `dr_redo_filter.c:71-104`, using
-`RelationMapOidToFilenode(reloid, /*shared=*/true)`):
+| Event | What production does to its topology | What the replica must do |
+|---|---|---|
+| Segment primary → mirror (FTS) | flips `role`/`status`/`mode` **in place**; the promoted mirror starts timeline 2 | follow the fork, for that content only |
+| Coordinator → standby coordinator (`gpactivatestandby`) | **deletes** the old coordinator's row and promotes the standby's, which keeps its own dbid (`segment_config_activate_standby()`, `segadmin.c`) | follow the fork, for content `-1` |
 
-| OID | Catalog |
-|-----|---------|
-| 5036 | `gp_segment_configuration` |
-| 7139 / 7140 | its two indexes |
-| 6092 / 6093 | its TOAST table + index |
-| 5106 | `gp_configuration_history` |
-| 5101 | `gp_id` |
-| 5103 | `gp_version_at_initdb` |
+Both are survivable, and each has a fixture (§10.4). Two settings are what make them work,
+both written by `ggdr create` on every node:
 
-A block is protected only if it is in the **global tablespace and shared**
-(`spcNode == GLOBALTABLESPACE_OID && dbNode == InvalidOid`,
-`DRRelfilenodeIsProtected()`, `dr_redo_filter.c:164-183`).
+- **`recovery_target_timeline = 'latest'`.** A promoted node archives a `.history` file and
+  writes everything after the promotion on the new timeline. The archive is keyed on
+  **content** (`%c`), which a promotion does not change, so the new timeline lands in the
+  directory that replica's node already reads. Pinned to `'current'`, a replica cannot
+  follow — and it does not fail loudly: it waits for WAL nobody will ever write again, which
+  from the outside is indistinguishable from an idle production.
+- **`archive_mode = off`.** The base backup carries production's `archive_mode` and its
+  `archive_command`, and that command names production's archive. A node in recovery
+  archives nothing, so this matters only once the replica is **promoted** — at which point
+  it would start writing its own timeline into the archive production is still filling.
+  Under `'latest'` that is not merely untidy: the next replica built from that archive would
+  find the promoted replica's history file as the newest timeline and recover onto *it*
+  rather than production's. One promotion would quietly poison every rebuild after it.
 
-Two important consequences:
+For the failover to be followable the **mirror must be archiving too** — `archive_mode = on`
+(not `always`) on production's mirrors and standby coordinator, which stays silent while
+they are in recovery and starts the moment one is promoted. There is nobody left to
+configure it afterwards.
 
-- **The replay LSN still advances.** Skipping `rm_redo` does not touch the LSN
-  bookkeeping — `replayEndRecPtr` (`xlog.c:7708-7711`) and `lastReplayedEndRecPtr`
-  (`xlog.c:7746-7749`) are set unconditionally around the redo call. The DR node stays
-  in lock-step with production's WAL position; it just doesn't *apply* the protected
-  records.
-- **`pg_wal` stays byte-identical to production's.** The filter changes what is *applied*,
-  not the bytes. This preserves faithful `pg_waldump`/PITR and deterministic crash
-  recovery (the filter re-applies identically on restart).
+The catalog churn itself — role/status updates, `gp_configuration_history` inserts, the
+deleted coordinator row — replays like any other record and changes nothing the replica
+serves.
 
-#### 4.2.2 Frozen-tuple seed
+#### 4.2.2 Auxiliary tooling: `gg_walfilter` (`src/bin/gg_walfilter`)
 
-After a base backup is restored, `gp_segment_configuration` still holds production's rows.
-`ggseed_dr_topology` (`gpMgmt/bin/ggseed_dr_topology`) replaces them with DR-local rows
-**before** `standby.signal` is placed:
+The WAL rewriter survives as **tooling**, not as a mechanism the replica depends on. It is a
+hand-written walker (deliberately not `xlogreader`: a record spilling across a segment
+boundary must be decided from its in-segment prefix, and `DecodeXLogRecord()` on a
+zero-padded prefix fails open) with three uses:
 
-1. start the coordinator **standalone** (`postgres --single`, `allow_system_table_mods=on`);
-2. `DELETE FROM gp_segment_configuration`, insert the DR-local rows from a topology TSV;
-3. `VACUUM FREEZE gp_segment_configuration` — the rows get `xmin = FrozenTransactionId`, so
-   they are **unconditionally visible with no CLOG dependency** (production's replayed XID
-   timeline can never make them invisible);
-4. `CHECKPOINT`, shut down.
+- **`inspect`** — say what a WAL segment contains and which records a given rule set would
+  rewrite;
+- **offline filtering** with explicit rules (`--exclude-db`, `--exclude-tablespace`,
+  `--protect-mapped-oid`), e.g. for partial replicas or redacted WAL hand-offs;
+- **opt-in restore-path filtering** — `gg_walfilter restore` is a complete `restore_command`
+  entry point, for deployments that want filtering *outside* the engine.
 
-Because those pages are frozen **and** the redo filter blocks production's records from
-overwriting them, the DR-local topology persists through replay. The frozen tuples are
-what make the DR cluster genuinely describe itself.
+`--halt-on-remap` halts a restore (exit 3) if production rebuilds a mapped catalog. It was
+`--gp-dr-topology` while the engine had a matching guard; the preset was that guard's only
+setter, so deleting the guard would have made the option unreachable, and it was renamed to
+say what it does instead.
 
-#### 4.2.3 Records that name a relation in the payload, not in a block tag
+History: an earlier revision used `gg_walfilter` (then Python) *as* the default topology
+protection via `restore_command` (ADR-0002); ADR-0003 restored the in-backend filter as the
+default and kept the tool, ported to C; P7 deleted the filter and left the tool.
 
-`DRRedoShouldFilter()` decides from a record's *block references*, so a record that names its
-relation only in its payload is invisible to it — and is always applied, since that is also
-the shape of a commit record. Two such record types touch the protected catalogs, and each
-gets its own guard.
-
-**Relfilenode rewrites → halt.** If production ever `VACUUM FULL` / `CLUSTER` / `REINDEX` /
-`TRUNCATE`s a protected catalog, its relfilenode changes and a shared relmap update is
-WAL-logged. There is **no preemptive block on the production side**. Instead the DR replica
-**halts reactively**: `relmap_redo()` (`relmapper.c:1032-1048`) calls
-`DRRejectForbiddenRemap()` (`dr_redo_filter.c:138-158`), which `ereport(FATAL)`s if an
-incoming mapping would change a protected catalog's relfilenode — halting the postmaster
-*before* any on-disk write, so the replay LSN does not advance past the offending record.
-The fix is to re-create that DR node from a fresh base backup. (This is a documented
-contract limitation, §9.)
-
-**Heap truncation → skip.** A plain `VACUUM` that frees trailing pages of a protected
-catalog emits `XLOG_SMGR_TRUNCATE`, which carries its `RelFileNode` in `xl_smgr_truncate`
-and registers no buffers. Applied blindly it would truncate the DR's *own* file — the one
-holding the frozen-seeded DR-local rows, whose page count legitimately differs from
-production's, because the seed's re-inserted rows can land on a block production has since
-freed. `smgr_redo()` therefore consults `DRRedoShouldFilterRelFileNode()`
-(`dr_redo_filter.c:186-217`, call site `storage.c:698-715`) and **skips the truncation**,
-logging it at `LOG`.
-
-The asymmetry is deliberate. An ignored truncation has no lasting consequence: the node
-keeps its own pages, the protected set still resolves to the same filenode, and replay
-continues correctly. A remap is different — it repoints the catalog at a filenode the
-protected set no longer covers, so the filter would silently stop protecting it from then
-on. Unrecoverable divergence earns a `FATAL`; a harmless one does not, and halting every DR
-node on a routine production autovacuum would be a far worse failure than the one being
-prevented.
-
-#### 4.2.4 Auxiliary tooling: `gg_walfilter` (src/bin)
-
-`gg_walfilter` (`src/bin/gg_walfilter/`, a C frontend program installed into
-`$GPHOME/bin`) is a **record-level WAL filter for archived segments**: it rewrites
-selected records into same-length `XLOG_NOOP` records (the walbouncer technique) with
-the CRC recomputed, so framing, LSNs and xid tracking stay intact while the record's
-redo becomes a no-op. It is **not part of the default DR data path** — the in-backend
-redo filter above is the engine invariant that protects the topology — but it ships
-with the server for:
-
-- **offline inspection** — `gg_walfilter inspect <segment>` reports, per record, what
-  a rule set would filter and why (`--gp-dr-topology` selects the DR preset);
-- **offline filtering** — `gg_walfilter filter` neutralizes matching records in local
-  segment files (generic rules: `--exclude-relfilenode`, `--exclude-database`,
-  `--exclude-tablespace`, `--protect-mapped-oid`), e.g. for partial replicas or
-  redacted WAL hand-offs;
-- **opt-in restore-path filtering** — `gg_walfilter restore` is a full
-  `restore_command` entry point (fetch → filter → atomically install, with
-  boundary-continuation state and deterministic archive lookback), for deployments
-  that want filtering *outside* the engine.
-
-Its filter decision is intentionally identical to the engine's, and tracks **both** of the
-engine's rules (§4.2.3): rewrite iff the record has ≥1 block reference and every one matches
-a rule (`DRRedoShouldFilter()`), **or** it is an `XLOG_SMGR_TRUNCATE` whose payload
-`RelFileNode` matches (`DRRedoShouldFilterRelFileNode()`, `wf_truncate_target()` /
-`wf_truncate_matches()` in `filter.c`). Keeping the two in step is the point of the tool:
-`inspect` is only useful if it predicts what a DR node will actually do with the WAL. Where
-the tool cannot resolve a truncate's target from the segment in hand — the record's leading
-bytes land past the segment end — it fails closed under the DR preset rather than let an
-unidentified truncation through, the same posture it takes for a boundary-spanning relmap
-update.
-
-History: an earlier revision of this branch used `gg_walfilter` (then a Python script) *as*
-the default topology-protection mechanism via `restore_command` (ADR-0002); ADR-0003 restored
-the in-backend filter as the default and kept the tool, ported to C, as tooling.
 
 ### 4.3 M2 — Read-only enforcement
 
@@ -711,27 +665,31 @@ What it does, in order (`cmd_create`):
 2. **Restore** each instance's base backup into its DR datadir (`cp -a`, `chmod 700`);
    verify each has a `backup_label`.
 3. **Archive-completeness gate (fail-closed).** For each content, verify the WAL archive
-   directory is non-empty and contains the backup's **START WAL segment**. If not, abort —
-   because resuming without the archived `[REDO..backup-end]` WAL could replay the seed's
-   forked WAL and permanently fork the timeline.
-4. **Frozen-topology seed** on the coordinator: save `backup_label` + `global/pg_control`
-   aside, run `ggseed_dr_topology` (§4.2.2), then **restore** the saved recovery-start state
-   so recovery resumes from the backup checkpoint, and **re-fetch** any backup-tail WAL
-   segment from the archive over `pg_wal` (so the seed's WAL can never win over the archive).
-5. **Arm the replica** on every node: empty `postgresql.auto.conf`; append `hot_standby = on`,
-   `restore_command`, `recovery_target_timeline = 'current'`, and (if `--pause-at`) the
-   pause GUC; create `standby.signal`. `hot_standby = on` is the whole switch — there is no
-   separate DR GUC or marker file (§4.1).
+   directory is non-empty and contains the backup's **START WAL segment**. This was once a
+   corruption gate — an archive miss could replay the deleted seed's forked WAL — and is now
+   a usability one: without those segments the node starts and then waits forever for a file
+   that is not coming, which is a far worse symptom to debug than a refusal here.
+4. **Write the DR-local topology store** into **every** node's `$PGDATA/gg_topology`, via
+   `gg_topology write` (§4.2). Every node, not just the coordinator: only the coordinator's
+   copy is read while the replica serves, but a segment still holding production's entries
+   would describe the wrong cluster the moment this replica is promoted and its FTS begins
+   writing the store. The base backup carried production's copy of this file; this is the
+   overwrite it exists for, and it must happen before any node starts.
+5. **Arm the replica** on every node: empty `postgresql.auto.conf` (dropping production's
+   sync-rep settings); append `gg_topology_source = file`, `hot_standby = on`,
+   `archive_mode = off`, `restore_command`, `recovery_target_timeline = 'latest'`,
+   `max_standby_archive_delay = 0` / `max_standby_streaming_delay = 0`, and (if `--pause-at`)
+   the pause GUC; create `standby.signal`. `hot_standby = on` is the whole switch — there is
+   no separate DR GUC or marker file (§4.1). For why the last two of those settings are
+   `'latest'` and `off` rather than the obvious defaults, see §4.2.1.
 6. **Start** each node in archive recovery (`pg_ctl`, coordinator in `gp_role=dispatch`,
    segments in `gp_role=execute`) and poll until all accept read connections.
-7. **Post-build topology check** (`_check_seeded_topology()`): read the coordinator's
-   `gp_segment_configuration` back and require it to describe *this* cluster — one row per
-   topology entry, matching `dbid`/`content`/`port`/`hostname`. A silent seed failure would
-   leave the replica describing production, so a mismatch **fails the build** rather than
-   surfacing later as confusing symptoms. The check also reports the catalog's heap size and
-   the block its live rows landed on: above block 0 means this node's topology depends on the
-   §4.2.3 truncation guard, which is worth knowing at a glance. Only the coordinator is
-   checked, because only the coordinator is seeded.
+7. **Post-build topology check** (`_check_topology()`): require **every** node to report
+   `gg_topology_source = file`, and the coordinator's `gp_segment_configuration` to describe
+   *this* cluster — one row per topology entry, matching `dbid`/`content`/`port`/`hostname`.
+   Both halves fail the build rather than surfacing later as confusing symptoms: a node left
+   on the catalog provider would describe production, and because the GUC is exempt from the
+   QD/QE sync check a coordinator-on-file/segments-on-catalog split comes up silently.
 
 At the end the DR cluster is live in recovery, refusing writes, verified to describe itself,
 and (with `--pause-at`) paused at a consistent restore point ready to serve as-of-N reads.
@@ -914,7 +872,7 @@ $ ggdr create -t /archive/dr_topology.tsv \
   recovery-conflict cancellation** for queries that start and finish within a serve window.
 - **Minimal new core surface.** It reuses the shipped `gp_pause_on_restore_point_replay`
   primitive and the existing hot-standby dispatch, adding only the standby-reader context,
-  the redo filter, the served restore-point snapshot, and enforcement/observability.
+  the topology provider, the served restore-point snapshot, and enforcement/observability.
 - **Promote in place**, cutting every node at the same restore point, with a clean
   two-phase disengage of DR mode.
 - **WAN-tolerant / geo-separable.** Nothing requires a low-latency link; hosts and layout
@@ -967,34 +925,29 @@ $ ggdr create -t /archive/dr_topology.tsv \
 - **Index-only and bitmap scans lose the all-visible fast path** on a replica (ADR-0006
   D10). Correct answers, more heap fetches.
 
-**Topology filter**
+**Topology**
 
-- **Production `VACUUM FULL`/`CLUSTER`/`REINDEX`/`TRUNCATE` on a protected topology catalog
-  halts the DR.** It is caught reactively as a `FATAL` in `relmap_redo`
-  (`DRRejectForbiddenRemap`), *not* blocked on production. Recovery is to re-base-backup +
-  re-seed that DR node. Treat these catalogs as immutable while a DR replica is attached.
-- **Plain `VACUUM` truncation of a protected catalog is skipped, not fatal** (§4.2.3). The
-  DR's copy of these catalogs legitimately has a different page count from production's,
-  because the seed's re-inserted rows may sit on a block production later frees; applying
-  production's truncation would discard them. This was a real defect — the guard in
-  `smgr_redo` was added after the payload-vs-block-tag gap was found; see scenario V-20.
-- **The filter reduces WAL *apply*, not WAL *volume*.** Topology records are tiny; the
-  filter does not save bandwidth. Bandwidth is a `wal_compression` / relay concern.
-- **Frozen-seed footprint (bounded, self-healing).** `VACUUM FREEZE` of
-  `gp_segment_configuration` does in-place relstats updates on a few `pg_class` pages
-  (`pg_class` is *not* protected); production changes co-located on those pages within the
-  `(backup-LSN, seed-LSN]` window are LSN-shadowed until the next production FPI heals them
-  — harmless on a read-only replica. A production-grade create utility should seed against a
-  scratch copy and transplant back only the protected forks.
+- **Production may run maintenance on its topology catalog.** `VACUUM`, `VACUUM FULL`,
+  `REINDEX` and `TRUNCATE` were all prohibited while the replica read that catalog; they are
+  now ordinary WAL to a replica that reads its own store (§4.2, fixture V-13′). The
+  `relmap_redo` `FATAL` and the `smgr_redo` truncate guard that enforced the prohibition are
+  deleted.
+- **The replica's topology store is not WAL-logged, which is exactly the point and also the
+  cost.** It is a plain file per node: it is not backed up by `pg_basebackup` of the replica,
+  not repaired by replay, and a node that loses it will not start in dispatch mode. Rebuild
+  it with `gg_topology write`, or re-run `ggdr create` for that node.
+- **`gg_topology_source` is exempt from the QD/QE GUC-sync check**, so a
+  coordinator-on-file/segments-on-catalog split does not announce itself. `ggdr create`
+  arms every node in one loop and its post-build check requires all of them to report
+  `file` (§6.1).
 
-**Seeding / create**
+**Create**
 
-- **Timeline-fork hazard around the seed.** The single-user seed consumes `backup_label`
-  and advances `pg_control`; `create` preserves and restores the recovery-start
-  state and **re-fetches** backup-tail WAL from the archive, and it **gates fail-closed** on
-  the backup's START WAL segment being present in the archive. Without those, an archive
-  miss could replay the seed's forked WAL and permanently fork the timeline.
-- **`--scratch-seed` is reserved / not implemented** in the PoC.
+- **The archive gate is fail-closed and stays that way.** `create` refuses unless each
+  content's archive holds the backup's START WAL segment. It guarded a corruption case while
+  the seed existed (an archive miss could replay the seed's forked WAL and fork the timeline
+  permanently); with the seed gone it guards a usability one — a node that starts without
+  those segments waits forever for a file that is not coming.
 
 **Operational (PoC scope)**
 
@@ -1008,12 +961,16 @@ $ ggdr create -t /archive/dr_topology.tsv \
 - **Unclean production loss.** Computing the *latest complete common restore point* when
   some segments archived past N and others did not is not automated; promote from a cut you
   have verified is consistent (`stats` → `consistent serve point`).
-- **Production HA events fork timelines.** A production primary→mirror failover switches that
-  segment's timeline; the DR must follow via the archived `.history` file. Reliable
-  history-file archiving is required; "mirror failover while DR is attached" is a scenario to
-  test explicitly. DR nodes are configured with `recovery_target_timeline = 'current'`.
+- **Production HA events fork timelines — and the replica follows.** A primary→mirror
+  failover, or a coordinator activated from its standby, moves that content onto a new
+  timeline; DR nodes run `recovery_target_timeline = 'latest'` and cross the fork using the
+  archived `.history` file (§4.2.1, fixtures in §10.4). What this *requires of production*
+  is the standing condition: **mirrors and the standby coordinator must be configured to
+  archive**, or the WAL after a promotion never reaches the archive at all.
+- **`gpexpand` invalidates the replica.** Changing production's segment count leaves the
+  replica describing a cluster that no longer exists; rebuild it after the expansion.
 - **Re-sync is a full re-base-backup.** There is no cross-WAN `pg_rewind`; a fallen-behind or
-  gap-hit DR node is rebuilt with `create` for that node + re-seed.
+  gap-hit DR node is rebuilt with `create` for that node.
 
 **Version / contract**
 
@@ -1030,9 +987,9 @@ $ ggdr create -t /archive/dr_topology.tsv \
 | Area | Location |
 |------|----------|
 | DR mode gate | `IsDRReplicaMode()` = `EnableHotStandby && RecoveryInProgress()`, `xlog.c`; decl `xlog.h` |
-| Redo filter | `dr_redo_filter.c` (`DRRedoShouldFilter` :229-259, protected OIDs :43-52, resolve :71-104, match :164-183, remap-reject :138-158, `DRRedoShouldFilterRelFileNode` :207-217); dispatch + consistency-check skip `xlog.c:7730-7742`; header `dr_redo_filter.h:32-56`; remap redo `relmapper.c:1032-1048`; smgr truncate guard `storage.c:698-715` |
+| Topology provider | `cdbtopology.c` (provider layer, write sets), `cdbtopology_file.c` (the file store), `cdbtopology_catalog.c` (the catalog store), format in `src/common/gg_topology_file.c` so initdb and frontends link it |
 | WAL-filter tool (auxiliary) | `src/bin/gg_walfilter/` (`gg_walfilter.c` CLI, `segment.c` walker/decoder, `filter.c` rules + NOOP rewrite + lookback, `state.c` boundary state, `fetch.c` fetch/install); tests `src/test/dr/test_gg_walfilter.py` (black-box) |
-| Frozen seed | `gpMgmt/bin/ggseed_dr_topology` |
+| Topology store tool | `src/bin/gg_topology` (`dump` / `bootstrap` / `write`) |
 | Read-only enforcement | `execMain.c:1651-1660`; DTM backstop `cdbtm.c:281-284` |
 | FTS/autovac (structural) | `postmaster.c:6545-6578` (bgworker), `postmaster.c:2132-2134` (autovac) |
 | Standby-reader context | `DTX_CONTEXT_QD_STANDBY_READER` `cdbtm.h:142-149`; select `cdbtm.c:1729-1743`; skips `cdbtm.c:417,452`, `execMain.c:666`; serialize `cdbdisp_dtx.c:158-177` |
@@ -1053,7 +1010,7 @@ $ ggdr create -t /archive/dr_topology.tsv \
 
 | GUC | Context | Default | Role |
 |-----|---------|---------|------|
-| `hot_standby` | `PGC_POSTMASTER` | `false` | On a node in recovery, makes it a DR replica: read-only enforcement, topology redo filter, standby distributed read. Disengages with recovery. |
+| `hot_standby` | `PGC_POSTMASTER` | `false` | On a node in recovery, makes it a DR replica: read-only enforcement, the served restore-point snapshot, standby distributed read. Disengages with recovery. |
 | `gp_pause_on_restore_point_replay` | `PGC_SUSET` | `''` | Pause replay when the named restore point is replayed; re-point + resume to advance. `gg_dr_switch()` maintains it. |
 | `max_standby_archive_delay` | `PGC_SIGHUP` | `0` on a DR node (`ggdr create` writes it) | A frozen `xmin` makes recovery conflicts routine; the stock 30 s would be added to every advance that hits one. `-1` is a trap, not the other extreme — it blocks the startup process inside redo. |
 
@@ -1068,16 +1025,21 @@ $ ggdr create -t /archive/dr_topology.tsv \
 
 ### 10.4 Test fixture
 
-`src/test/dr/` — a two-container fixture (production + DR sharing an `/archive` volume) that
-builds the DR via `ggdr create` and exercises M1/M2/M2′/M3/M5 plus
-`ggdr` `switch`/`pause`/`stats` plus the SQL control functions end-to-end
-(`docker-compose -f src/test/dr/docker-compose.yml up --build`).
+`src/test/dr/` — two-container fixtures (production + DR sharing an `/archive` volume), all
+building the replica with `ggdr create` against the same image. Four scenarios, each with its
+own compose file and its own verdict line, so a failure attributes to one of them:
 
-`src/test/dr/docker-compose.dense.yml` — a second, opt-in fixture for the §4.2.3 truncation
-guard: it densifies production's `gp_segment_configuration` before the base backup so the
-DR's seed lands its rows on a trailing block, then vacuums production to emit the truncation.
-Run against a guarded and an unguarded build it reports `TOPOLOGY SURVIVED` vs.
-`TOPOLOGY DESTROYED`. See `src/test/dr/README.md`.
+| Fixture | Production does | Verdict line |
+|---|---|---|
+| `docker-compose.yml` | the default run: topology change, restore points, straddle, promotion | six `… TEST: PASS` banners |
+| `docker-compose.maint.yml` | `VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE` on its topology catalog | `V-13' VERDICT:` |
+| `docker-compose.failover.yml` | **runs with mirrors** and fails a segment over between two restore points | `FAILOVER VERDICT:` |
+| `docker-compose.costandby.yml` | **runs with a standby coordinator** and activates it between two restore points | `STANDBY-ACTIVATION VERDICT:` |
+
+The last two are the timeline-fork cases of §4.2.1; both assert that the forked content
+followed production onto the new timeline, that the *other* contents did not, and that the
+replica's catalog took production's topology change while the topology it serves did not
+move. See `src/test/dr/README.md`.
 
 Scenario catalogue: [`greengage-dr-test-scenarios.md`](greengage-dr-test-scenarios.md) —
 what to test, what is already automated, and the expected behaviour of each corner case.

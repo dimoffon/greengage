@@ -7,8 +7,9 @@ behaviour and the mechanism that produces it.
 
 Every "expected behaviour" below is tied to a mechanism in the shipped code. Where a
 scenario has **not** been run yet and the outcome is a prediction from reading the code,
-it is marked **`PREDICTED`** — those are the ones most worth running first, because two of
-them (T-3, HA-1) predict *failures*.
+it is marked **`PREDICTED`** — those are the ones most worth running first, because some of
+them predict *failures*. HA-1 was one such prediction; automating it (as HA-2) found the
+defect it predicted and the fix shipped with the fixture.
 
 ---
 
@@ -24,19 +25,28 @@ Base fixture: `docker-compose -f src/test/dr/docker-compose.yml up --build` — 
 container (coordinator + 2 segments, archiving per content) and a DR container sharing an
 `/archive` volume, built with `ggdr create`.
 
+Three further fixtures share that image and run one production scenario each, under their own
+compose project so they can run beside the base one:
+
+| Fixture | Production does | Scenarios |
+|---|---|---|
+| `docker-compose.maint.yml` | maintenance on its topology catalog | V-13′ |
+| `docker-compose.failover.yml` | **has mirrors** and fails a segment over | HA-2, HA-3′ |
+| `docker-compose.costandby.yml` | **has a standby coordinator** and activates it | HA-5 |
+
 ---
 
 ## Group A — Build, arm, and baseline lifecycle
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **A-1** | `ggdr create` from per-content base backups + WAL archive | Every node restored, coordinator frozen-seeded with DR-local topology, replica armed (`hot_standby`, `restore_command`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build topology check confirming the seed describes this cluster (V-21). | AUTO | PASS |
-| **A-2** | DR describes **itself**, not production | `gp_segment_configuration.hostname` on the DR reads `dr`, never production's host. The frozen-tuple seed (`xmin = FrozenTransactionId`) is unconditionally visible with no CLOG dependency, and the redo filter blocks production's records from overwriting it. | AUTO | PASS |
-| **A-3** | Production mutates `gp_segment_configuration` (hostname change) | DR value is **unchanged**. `DRRedoShouldFilter()` sees every referenced block in the protected set and skips `rm_redo`; `lastReplayedEndRecPtr` still advances, so the DR stays in LSN lock-step. | AUTO | PASS |
-| **A-4** | Redo filter is **selective** — a user table created on production *after* the base backup | Table appears on the DR. Proof the filter only skips the topology catalogs, not ordinary WAL. | AUTO | PASS |
+| **A-1** | `ggdr create` from per-content base backups + WAL archive | Every node restored, the DR-local topology written into **every** node's `$PGDATA/gg_topology`, the replica armed (`gg_topology_source = file`, `hot_standby`, `restore_command`, `recovery_target_timeline = 'latest'`, `archive_mode = off`, `standby.signal`), all nodes started in archive recovery and accepting read connections, and the post-build check confirming every node runs the file provider and the coordinator describes this cluster. | AUTO | PASS |
+| **A-2** | DR describes **itself**, not production | `gp_segment_configuration.hostname` on the DR reads `dr`, never production's host. The view resolves to the **file** provider, whose store is `$PGDATA/gg_topology` — not WAL-logged, so production's rows cannot reach it. | AUTO | PASS |
+| **A-3** | Production mutates `gp_segment_configuration` (hostname change) | The served value is **unchanged**, and — the other half, asserted in the same run — the replica's `gp_segment_configuration_internal` **does** carry production's new value. Nothing is filtered; the replayed catalog is simply not what the replica reads. | AUTO | PASS |
+| **A-4** | Production's ordinary WAL still applies — a user table created *after* the base backup | Table appears on the DR. Since P7 the replica applies production's WAL in full, so this is no longer a statement about a filter's selectivity but the baseline the whole design rests on; T6 strengthens it to a byte-level check with `wal_consistency_checking = 'all'`. | AUTO | PASS |
 | **A-5** | `create` refuses to clobber a live cluster | Aborts if any target datadir has `postmaster.pid`; refuses a non-empty datadir without `--force`. | NEW | REFUSE |
-| **A-6** | `create` with an **incomplete WAL archive** (backup's START WAL segment absent) | Aborts fail-closed *before* starting any node. Without this gate, recovery could replay the seed's forked WAL and permanently fork the timeline. | NEW | REFUSE |
-| **A-7** | `pg_wal` on the DR is **byte-identical** to production's for the same content | `pg_waldump` diff / checksum of a replayed segment matches production's archived copy. The filter changes what is *applied*, never the bytes — this is what keeps the archive reusable for production PITR and for a second DR. | NEW | PASS |
+| **A-6** | `create` with an **incomplete WAL archive** (backup's START WAL segment absent) | Aborts fail-closed *before* starting any node. This was a corruption gate while the deleted seed could fork the timeline; it is now a usability gate — without those segments a node starts and waits forever for a file that is not coming. | NEW | REFUSE |
+| **A-7** | `pg_wal` on the DR is **byte-identical** to production's for the same content | `pg_waldump` diff / checksum of a replayed segment matches production's archived copy. Trivially true now that nothing rewrites or skips records — which is what keeps the archive reusable for production PITR and for a second DR. | NEW | PASS |
 | **A-8** | Two DR replicas built from **one** archive | Both build and serve independently. No replication slot exists, so neither pins production WAL nor interferes with the other. | NEW (MANUAL) | PASS |
 | **A-9** | Segment-count mismatch (DR topology has N+1 contents) | Build must fail or the DR must refuse to serve. Per-content replay requires an exact content-count match; host layout is free. | NEW | REFUSE |
 | **A-10** | Version / block-size / checksum mismatch between clusters | Startup fails on the standard physical-replication contract checks (`CATALOG_VERSION_NO`, block size, checksums, encoding). Nothing DR-specific — but must be demonstrated to fail *loudly*, not subtly. | NEW (MANUAL) | REFUSE |
@@ -170,25 +180,38 @@ V-5 is deleted because the frozen seed that caused it no longer exists.
 
 ## Group F — Production HA events (the switchover-to-mirror question)
 
-This is the group the current fixture does not cover at all, and where the sharpest
-open question lives.
+This was the group nothing covered and where the sharpest open question lived. Both
+halves of it are now automated — `docker-compose.failover.yml` for a segment (HA-2) and
+`docker-compose.costandby.yml` for the coordinator (HA-5) — and the question they answered
+was a real defect: `ggdr create` pinned every node to `recovery_target_timeline = 'current'`,
+under which no replica can follow a promotion, and which fails by *waiting* rather than by
+erroring. It writes `'latest'` now.
 
-**Prerequisite for the whole group:** production **mirrors must archive too.** With
-`archive_mode = on` a standby does not archive; a promoted mirror starts archiving only
-once it becomes primary. Its `%c` content id is unchanged, so it writes to the same
-`wal/seg<content>/` directory the DR already reads. Reliable archiving of the
-`.history` file is equally required.
+**Prerequisite for the whole group, and it is a production-side one:** production's
+**mirrors and standby coordinator must archive too.** With `archive_mode = on` a node in
+recovery archives nothing, so a mirror stays silent until FTS promotes it and then becomes
+the node that archives that content — but only if it was configured for it beforehand, and
+by then there is nobody left to configure it. Its `%c` content id is unchanged, so it writes
+to the same `wal/seg<content>/` directory the DR already reads. Reliable archiving of the
+`.history` file is equally required; both fixtures configure archiving on every instance for
+exactly this reason.
+
+**A second production-side condition, found while automating HA-2:** a promoted **replica**
+must not archive into production's archive. `ggdr create` now arms `archive_mode = off`,
+because under `'latest'` a history file left behind by one promoted replica is the newest
+timeline the *next* replica built from that archive would follow — see §4.2.1 of the
+architecture document.
 
 | ID | Scenario | Expected behaviour & why | Status | Verdict |
 |---|---|---|---|---|
-| **HA-1** | **Production segment fails over to its mirror** (FTS promotes; that content's timeline goes 1 → 2) while the DR is attached | **Failure, confirmed by code reading** (chain traced end to end — see [HA-1 analysis](#appendix--ha-1-verified-against-the-code) below). The DR node for that content replays every TLI-1 segment the *old* primary managed to archive, then requests the next TLI-1 segment — which either was never archived (the old primary died mid-segment) or exists only as `….partial`. `restore_command` misses, and because the timeline goal is `CONTROLFILE` the node **never rescans for `00000002.history`** and never switches to TLI 2 — even though the TLI-2 segments are sitting in the same archive directory it is already reading. It retries the same missing filename every `wal_retrieve_retry_interval` **forever**. The failed restore logs at **DEBUG2** — invisible at default `log_min_messages` — so the node is **indistinguishable from a healthy DR whose production is simply idle**. **Verify at runtime, then decide:** `recovery_target_timeline = 'latest'` (HA-2), or document mirror failover as "rebuild that DR node". | NEW | **GAP** |
-| **HA-1b** | **Detecting** the HA-1 stall from the shipped observability | **Second gap: you cannot.** `rpo_seconds` grows — but it grows identically when production is idle, because it is `now() - min(pg_last_xact_replay_timestamp())`. `replay_lsn` freezes — same ambiguity. **Neither `gg_stat_dr_replica` nor `gg_stat_dr_replica_summary` exposes a timeline id**, and `pg_last_wal_replay_lsn()` does not reveal one either; you have to reach `pg_control_checkpoint()` or the archive directory listing to see that production has forked onto TLI 2 while the DR is stuck on TLI 1. Consider adding a `timeline` column to `gg_stat_dr_replica` regardless of how HA-1 is resolved. | NEW | **GAP** |
-| **HA-2** | Same as HA-1 with `recovery_target_timeline = 'latest'` and the `.history` file archived | Should work, and the archive-only case is genuinely reachable: the WAL-source state machine advances to `XLOG_FROM_STREAM` **even with no `primary_conninfo`** ("Move to XLOG_FROM_STREAM state in either case… immediate failure if we didn't launch walreceiver", `xlog.c:13337`), which is where the rescan hook lives. So a slot-less archive-only DR does reach `rescanLatestTimeLine()`, reads `00000002.history` via `restore_command`, and follows the fork. Note `recovery_target_timeline` is **`PGC_POSTMASTER`** — flipping it costs a restart of each DR node, though a restart *after* a fork still recovers (startup runs `findNewestTimeLine()`, `xlog.c:5693`). **Also check the last pre-fork segment:** the old timeline's final partial segment is archived as `….partial`, which a plain `cp`-based `restore_command` will not find. Expect either clean continuation or a stall precisely at the fork LSN — determine which, and whether `restore_command` needs `.partial` handling. | NEW `PREDICTED` | to determine |
-| **HA-3′** | The failover's topology churn (role `p`↔`m` swap, mode/status updates, `gp_configuration_history` inserts) reaching the DR | **Replayed, not filtered — and still harmless.** Those records land in the replica's `gp_segment_configuration_internal`, which nothing reads; the topology it serves comes from its own file. The scenario still passes, for the opposite reason it used to. `gp_configuration_history` in particular is now production's, which is why `ggdr promote` replaces it with a single promotion row. | **REWRITTEN (P8)** | PASS |
-| **HA-4** | `gprecoverseg` rebuilds the old primary as a mirror; later `gprecoverseg -r` rebalances back | The rebalance is a **second promotion** → another timeline increment for that content. Different contents legitimately sit on different timelines — harmless, because each content has its own independent WAL/LSN space. But it multiplies HA-1's exposure. | NEW | see HA-1/HA-2 |
-| **HA-5** | Production **coordinator** activated from its standby coordinator (`gpactivatestandby`) | Content `-1` forks its timeline — the HA-1/HA-2 analysis applies to the DR coordinator. The standby coordinator must also be archiving. | NEW `PREDICTED` | see HA-1 |
+| **HA-1** | **Production segment fails over to its mirror** (FTS promotes; that content's timeline goes 1 → 2) while the DR is attached | **Was a real gap; the cause is gone.** The chain in the [HA-1 analysis](#appendix--ha-1-verified-against-the-code) below was traced link by link and its first link — `ggdr create` arming `recovery_target_timeline = 'current'` unconditionally — no longer exists: `create` writes `'latest'` (HA-2). Honest limit on this row: the stall itself was **never reproduced at runtime**, because the configuration that causes it was removed before the fixture that would have shown it was run. What is measured is the positive case, HA-2. | **RESOLVED** | n/a — see HA-2 |
+| **HA-1b** | **Detecting** an HA-1-style stall from the shipped observability | **Still a gap.** `rpo_seconds` grows and `replay_lsn` freezes identically when production is merely idle, and **neither `gg_stat_dr_replica` nor `gg_stat_dr_replica_summary` exposes a timeline id**. The failover fixture detects the switch from outside SQL — the restored `0000000N.history` file in the node's `pg_wal`, and the startup process logging `new target timeline is N` — which is the operator workaround, not a fix. A `timeline` column on `gg_stat_dr_replica` remains the obvious addition. | NEW | **GAP** |
+| **HA-2** | Same as HA-1 with `recovery_target_timeline = 'latest'` and the `.history` file archived | **Verified end to end, and it is now the shipped configuration** (`docker-compose.failover.yml`, 23/23). Production runs with mirrors, archives on the mirrors too, and a primary is killed `-m immediate` between two restore points while the replica is paused at the earlier one; the advance across the fork is the assertion. Measured: the forked content restored `00000002.history` and logged `new target timeline is 2`, the other two nodes stayed on timeline 1, no node restarted, and the rows written *through the promoted mirror* read back. **The `.partial` question is answered: no special handling is needed.** The old timeline's last segment is archived only as `….partial`, which a plain `cp` restore_command indeed cannot fetch — but it never has to: promotion copies that segment's pre-fork bytes into the new timeline's first segment, so fetching `000000020000000000000006` yields everything. | **AUTOMATED** | PASS |
+| **HA-3′** | The failover's topology churn (role `p`↔`m` swap, mode/status updates, `gp_configuration_history` inserts) reaching the DR | **Replayed, not filtered — and still harmless**, now exercised against a real FTS failover rather than a simulated catalog edit. The failover fixture asserts both halves in the same run: the replica's `gp_segment_configuration_internal` shows the promoted dbid as primary for that content, and the topology it serves is unchanged (3 nodes, seg0 still `dr`). `gp_configuration_history` is production's, which is why `ggdr promote` replaces it with a single promotion row. | **AUTOMATED (P8 → failover fixture)** | PASS |
+| **HA-4** | `gprecoverseg` rebuilds the old primary as a mirror; later `gprecoverseg -r` rebalances back | The rebalance is a **second promotion** → another timeline increment for that content. Different contents legitimately sit on different timelines — harmless, because each content has its own independent WAL/LSN space, and HA-2 shows a replica following a fork on one content while the others stay put. Untested only in the sense that nobody has run two forks in sequence on the same content. | NEW | see HA-2 |
+| **HA-5** | Production **coordinator** activated from its standby coordinator (`gpactivatestandby`) | **Verified end to end** (`docker-compose.costandby.yml`, 25/25) — and it is the sharper case, not merely HA-1 on another content. FTS flips a segment's role in place; `segment_config_activate_standby()` (`segadmin.c`) **deletes the old coordinator's row** and promotes the standby's, so production's WAL carries the removal of the row for content `-1` — the content the replica's own coordinator occupies. Measured: the replica's catalog lost dbid 1 exactly as production's did while the topology it serves still has it, content `-1` followed onto timeline 2, both segments stayed on timeline 1, a table created *after* the activation reads back, and promotion afterwards still works (the state in which `StartupXLOG`'s DR exclusion for `needToPromoteCatalog` matters most). The standby coordinator must be archiving. | **AUTOMATED** | PASS |
 | **HA-6** | `gpexpand` adds segments to production | The DR is **invalidated** — the content count no longer matches and the expansion redistributes data cluster-wide. Expect: rebuild the DR from scratch after the expansion completes. Demonstrate that it fails clearly rather than serving wrong results. | NEW | REFUSE / rebuild |
-| **HA-7** | A production segment crashes and restarts (no failover) | No timeline change; the DR simply continues. Baseline control for HA-1 — isolates "crash" from "failover". | NEW | PASS |
+| **HA-7** | A production segment crashes and restarts (no failover) | No timeline change; the DR simply continues. Baseline control for HA-1 — isolates "crash" from "failover". Not automated; the failover fixture covers the harder case. | NEW | PASS |
 
 ---
 
@@ -297,12 +320,19 @@ once it becomes primary. Its `%c` content id is unchanged, so it writes to the s
 
 ## Appendix — HA-1 verified against the code
 
+**Status: acted on.** This analysis is what HA-2 was built to test, and step 1 below is no
+longer true of the shipped code — `ggdr create` writes `'latest'`, which makes steps 2–6
+unreachable. It is kept because it is the reasoning that found the defect, and because
+steps 5 and 6 remain the reason the failure mode was *silent*: anyone changing the timeline
+setting back should read what that buys them.
+
 The prediction that a production mirror failover silently stalls the DR was traced link by
 link. Each step is a direct code reference, not an inference:
 
-1. **The DR is armed with `'current'`, unconditionally.** `cmd_create` writes
-   `recovery_target_timeline = 'current'` into every node's `postgresql.conf`
-   (`gpMgmt/bin/ggdr:586`). There is no CLI flag to override it.
+1. ~~**The DR is armed with `'current'`, unconditionally.**~~ `cmd_create` wrote
+   `recovery_target_timeline = 'current'` into every node's `postgresql.conf`, with no CLI
+   flag to override it. **Fixed:** it writes `'latest'`, and the failover fixture asserts a
+   replica crosses the fork.
 2. **`'current'` means "do not follow forks".** `check_recovery_target_timeline()` maps the
    string to `RECOVERY_TARGET_TIMELINE_CONTROLFILE` (`guc.c:12212-12213`).
 3. **Startup pins the TLI from `pg_control`.** `findNewestTimeLine()` is called only for
@@ -350,7 +380,15 @@ history; for what the code does today see V-13′, V-20′ and V-21′ above, an
 
 ---
 
-## Appendix — V-20 verified against the code
+## Appendix — V-20 verified against the code (historical)
+
+**Superseded.** V-20 asked whether production's `VACUUM` could truncate away the DR's
+topology rows, because those rows lived in a *shared catalog the DR read*. They do not any
+more — the replica's topology is `$PGDATA/gg_topology` (P6) and the truncate guard analysed
+here was deleted with the rest of the redo filter (P7). The question inverted into V-13′:
+production may now run `VACUUM` / `VACUUM FULL` / `REINDEX` / `TRUNCATE` on its topology
+catalog with a replica attached, and `docker-compose.maint.yml` asserts the replica does not
+notice. This appendix is kept for the reasoning, not as a description of current code.
 
 The mechanism is confirmed; only the blast radius depends on runtime state.
 
@@ -395,7 +433,15 @@ measured; see the V-21 appendix below.
 
 ---
 
-## Appendix — V-21 measured on the fixture
+## Appendix — V-21 measured on the fixture (historical)
+
+**Superseded with V-20.** The measurement below is what made V-20 concrete: the DR's topology
+lived in the *same relfilenode* as production's, so production's truncate record named the
+very file holding it. The replica's topology is no longer in that relation at all, so the
+shared relfilenode is now an unremarkable consequence of physical replication rather than an
+exposure. The post-build check it named (V-21) survives in a different form: `ggdr create`
+requires every node to report `gg_topology_source = file` and the coordinator to describe
+this cluster.
 
 Run against `src/test/dr/docker-compose.yml` (production: coordinator + 2 segments, no
 mirrors; DR built by `ggdr create`). The rest of the suite passed 28/28 on
@@ -456,7 +502,11 @@ verified end to end**; see the next appendix.
 
 ---
 
-## Appendix — V-20 reproduced and fixed, end to end
+## Appendix — V-20 reproduced and fixed, end to end (historical)
+
+**Superseded, and the fixture named below no longer exists.** `docker-compose.dense.yml`
+became `docker-compose.maint.yml` in P8 and now tests the inverse property (see the previous
+appendix). Retained as the record of how the defect was reproduced and what the guard cost.
 
 `src/test/dr/docker-compose.dense.yml` + `scripts/dense-{primary,dr}-entrypoint.sh` build the
 state the default fixture cannot reach, and were run against an unguarded and a guarded build
