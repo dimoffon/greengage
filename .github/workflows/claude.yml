@@ -81,9 +81,6 @@ jobs:
           # whatever token the action resolved, and needs `pull-requests: write` above.
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-          # TEMPORARY: debugging an is_error on turn 1. Remove after diagnosis.
-          show_full_output: true
-
           # The Greengage skills, subagents and commands. The marketplace URL must end
           # in `.git`; the action rejects owner/repo shorthand and SSH URLs.
           plugin_marketplaces: "https://github.com/GreengageDB/gg-agent.git"
