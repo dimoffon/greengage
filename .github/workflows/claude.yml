@@ -10,9 +10,12 @@
 #
 # This job is NOT a required check, so it needs no branch-protection change.
 #
-# Setup, both of which need repository admin:
-#   1. Install the Claude GitHub App on this repository.
-#   2. Add the repository or organization secret ANTHROPIC_API_KEY.
+# Setup: add the repository or organization secret ANTHROPIC_API_KEY. That is all.
+#
+# The Claude GitHub App is deliberately NOT used, because installing it is not always
+# available to a repository owner. Supplying `github_token` below makes the action use
+# the workflow's own token instead: src/github/token.ts returns early on it, before the
+# OIDC exchange that would otherwise require the App.
 #
 # Try it:  comment "@claude review this for MPP correctness" on a pull request.
 
@@ -49,7 +52,9 @@ jobs:
       contents: read # review only -- Claude cannot commit
       pull-requests: write # inline comments and the summary comment
       issues: write # the action's own tracking comment
-      id-token: write # required for the action's GitHub App authentication
+      # No `id-token: write`: that is only needed for the Claude GitHub App's OIDC
+      # exchange, which `github_token` below bypasses. Add it back if you ever remove
+      # `github_token` to authenticate as the App instead.
 
     steps:
       - uses: actions/checkout@v6
@@ -66,9 +71,15 @@ jobs:
           # unprompted automation mode. Without it, the triggering comment is the
           # prompt and Claude waits to be mentioned.
 
-          # Deliberately no `github_token:` -- omitting it authenticates as the Claude
-          # GitHub App. Passing ${{ secrets.GITHUB_TOKEN }} would also stop GitHub from
-          # triggering CI on anything Claude pushes.
+          # Authenticate as the workflow itself rather than as the Claude GitHub App,
+          # so no App installation is needed. Consequences, all acceptable here:
+          #   - comments are authored by github-actions[bot], not claude[bot];
+          #   - `use_sticky_comment` would not work (left at its "false" default);
+          #   - comments by github-actions[bot] do not re-trigger workflows, which does
+          #     not matter for a review-only job that never pushes a commit.
+          # Inline review comments are unaffected -- the inline-comment MCP server uses
+          # whatever token the action resolved, and needs `pull-requests: write` above.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
           # The Greengage skills, subagents and commands. The marketplace URL must end
           # in `.git`; the action rejects owner/repo shorthand and SSH URLs.
