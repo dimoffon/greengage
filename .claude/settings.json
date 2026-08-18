@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "greengage-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "GreengageDB/gg-agent"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "greengage@greengage-agent-skills": true
+  }
+}
