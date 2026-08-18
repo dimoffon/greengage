@@ -1624,6 +1624,7 @@ _copyMotion(const Motion *from)
 
 	COPY_SCALAR_FIELD(segidColIdx);
 	COPY_SCALAR_FIELD(numHashSegments);
+	COPY_SCALAR_FIELD(numSenderSegments);
 
 	if (from->senderSliceInfo)
 	{

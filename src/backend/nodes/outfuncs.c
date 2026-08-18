@@ -1357,6 +1357,7 @@ _outMotion(StringInfo str, const Motion *node)
 	WRITE_INT_FIELD(segidColIdx);
 
 	WRITE_INT_FIELD(numHashSegments);
+	WRITE_INT_FIELD(numSenderSegments);
 
 	/* senderSliceInfo is intentionally omitted. It's only used during planning */
 

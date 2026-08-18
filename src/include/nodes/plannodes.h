@@ -1510,6 +1510,7 @@ typedef struct Motion
 	List		*hashExprs;			/* list of hash expressions */
 	Oid			*hashFuncs;			/* corresponding hash functions */
 	int         numHashSegments;	/* the module number of the hash function */
+	int			numSenderSegments;	/* number of segments actually sending */
 
 	/* For Explicit */
 	AttrNumber segidColIdx;			/* index of the segid column in the target list */
