@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "DR In Sync at a Restore Point",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "views": [
+      { "id": "wal-path", "label": "WAL path", "focus": ["prod-coord", "prod-seg", "wal-archive", "dr-coord", "dr-seg"], "note": "Every instance archives its own WAL into a per-content directory; every DR node restores from the same directory." },
+      { "id": "restore-point", "label": "Restore point", "focus": ["prod-coord", "prod-seg"], "note": "gp_create_restore_point('N') writes one XLOG_RESTORE_POINT record into every instance's WAL." },
+      { "id": "replica-state", "label": "Replica paused", "focus": ["dr-coord", "dr-seg"], "note": "Each DR node replays until the record named by gp_pause_on_restore_point_replay and pauses exactly there." }
+    ]
+  },
+  "components": [
+    { "id": "apps", "type": "external", "label": "Applications", "sublabel": "read-write SQL", "pos": [60, 150], "size": [150, 62] },
+    { "id": "prod-coord", "type": "database", "label": "Coordinator", "sublabel": "archive_mode = on", "pos": [320, 150], "size": [190, 64] },
+    { "id": "prod-seg", "type": "database", "label": "Segments seg0…segN", "sublabel": "mirrors archive too (preset)", "pos": [320, 310], "size": [190, 64] },
+    { "id": "wal-archive", "type": "cloud", "label": "WAL archive", "sublabel": "one dir per content: seg<c>/", "pos": [610, 230], "size": [180, 64] },
+    { "id": "dr-coord", "type": "database", "label": "DR coordinator", "sublabel": "hot_standby = on, paused at rp 'N'", "pos": [900, 150], "size": [200, 64] },
+    { "id": "dr-seg", "type": "database", "label": "DR segments seg0…segN", "sublabel": "paused at rp 'N'", "pos": [900, 310], "size": [200, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Production cluster (online, read-write)", "wraps": ["prod-coord", "prod-seg"] },
+    { "kind": "region", "label": "DR replica (in recovery, read-only)", "wraps": ["dr-coord", "dr-seg"] }
+  ],
+  "connections": [
+    { "id": "apps-sql", "from": "apps", "to": "prod-coord", "label": "read-write SQL" },
+    { "id": "restore-point", "from": "prod-coord", "to": "prod-seg", "label": "gp_create_restore_point('N')", "labelDy": 24 },
+    { "id": "archive-coord", "from": "prod-coord", "to": "wal-archive", "label": "archive_command", "variant": "emphasis" },
+    { "id": "archive-seg", "from": "prod-seg", "to": "wal-archive", "label": "archive_command", "variant": "emphasis" },
+    { "id": "restore-coord", "from": "wal-archive", "to": "dr-coord", "label": "restore_command (cp)", "variant": "emphasis" },
+    { "id": "restore-seg", "from": "wal-archive", "to": "dr-seg", "label": "restore_command (cp)", "variant": "emphasis" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "What 'in sync' means", "items": ["Every node has replayed to the same named restore point and paused there — that is the servable cut", "gp_pause_on_restore_point_replay matches the XLOG_RESTORE_POINT record by exact name", "At the pause the startup process freezes a local snapshot; gg_dr_switch later publishes it cluster-wide"] },
+    { "dot": "emerald", "title": "DR mode is a predicate", "items": ["IsDRReplicaMode() = hot_standby AND in recovery — no GUC or signal file to unset at promote", "ggdr create arms it: hot_standby=on, standby.signal, restore_command, gg_topology_source=file", "Plus recovery_target_timeline='latest', archive_mode=off, max_standby_*_delay=0"] },
+    { "dot": "amber", "title": "Archive and replay discipline", "items": ["%c expands to the content id — one archive dir per content; the coordinator is seg-1/", "Mirrors and standby need archive_command preset: a node in recovery archives nothing", "WAL replays in full (no redo filter); the replica never connects to production — RPO is the cut's age"] }
+  ]
+}

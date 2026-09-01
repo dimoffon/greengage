@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Switching the Served Cut",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1360, 576]
+  },
+  "participants": [
+    { "id": "op", "type": "external", "label": "Operator (ggdr)" },
+    { "id": "qd", "type": "database", "label": "DR coordinator" },
+    { "id": "seg", "type": "database", "label": "DR segments" },
+    { "id": "slot", "type": "database", "label": "Snapshot slots" }
+  ],
+  "segments": [
+    { "from": 150, "to": 228, "label": "Arm" },
+    { "from": 240, "to": 378, "label": "Resume and wait" },
+    { "from": 390, "to": 502, "label": "Publish the cut" }
+  ],
+  "messages": [
+    { "from": "op", "to": "qd", "y": 176, "label": "SELECT gg_dr_switch('N')", "variant": "emphasis" },
+    { "from": "qd", "to": "seg", "y": 210, "label": "dispatch gg_dr_switch('N'): arm pause target", "variant": "emphasis" },
+    { "from": "qd", "to": "seg", "y": 264, "label": "pg_reload_conf(), then guarded pg_wal_replay_resume()" },
+    { "from": "seg", "to": "slot", "y": 298, "label": "replay to rp 'N': freeze snapshot into pending slot" },
+    { "from": "qd", "to": "seg", "y": 332, "label": "poll: paused at 'N'?", "variant": "dashed" },
+    { "from": "seg", "to": "qd", "y": 366, "label": "paused at 'N' everywhere", "variant": "return" },
+    { "from": "qd", "to": "seg", "y": 414, "label": "dispatch gg_dr_switch('N') again: publish", "variant": "emphasis" },
+    { "from": "seg", "to": "slot", "y": 448, "label": "memcpy pending → served", "variant": "emphasis" },
+    { "from": "qd", "to": "op", "y": 482, "label": "true — cluster now serves cut 'N'", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "qd", "from": 170, "to": 488, "type": "database" },
+    { "participant": "seg", "from": 204, "to": 454, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "The horizon switch is a memcpy", "items": ["DRServedSnapshotPublish copies pending → served in each node's shared memory, iff the names match", "procarray and latestCompletedXid never move; nothing global is rewound", "Readers pick up the new image on their next GetSnapshotData() call"] },
+    { "dot": "emerald", "title": "Reads never stop", "items": ["Queries stay answerable through the whole switch — on the old cut N-1 until publish", "Publish is dispatched only after every node is paused at N: segments first, then the QD", "So no node serves N while a lagging node still serves N-1"] },
+    { "dot": "amber", "title": "Ordering rules", "items": ["Arm before resume: resuming first lets a node free-run to end of WAL", "A node already paused at 'N' is left alone; arming ahead of production is how you catch a point cleanly", "Re-running with the current point is a cheap re-publish — how a restarted node gets its image back"] }
+  ]
+}

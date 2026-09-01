@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Mirror Failover Seen from DR",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1360, 560]
+  },
+  "participants": [
+    { "id": "fts", "type": "backend", "label": "FTS (production)" },
+    { "id": "prim", "type": "database", "label": "Primary segK" },
+    { "id": "mirror", "type": "database", "label": "Mirror segK" },
+    { "id": "arch", "type": "cloud", "label": "Archive segK/" },
+    { "id": "drseg", "type": "database", "label": "DR segment K" },
+    { "id": "drcoord", "type": "database", "label": "DR coordinator" }
+  ],
+  "segments": [
+    { "from": 150, "to": 296, "label": "Failover on production" },
+    { "from": 308, "to": 458, "label": "Replica follows the fork" }
+  ],
+  "messages": [
+    { "from": "fts", "to": "prim", "y": 176, "label": "probe: no response", "variant": "dashed" },
+    { "from": "fts", "to": "mirror", "y": 210, "label": "promote the mirror", "variant": "emphasis" },
+    { "from": "mirror", "to": "arch", "y": 244, "label": "timeline T+1: .history + WAL into segK/", "variant": "emphasis" },
+    { "from": "fts", "to": "arch", "y": 278, "label": "role flip in catalog → coordinator WAL (seg-1/)", "variant": "dashed" },
+    { "from": "drseg", "to": "arch", "y": 332, "label": "restore_command polls segK/" },
+    { "from": "arch", "to": "drseg", "y": 366, "label": "0000000<T+1>.history, then WAL @ T+1", "variant": "return" },
+    { "from": "arch", "to": "drcoord", "y": 400, "label": "replayed catalog role flip (full replay, no filter)" },
+    { "from": "drcoord", "to": "drseg", "y": 434, "label": "dispatch targets unchanged", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "mirror", "from": 204, "to": 250, "type": "database" },
+    { "participant": "drseg", "from": 326, "to": 440, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Why the replica barely notices", "items": ["A promote does not change the content id — the new timeline lands in the segK/ dir the replica already reads", "recovery_target_timeline='latest': rescanLatestTimeLine adopts the fork mid-recovery, all stock code", "The old timeline's .partial segment is never needed — promotion copies the pre-fork bytes forward"] },
+    { "dot": "emerald", "title": "Topology stays local", "items": ["Production's role flip replays in full into the replica's catalog copy — and is ignored there", "gg_topology_source=file: the QD dispatches by $PGDATA/gg_topology, which nothing replicates", "Topology writes are refused during recovery: 'cannot modify the cluster topology during recovery'"] },
+    { "dot": "amber", "title": "Operational preconditions", "items": ["archive_mode + archive_command must be preset on mirrors and standby before any failover", "A node in recovery archives nothing — configured late, post-failover WAL never reaches the archive", "gpactivatestandby is the same story on the coordinator content: WAL continues into seg-1/"] }
+  ]
+}

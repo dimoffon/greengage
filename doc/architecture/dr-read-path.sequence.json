@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "DR Read Path",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1400, 624]
+  },
+  "participants": [
+    { "id": "client", "type": "external", "label": "Client" },
+    { "id": "qd", "type": "database", "label": "DR coordinator" },
+    { "id": "qe", "type": "database", "label": "Segment QE" },
+    { "id": "slot", "type": "database", "label": "Served snapshot" }
+  ],
+  "segments": [
+    { "from": 150, "to": 354, "label": "SELECT at the published cut" },
+    { "from": 366, "to": 438, "label": "Writes and locks" },
+    { "from": 450, "to": 530, "label": "Before the first cut" }
+  ],
+  "messages": [
+    { "from": "client", "to": "qd", "y": 174, "label": "SELECT …", "variant": "emphasis" },
+    { "from": "qd", "to": "qe", "y": 206, "label": "dispatch slices, is_hs_dispatch = 1", "variant": "emphasis" },
+    { "from": "qe", "to": "slot", "y": 238, "label": "GetSnapshotData() → DRServedSnapshotFill()" },
+    { "from": "slot", "to": "qe", "y": 270, "label": "frozen xmin/xmax @ rp 'N'", "variant": "return" },
+    { "from": "qe", "to": "qd", "y": 302, "label": "tuples as of rp 'N'", "variant": "return" },
+    { "from": "qd", "to": "client", "y": 334, "label": "result — its age is rpo_seconds", "variant": "return" },
+    { "from": "client", "to": "qd", "y": 390, "label": "INSERT / SELECT … FOR UPDATE", "variant": "dashed" },
+    { "from": "qd", "to": "client", "y": 422, "label": "ERROR: cannot execute … on a read-only disaster-recovery replica", "variant": "return" },
+    { "from": "client", "to": "qd", "y": 482, "label": "SELECT, no restore point reached yet", "variant": "dashed" },
+    { "from": "qd", "to": "client", "y": 514, "label": "ERROR: no restore point to serve from (checked per node)", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "qd", "from": 168, "to": 340, "type": "database" },
+    { "participant": "qe", "from": 200, "to": 308, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "One frozen image per node", "items": ["The QD ships no snapshot — each QE fills from its own served slot, frozen at the same named point", "The restore point is the cross-node agreement a distributed snapshot would otherwise provide", "The visibility-map bypass is closed: index-only scans cannot leak rows newer than the cut"] },
+    { "dot": "emerald", "title": "Standby dispatch plumbing", "items": ["The QD runs as DTX_CONTEXT_QD_STANDBY_READER: no gxid, no distributed snapshot", "IS_HOT_STANDBY_QD() picks the standby entry per content — on a DR cluster, the only 'p' row", "IS_STANDBY_QE() exemptions keep coordinator ∪ segment plans working on a writer gang"] },
+    { "dot": "amber", "title": "What is refused", "items": ["Anything but plain SELECT: rowmarks, modifying CTEs, CTAS, REFRESH — stricter than stock hot standby", "DTM backstop: 'cannot start a distributed transaction on a read-only disaster-recovery replica'", "gp_role=utility is not a data path: without dispatch a distributed table looks empty at any cut"] }
+  ]
+}

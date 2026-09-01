@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Promoting the DR Cluster",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1360, 568]
+  },
+  "participants": [
+    { "id": "op", "type": "external", "label": "Operator (ggdr)" },
+    { "id": "seg", "type": "database", "label": "DR segments" },
+    { "id": "coord", "type": "database", "label": "DR coordinator" }
+  ],
+  "segments": [
+    { "from": 150, "to": 232, "label": "Preconditions (utility mode)" },
+    { "from": 244, "to": 370, "label": "Segments first" },
+    { "from": 382, "to": 494, "label": "Coordinator, then history" }
+  ],
+  "messages": [
+    { "from": "op", "to": "seg", "y": 172, "label": "check: in recovery, paused, at rp 'N'", "variant": "dashed" },
+    { "from": "op", "to": "coord", "y": 206, "label": "check: same reached point on every node", "variant": "dashed" },
+    { "from": "op", "to": "seg", "y": 280, "label": "pg_promote(false) — arm the trigger", "variant": "emphasis" },
+    { "from": "op", "to": "seg", "y": 314, "label": "pg_wal_replay_resume()", "variant": "emphasis" },
+    { "from": "seg", "to": "op", "y": 348, "label": "in_recovery = false", "variant": "return" },
+    { "from": "op", "to": "coord", "y": 404, "label": "pg_promote(false) + resume", "variant": "emphasis" },
+    { "from": "coord", "to": "op", "y": 438, "label": "in_recovery = false — online read-write", "variant": "return" },
+    { "from": "op", "to": "coord", "y": 472, "label": "gp_configuration_history := one 'DR promoted at rp N' row" }
+  ],
+  "activations": [
+    { "participant": "seg", "from": 274, "to": 354, "type": "database" },
+    { "participant": "coord", "from": 398, "to": 478, "type": "database" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Why this exact order", "items": ["Segments before the coordinator, so its FTS finds live primaries when it starts probing", "Promote before resume: the startup process sleeps in recoveryPausesHere(); pg_promote only arms the trigger", "On wake it ends recovery right after the restore-point record it stands on — the cut is exactly rp 'N'", "The cut lands at the point replay reached, not at the one being served"] },
+    { "dot": "emerald", "title": "No restart, nothing to unset", "items": ["DR behavior is keyed on IsDRReplicaMode() = hot_standby AND in recovery — it lifts when recovery ends", "The frozen slots stay populated but unread; stat views guard DR columns behind pg_is_in_recovery()", "standby.signal stays in place; no GUC to unset, no restart"] },
+    { "dot": "amber", "title": "Deliberate non-waits", "items": ["pg_promote(false) is async — a standby QD cannot poll promoted QEs; pg_promote(true) would deadlock", "gg_dr_promote() is the SQL twin; the history rewrite is ggdr's extra step (DELETE, not TRUNCATE)", "Irreversible: recovery only moves forward; mirrors and standby come later via gprecoverseg / gpinitstandby"] }
+  ]
+}
