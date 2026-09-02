@@ -350,7 +350,7 @@ if [ -n "$sok" ]; then
 		# on answering as of the OLD point forever: what makes a node start serving
 		# a new point is the publish step, and that is only safe once every node
 		# has arrived, which only the coordinator can establish.
-		psql -p "$PORT_BASE" -d postgres -Atc "select gg_dr_switch('$1');" >/dev/null 2>&1
+		psql -p "$PORT_BASE" -d postgres -Atc "call gg_dr_switch('$1');" >/dev/null 2>&1
 	}
 	all_paused() {  # true iff EVERY node (coordinator + all segments) has replay paused
 		local nd pp
@@ -626,19 +626,39 @@ if [ -n "$sok" ]; then
 	ok7() { log "dr-test: PASS  $1"; p7=$((p7+1)); }
 	no7() { log "dr-test: FAIL  $1"; f7=$((f7+1)); }
 
-	# ask production for a fresh restore point beyond dr_rp_switch, and wait for it
+	# The switch is armed BEFORE production creates the point, and production churns
+	# -- updates, deletes, ANALYZE, VACUUM of user and catalog tables -- before it
+	# does.  That is the regression for the switch being a frozen-image reader: as a
+	# SELECT of a function, gg_dr_switch() held the image frozen at dr_rp_switch for
+	# the whole wait, and the first replayed prune or VACUUM cancelled it
+	# ("canceling statement due to conflict with recovery"), every time production
+	# was doing anything at all.  It is a procedure now and holds no snapshot while
+	# it waits; the churn replays underneath it and it must still return cleanly.
+	#
+	# The marker tells production to start churning and then create the point; the
+	# CALL is issued at once, so it is waiting while the churn replays.  Inside an
+	# explicit transaction block on purpose: CALL is legal there, and the segment leg
+	# is a dispatched procedure rather than an ALTER SYSTEM statement, which
+	# PreventInTransactionBlock would reject -- assert the usage stays legal.
 	touch "$ARCHIVE/dr_wants_promote_rp"
-	for _ in $(seq 1 300); do [ -f "$ARCHIVE/promote_rp_ready" ] && break; sleep 2; done
-
-	# Inside an explicit transaction block on purpose: the segment leg used to be a
-	# dispatched `ALTER SYSTEM`, which PreventInTransactionBlock rejects whenever the
-	# QE runs it inside the dispatched transaction.  It is a dispatched function call
-	# now, which is never subject to that check -- assert the usage stays legal.
+	conflicts_before=$(q "select confl_snapshot from pg_stat_database_conflicts where datname='postgres';")
 	r=$(dsps "begin;
-select gg_dr_switch('dr_rp_promote');
+call gg_dr_switch('dr_rp_promote');
 commit;")
-	echo "$r" | grep -qx t && ok7 "gg_dr_switch('dr_rp_promote') returned true inside a transaction block (whole cluster advanced from the coordinator)" \
-				 || no7 "gg_dr_switch returned '$r' (expected t)"
+	if echo "$r" | grep -qi "error"; then
+		no7 "gg_dr_switch('dr_rp_promote') failed inside a transaction block while production churned: $(echo "$r" | grep -i error | head -1)"
+	else
+		ok7 "gg_dr_switch('dr_rp_promote') armed before the point existed returned cleanly inside a transaction block, with production churning meanwhile"
+	fi
+	# Informational: production announces the point a few seconds after creating it,
+	# while the segments' copy of it reaches the archive on archive_timeout, so the
+	# marker is normally there first -- but that is timing, not a contract.
+	log "dr-test: production's promote_rp_ready marker $([ -f "$ARCHIVE/promote_rp_ready" ] && echo present || echo absent) when the switch returned"
+	# The coordinator's own conflict counter is what the old SELECT form moved on
+	# every failure; report it rather than assert on it, because a monitoring read
+	# of this script can legitimately be cancelled too.
+	conflicts_after=$(q "select confl_snapshot from pg_stat_database_conflicts where datname='postgres';")
+	log "dr-test: coordinator confl_snapshot before/after the switch: ${conflicts_before:-?} -> ${conflicts_after:-?}"
 	r=$(dsp "select consistent_restore_point from gg_stat_dr_replica_summary;")
 	[ "$r" = dr_rp_promote ] && ok7 "summary consistent_restore_point = dr_rp_promote after gg_dr_switch" \
 						  || no7 "summary consistent_restore_point = '$r' (expected dr_rp_promote)"

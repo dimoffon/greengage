@@ -33,6 +33,8 @@
 #include "nodes/parsenodes.h"
 #include "utils/guc.h"
 #include "utils/faultinjector.h"
+#include "utils/snapmgr.h"
+#include "storage/proc.h"
 
 /*
  * gp_create_restore_point: a distributed named point for cluster restore
@@ -319,12 +321,20 @@ gp_switch_wal(PG_FUNCTION_ARGS)
  * Apply one recovery-control step to every primary segment and to this node.
  *
  * The remote leg is a dispatched SQL command; the local leg calls the same
- * builtin directly.  Direct calls rather than SPI are deliberate: these run
- * inside a SELECT, so SPI would execute them inside a transaction block, and
- * ALTER SYSTEM refuses that (PreventInTransactionBlock in standard_ProcessUtility).
- * None of these steps writes WAL -- ALTER SYSTEM writes postgresql.auto.conf and
- * the replay-control builtins touch shared memory -- which is what makes them
- * legal on a node in recovery.
+ * builtin directly.  None of these steps writes WAL -- ALTER SYSTEM writes
+ * postgresql.auto.conf and the replay-control builtins touch shared memory --
+ * which is what makes them legal on a node in recovery.
+ *
+ * What is dispatched matters as much as what it does.  On a replica every
+ * executor snapshot is the image frozen at the served restore point, whose xmin
+ * is old by construction once replay resumes.  A statement holding one is
+ * cancelled by the first replayed prune or VACUUM that removes a row version
+ * behind that xmin (max_standby_archive_delay = 0), and is refused outright
+ * while the node has nothing to serve.  So nothing here reaches the executor on
+ * a segment: the per-node primitive is a procedure, dispatched as a CALL, which
+ * drops the snapshot its portal pushed before doing anything; and the state poll
+ * is a SHOW of a GUC computed from shared memory, which takes no snapshot at all
+ * (PlannedStmtRequiresSnapshot exempts it).
  */
 static void
 dr_dispatch(const char *cmd)
@@ -340,9 +350,9 @@ dr_dispatch(const char *cmd)
  *
  * Calls AlterSystemSetConfigFile() directly instead of executing an ALTER SYSTEM
  * statement, because standard_ProcessUtility() gates AlterSystemStmt behind
- * PreventInTransactionBlock() and every caller here is already inside one:
- * gg_dr_switch() runs inside a SELECT, and on a segment the dispatched statement
- * may be executing inside the dispatched transaction.  The underlying action is
+ * PreventInTransactionBlock() and the caller may be inside one: CALL is legal in
+ * a transaction block, and on a segment the dispatched statement may be
+ * executing inside the dispatched transaction.  The underlying action is
  * identical -- it writes the file and nothing else.
  */
 static void
@@ -366,57 +376,68 @@ dr_write_pause_target(const char *target)
 }
 
 /*
- * Run the per-node switch primitive everywhere, this node included: arm `target`
- * as the pause target, and publish the image frozen at `target` if this node has
- * one.  Both halves are idempotent, which is why the coordinator can call this
- * twice -- once to arm, once to publish after every node has arrived.
+ * Hold no snapshot from here on.
+ *
+ * The portal pushed one for this statement, and parse analysis registered a
+ * catalog snapshot.  On a replica both are the frozen image, so both publish
+ * an xmin from the served restore point, and the first replayed prune or VACUUM
+ * that removes a row version behind it cancels this backend.  A switch waits for
+ * as long as production takes to create and archive the next point, so it was
+ * cancelled by the first such record in the meantime: with any churn on
+ * production the switch failed every time, with none it always worked.
+ *
+ * Only a procedure can do this.  A function runs inside its caller's executor,
+ * whose registered snapshot cannot be released from underneath it;
+ * PortalRunUtility tolerates a procedure popping the snapshot it pushed, which
+ * is how procedures that COMMIT work.  Same problem, same shape as
+ * pg_wal_replay_wait() in PostgreSQL 17.
+ *
+ * `strict` is for the wait: REPEATABLE READ and SERIALIZABLE register the
+ * transaction snapshot for the whole transaction, and a snapshot from an
+ * enclosing function outlives us too, so neither can be made safe -- refuse
+ * rather than wait exposed.  The per-node primitive runs for microseconds and
+ * merely drops what it can.
  */
 static void
-dr_node_switch(const char *target)
+dr_release_snapshots(const char *fname, bool strict)
 {
-	char	   *cmd;
+	if (ActiveSnapshotSet())
+		PopActiveSnapshot();
+	InvalidateCatalogSnapshot();
 
-	/*
-	 * Dispatch gg_dr_switch() itself: on a segment it is the per-node primitive
-	 * (see the Gp_role check at the top of it) and returns immediately.  A
-	 * function call, not `ALTER SYSTEM ...`, because the utility statement is
-	 * rejected by PreventInTransactionBlock whenever the QE happens to run it
-	 * inside the dispatched transaction -- which depends on gang and DTX state,
-	 * so it worked in some deployments and failed in others.
-	 */
-	cmd = psprintf("SELECT pg_catalog.gg_dr_switch(%s)",
-				   quote_literal_cstr(target));
-	dr_dispatch(cmd);
-	pfree(cmd);
-
-	dr_write_pause_target(target);
+	if (strict && GetOldestSnapshot() != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s() must be called without an active or registered snapshot", fname),
+				 errdetail("On a disaster-recovery replica a snapshot is the image frozen at the served restore point; a backend holding one while replay runs is cancelled by the first row version replay removes."),
+				 errhint("CALL it directly in a READ COMMITTED transaction, not from a function and not inside a REPEATABLE READ or SERIALIZABLE transaction.")));
+	Assert(!strict || !TransactionIdIsValid(MyPgXact->xmin));
 }
 
 /*
- * Reload config, then resume replay, on every node.  Order matters: resuming
- * before the new pause target is loaded lets a node free-run to end-of-WAL.
+ * The per-node arm: point this node's pause target at `target`, have the
+ * startup process read it, and resume replay unless the node is already stopped
+ * there.
  *
- * A node that is ALREADY stopped at `target` is left alone.  Resuming it would
- * send it past a restore point it has reached, with nothing ahead to stop at --
- * and the wait loop would then never see it paused.  Nodes do get there ahead of
+ * The order is what makes it safe, and it is local to the node: the target is
+ * on disk and signalled before replay moves, so a node cannot free-run past a
+ * point it has not been told about.  The startup process handles SIGHUP before
+ * it leaves its pause loop and again before every record, so the reload lands
+ * before the next restore-point record is compared.
+ *
+ * A node ALREADY stopped at `target` is left alone.  Resuming it would send it
+ * past a restore point it has reached, with nothing ahead to stop at -- and the
+ * coordinator's wait would then never see it there.  Nodes do get there ahead of
  * a switch: one that restarted replays to its armed target on its own, and an
  * operator can drive a node by hand.
  */
 static void
-dr_reload_and_resume(const char *target)
+dr_node_arm(const char *target)
 {
-	char	   *cmd;
 	char		local[MAXFNAMELEN];
 
-	dr_dispatch("SELECT pg_catalog.pg_reload_conf()");
+	dr_write_pause_target(target);
 	DirectFunctionCall1(pg_reload_conf, (Datum) 0);
-
-	cmd = psprintf("SELECT pg_catalog.pg_wal_replay_resume() "
-				   "WHERE pg_catalog.pg_is_in_recovery() "
-				   "  AND coalesce(pg_catalog.pg_last_paused_restore_point(), '') <> %s",
-				   quote_literal_cstr(target));
-	dr_dispatch(cmd);
-	pfree(cmd);
 
 	GetPausedRestorePointName(local, sizeof(local));
 	if (RecoveryInProgress() && strcmp(local, target) != 0)
@@ -424,18 +445,61 @@ dr_reload_and_resume(const char *target)
 }
 
 /*
+ * Arm `target` on every node: the segments through the per-node procedure,
+ * then this node directly.  Dispatched as a CALL, gg_dr_switch_node() runs on
+ * the segment through ProcessUtility and never the executor, so it is neither
+ * refused for want of a served image nor cancelled for holding one.
+ */
+static void
+dr_arm_everywhere(const char *target)
+{
+	char	   *cmd;
+
+	cmd = psprintf("CALL pg_catalog.gg_dr_switch_node(%s, false)",
+				   quote_literal_cstr(target));
+	dr_dispatch(cmd);
+	pfree(cmd);
+
+	dr_node_arm(target);
+}
+
+/*
+ * Start serving the image frozen at `target` on every node: segments first,
+ * then this node, so no node serves the new point while another still serves
+ * the old.  Only the coordinator may decide this, and only once it has
+ * established that every node has arrived (dr_all_paused_at): a node that
+ * published on its own arrival would serve the new point while a lagging peer
+ * was still short of it -- the torn read, one restore point later.  That is
+ * why arming and publishing are two separate calls of the per-node procedure
+ * rather than one call that publishes whenever it happens to have the image.
+ */
+static void
+dr_publish_everywhere(const char *target)
+{
+	char	   *cmd;
+
+	cmd = psprintf("CALL pg_catalog.gg_dr_switch_node(%s, true)",
+				   quote_literal_cstr(target));
+	dr_dispatch(cmd);
+	pfree(cmd);
+
+	DRServedSnapshotPublish(target);
+}
+
+/*
  * Is every node stopped at restore point `target`?
  *
  * The per-node answer is the restore point actually *reached* (from the replayed
  * WAL record), not the configured pause target, so a node that has not got there
- * yet reports its previous point rather than the one we asked for.
+ * yet reports its previous point -- or nothing at all once it has resumed, since
+ * SetRecoveryPause(false) clears the name.
  *
- * The paused test is belt and braces.  SetRecoveryPause(false) clears the reached
- * name, so a resumed node reports '' and the name comparison alone would already
- * exclude it -- but "stopped, and stopped there" is the question actually being
- * asked, and asking it directly is what keeps this correct if that clearing ever
- * changes.  The per-node query returns no row at all unless that node is stopped,
- * which the row count check below reads as "not there yet".
+ * The segments are asked with SHOW, not SELECT.  A SHOW is one of the utility
+ * statements PlannedStmtRequiresSnapshot exempts, so it runs on a segment
+ * without ever taking the frozen image, and gg_dr_paused_restore_point's show
+ * hook reads the same shared memory this node reads directly below.  It reports
+ * '' unless the node is paused, so "stopped, and stopped there" is one string
+ * comparison.
  */
 static bool
 dr_all_paused_at(const char *target)
@@ -452,9 +516,7 @@ dr_all_paused_at(const char *target)
 	if (local[0] == '\0' || strcmp(local, target) != 0)
 		return false;
 
-	CdbDispatchCommand("SELECT coalesce(pg_catalog.pg_last_paused_restore_point(), '') "
-					   "WHERE coalesce((SELECT pg_catalog.pg_is_wal_replay_paused() "
-					   "                WHERE pg_catalog.pg_is_in_recovery()), false)",
+	CdbDispatchCommand("SHOW gg_dr_paused_restore_point",
 					   DF_CANCEL_ON_ERROR, &results);
 	for (i = 0; i < results.numResults; i++)
 	{
@@ -491,17 +553,63 @@ dr_control_precheck(const char *fname)
 }
 
 /*
- * gg_dr_switch(restore_point) -> bool
+ * gg_dr_switch_node(restore_point, publish) -- procedure
+ *
+ * The per-node half of gg_dr_switch(), which dispatches it to every segment.
+ * With publish = false it arms `restore_point` as this node's pause target and
+ * resumes replay; with publish = true it starts serving the image frozen there,
+ * if this node has one.  Two calls rather than one because only the coordinator
+ * knows when the second is safe (see dr_publish_everywhere).
+ *
+ * Refused on a coordinator in dispatch mode: there gg_dr_switch() is the right
+ * call, and this one would arm a single node of a cluster whose other nodes
+ * nobody told.  A node reached in utility mode is fine -- that is an operator
+ * driving one node by hand, which is what `ggdr switch --content` does.
+ */
+Datum
+gg_dr_switch_node(PG_FUNCTION_ARGS)
+{
+	char	   *target = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		publish = PG_GETARG_BOOL(1);
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gg_dr_switch_node() is the per-node half of gg_dr_switch()"),
+				 errhint("CALL gg_dr_switch() on the coordinator to switch the whole cluster.")));
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to call gg_dr_switch_node()")));
+	if (target[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("restore point name cannot be empty")));
+
+	dr_release_snapshots("gg_dr_switch_node", false);
+
+	if (publish)
+		DRServedSnapshotPublish(target);
+	else
+		dr_node_arm(target);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * gg_dr_switch(restore_point) -- procedure
  *
  * Stop-and-go: re-point every node's pause target at `restore_point`, resume
- * replay, and wait until all of them are paused there -- a consistent serve
- * point.  Recovery only moves forward, so `restore_point` must be one that
- * production has created (or will create) ahead of the current position;
- * arming it before production creates it is fine and is how you catch a point
- * cleanly instead of overshooting it.
+ * replay, wait until all of them are paused there -- a consistent serve point
+ * -- and then start serving it everywhere.  Recovery only moves forward, so
+ * `restore_point` must be one that production has created (or will create)
+ * ahead of the current position; arming it before production creates it is
+ * fine and is how you catch a point cleanly instead of overshooting it.
  *
- * Blocks until every node is paused there, then returns true.  There is no
- * timeout argument: see the wait loop below.  Cancel it like any other query.
+ * Blocks until every node is paused there.  There is no timeout argument: see
+ * the wait loop below.  Cancel it like any other statement.  It is a procedure
+ * and not a function so that it can wait without holding a snapshot
+ * (dr_release_snapshots), which is why it is CALLed rather than SELECTed.
  *
  * Calling it with the point the cluster is already stopped at is well defined
  * and cheap: it re-publishes the served image without resuming replay.  That is
@@ -510,32 +618,7 @@ dr_control_precheck(const char *fname)
 Datum
 gg_dr_switch(PG_FUNCTION_ARGS)
 {
-	char	   *target = text_to_cstring(PG_GETARG_TEXT_P(0));
-
-	/*
-	 * On a segment, this is the per-node primitive the coordinator dispatched:
-	 * arm the pause target and return.  The coordinator drives the rest -- the
-	 * reload, the resume and the wait are its job, not ours.
-	 */
-	if (Gp_role == GP_ROLE_EXECUTE)
-	{
-		if (!superuser())
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to call gg_dr_switch()")));
-		dr_write_pause_target(target);
-
-		/*
-		 * The coordinator dispatches this twice: once to arm the target, and
-		 * again after every node has actually paused there.  On the first pass
-		 * this node has no frozen image for `target` yet and the publish is a
-		 * no-op; on the second it flips the image live.  That ordering is the
-		 * whole point -- publishing when this node alone arrives would serve
-		 * the new point while a lagging segment is still short of it.
-		 */
-		DRServedSnapshotPublish(target);
-		PG_RETURN_BOOL(true);
-	}
+	char	   *target = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
 	dr_control_precheck("gg_dr_switch");
 	if (target[0] == '\0')
@@ -543,10 +626,11 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("restore point name cannot be empty")));
 
+	dr_release_snapshots("gg_dr_switch", true);
+
 	/*
-	 * Already stopped there?  Then this is a re-publish, not a switch: arm,
-	 * publish, done -- no reload, no resume, no round trip.  (dr_reload_and_resume
-	 * would leave these nodes alone anyway; this just says so up front.)
+	 * Already stopped there?  Then this is a re-publish, not a switch: publish,
+	 * done -- no arming, no resume, no round trip beyond the poll.
 	 *
 	 * Reaching this on purpose is how a restarted node gets its served image
 	 * back: the frozen image lives in shared memory, which the postmaster does
@@ -554,17 +638,11 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 	 */
 	if (dr_all_paused_at(target))
 	{
-		dr_node_switch(target);
-		DRServedSnapshotPublish(target);
-		PG_RETURN_BOOL(true);
+		dr_publish_everywhere(target);
+		PG_RETURN_VOID();
 	}
 
-	/*
-	 * Order matters: re-point before resuming.  Resuming first would let a node
-	 * free-run past the target to the end of the WAL.
-	 */
-	dr_node_switch(target);
-	dr_reload_and_resume(target);
+	dr_arm_everywhere(target);
 
 	/*
 	 * Wait until every node is paused there.  No timeout: how long this takes is
@@ -572,21 +650,24 @@ gg_dr_switch(PG_FUNCTION_ARGS)
 	 * caller cannot usefully guess -- and a timeout that fires leaves the target
 	 * armed anyway, so it would report a failure that is not one.  The wait is
 	 * interruptible, so pg_cancel_backend() (or Ctrl-C) is the way out.
+	 *
+	 * A poll dispatches, and a dispatch can look a catalog up -- creating a gang
+	 * checks that the user is a superuser, for one -- which registers a catalog
+	 * snapshot: the frozen image, on a replica.  Drop it before sleeping, so that
+	 * nothing old is pinned across the second spent waiting.  The microseconds
+	 * inside the dispatch are the residual exposure, and they are the same
+	 * microseconds any CALL spends between its portal pushing a snapshot and the
+	 * procedure popping it.
 	 */
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
 		if (dr_all_paused_at(target))
 		{
-			/*
-			 * Every node has the image frozen at `target`; only now is it safe
-			 * to start serving it.  Segments first, then this node, so no node
-			 * is serving the new point while another is still serving the old.
-			 */
-			dr_node_switch(target);
-			DRServedSnapshotPublish(target);
-			PG_RETURN_BOOL(true);
+			dr_publish_everywhere(target);
+			PG_RETURN_VOID();
 		}
+		InvalidateCatalogSnapshot();
 		pg_usleep(1000000L);
 	}
 }

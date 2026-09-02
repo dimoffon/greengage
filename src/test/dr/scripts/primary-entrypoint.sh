@@ -208,6 +208,27 @@ log "primary: ggdr target dr_rp_switch (gg_switch=5) created + archived"
 #     to promote the whole cluster at. ---
 log "primary: waiting for the DR to request the promote restore point ..."
 for _ in $(seq 1 600); do [ -f "$ARCHIVE/dr_wants_promote_rp" ] && break; sleep 2; done
+# The DR has armed its switch to dr_rp_promote and is waiting for it.  Churn
+# BEFORE creating the point: updates and deletes leave dead row versions, and the
+# VACUUMs -- of the user table and of the catalogs the DR coordinator carries too
+# -- ship WAL records that remove them (XLOG_HEAP2_CLEAN / CLEANUP_INFO with a
+# latestRemovedXid).  Replayed on the DR while its switch waits, those cancel any
+# backend holding the image frozen at the previous point; the switch used to be
+# one, and this is the regression that keeps it from becoming one again.  Each
+# VACUUM gets its own -c: psql wraps a multi-statement -c in one transaction and
+# VACUUM refuses to run inside one.
+psql -p "$PORT_BASE" -d postgres -q -c \
+	"create table gg_churn (id int, note text) distributed by (id); insert into gg_churn select g, 'v0' from generate_series(1,2000) g;" || true
+for round in 1 2 3; do
+	psql -p "$PORT_BASE" -d postgres -q -c "update gg_churn set note = 'v$round';" || true
+	psql -p "$PORT_BASE" -d postgres -q -c "delete from gg_churn where id % 7 = $round;" || true
+	psql -p "$PORT_BASE" -d postgres -q -c "analyze gg_churn;" || true
+	psql -p "$PORT_BASE" -d postgres -q -c "vacuum gg_churn;" || true
+done
+for cat in pg_class pg_statistic pg_attribute; do
+	psql -p "$PORT_BASE" -d postgres -q -c "vacuum $cat;" || true
+done
+log "primary: churned gg_churn (3 rounds of update/delete/analyze/vacuum) + vacuumed pg_class/pg_statistic/pg_attribute while the DR's switch waits"
 psql -p "$PORT_BASE" -d postgres -q -c \
 	"create table gg_promote (id int) distributed by (id); insert into gg_promote select generate_series(1,7);" || true
 psql -p "$PORT_BASE" -d postgres -q -c "select gp_create_restore_point('dr_rp_promote');" >/dev/null 2>&1 || true

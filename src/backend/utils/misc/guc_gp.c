@@ -24,6 +24,7 @@
 #include "access/reloptions.h"
 #include "access/transam.h"
 #include "access/url.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "cdb/cdbappendonlyam.h"
 #include "cdb/cdbendpoint.h"
@@ -552,6 +553,25 @@ static const struct config_enum_entry gp_postmaster_address_family_options[] = {
 };
 
 IndexCheckType gp_indexcheck_insert = INDEX_CHECK_NONE;
+
+/*
+ * gg_dr_paused_restore_point is never stored: its value is computed by the
+ * show hook from the startup process's shared state every time it is shown.
+ * The variable exists because a config_string needs one to point at.
+ */
+static char *gg_dr_paused_restore_point;
+
+static const char *
+show_gg_dr_paused_restore_point(void)
+{
+	static char buf[MAXFNAMELEN];
+
+	if (RecoveryInProgress() && RecoveryIsPaused())
+		GetPausedRestorePointName(buf, sizeof(buf));
+	else
+		buf[0] = '\0';
+	return buf;
+}
 
 struct config_bool ConfigureNamesBool_gp[] =
 {
@@ -4728,6 +4748,21 @@ struct config_string ConfigureNamesString_gp[] =
 		NULL, NULL, NULL
 	},
 #endif  /* ENABLE_IC_PROXY */
+
+	{
+		{"gg_dr_paused_restore_point", PGC_INTERNAL, PRESET_OPTIONS,
+			gettext_noop("The restore point this node's replay is paused at, or empty."),
+			gettext_noop("Read only.  The same fact pg_last_paused_restore_point() "
+						 "reports, exposed as a GUC so that SHOW can fetch it: SHOW "
+						 "takes no snapshot, so the coordinator of a "
+						 "disaster-recovery replica can poll every segment for it "
+						 "without a statement that a recovery conflict could cancel."),
+			GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
+		},
+		&gg_dr_paused_restore_point,
+		"",
+		NULL, NULL, show_gg_dr_paused_restore_point
+	},
 
 	{
 		{"gp_pause_on_restore_point_replay", PGC_SUSET, DEVELOPER_OPTIONS,

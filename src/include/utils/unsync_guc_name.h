@@ -121,6 +121,7 @@
 		"geqo_seed",
 		"geqo_selection_bias",
 		"geqo_threshold",
+		"gg_dr_paused_restore_point",
 		"gg_topology_source",
 		"gp_adjust_selectivity_for_outerjoins",
 		"gp_allow_non_uniform_partitioning_ddl",

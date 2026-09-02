@@ -23,6 +23,16 @@ activates its standby coordinator: both fork a timeline, the replica follows it
 (`recovery_target_timeline = 'latest'`), and it must not archive into production's archive
 while doing so. Read it before changing what `ggdr create` writes into `postgresql.conf`.
 
+**[ADR-0009 — The DR Control Plane Holds No Snapshot](0009-dr-control-plane-holds-no-snapshot.md)**
+
+Current. Why `gg_dr_switch()` is a procedure (`CALL`) and not a function, and why the
+statements it dispatches to segments are `CALL` and `SHOW` rather than `SELECT`: a
+statement holding the frozen image is cancelled by the first prune replay applies behind
+it, and the switch used to be such a statement for the whole of its wait. Also records the
+open finding that a read started after such a prune can answer *wrongly* rather than be
+cancelled (C-13). Read it before adding anything the coordinator dispatches to a replica's
+segments.
+
 Companions, both current:
 
 - [`../greengage-dr-read-replica.md`](../greengage-dr-read-replica.md) — how the mechanisms

@@ -120,17 +120,17 @@ ADVANCE_TIMEOUT=${ADVANCE_TIMEOUT:-420}
 advance() {
 	local out rc
 	if out=$(timeout "$ADVANCE_TIMEOUT" psql -p "$PORT_BASE" -d postgres -Atc \
-			"select gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
+			"call gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
 	if [ "$rc" = 124 ]; then
 		log "fo-dr: gg_dr_switch('$1') did not return within ${ADVANCE_TIMEOUT}s"
 		return 1
 	fi
-	if [ "$rc" != 0 ] || [ "$out" != t ]; then
+	if [ "$rc" != 0 ] || echo "$out" | grep -qi "error"; then
 		log "fo-dr: gg_dr_switch('$1') -> rc=$rc out='$out' (retrying once)"
 		if out=$(timeout "$ADVANCE_TIMEOUT" psql -p "$PORT_BASE" -d postgres -Atc \
-				"select gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
+				"call gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
 		log "fo-dr: gg_dr_switch('$1') retry -> rc=$rc out='$out'"
-		[ "$rc" = 0 ] && [ "$out" = t ] || return 1
+		[ "$rc" = 0 ] && ! echo "$out" | grep -qi "error" || return 1
 	fi
 	return 0
 }

@@ -759,7 +759,8 @@ each host:
 
 | Function | Purpose |
 |---|---|
-| `gg_dr_switch(restore_point text)` → `bool` | Re-point every node's pause target at `restore_point`, resume replay, and wait until all of them are paused there. Returns `true` at the consistent cut, `false` on timeout (the arming has still been applied — keep watching `gg_stat_dr_replica_summary`). |
+| `CALL gg_dr_switch(restore_point text)` | Re-point every node's pause target at `restore_point`, resume replay, wait until all of them are paused there, then start serving that cut everywhere. A **procedure**, not a function, so that it can wait without holding a snapshot: on a replica every snapshot is the image frozen at the served point, and a backend holding one is cancelled by the first prune replay applies behind it — which is what the earlier `SELECT gg_dr_switch()` form suffered on every switch that overlapped production activity ([ADR-0009](adr/0009-dr-control-plane-holds-no-snapshot.md)). Returns when the cut is consistent; cancel it like any statement (the arming stays applied — `ggdr switch` says so). Refused inside `REPEATABLE READ`/`SERIALIZABLE` and from within a function, where the snapshot cannot be dropped. |
+| `CALL gg_dr_switch_node(restore_point text, publish bool)` | The per-node half the coordinator dispatches to each segment: arm the pause target (`false`) or start serving the image frozen there (`true`). Refused on a coordinator in dispatch mode; usable by hand on one node in utility mode. |
 | `gg_dr_promote()` → `bool` | Promote the whole cluster at its current consistent restore point. Refuses unless every node is paused at one point, equal to `at_restore_point` when given. Irreversible. |
 
 Status has no function of its own: `gg_stat_dr_replica` and `gg_stat_dr_replica_summary`
@@ -767,18 +768,26 @@ Status has no function of its own: `gg_stat_dr_replica` and `gg_stat_dr_replica_
 a second thing to keep in step.
 
 ```sql
-SELECT gg_dr_switch('rp_hourly_43');   -- advance the cluster, wait for the cut
+CALL gg_dr_switch('rp_hourly_43');     -- advance the cluster, wait for the cut
 SELECT * FROM gg_stat_dr_replica_summary;   -- confirm consistent_restore_point
 SELECT gg_dr_promote();            -- promote here
 ```
 
 Both are superuser-only, must run on the coordinator in dispatch mode, and refuse outright
 on a cluster that is not in recovery. Each applies its step to every primary segment with
-`CdbDispatchCommand()` and to the coordinator through SPI, so the two legs take the same
-path a client would. The steps themselves are the same ones `ggdr` performs —
-`ALTER SYSTEM` on the pause GUC, `pg_reload_conf()`, `pg_wal_replay_resume()`, and for
-promotion `pg_promote(false)` — and they are legal in recovery because none of them writes
-WAL: `ALTER SYSTEM` writes `postgresql.auto.conf` and the rest touch shared memory only.
+`CdbDispatchCommand()` and to the coordinator by calling the same builtin directly. The
+steps themselves are the same ones `ggdr` performs — `ALTER SYSTEM` on the pause GUC,
+`pg_reload_conf()`, `pg_wal_replay_resume()`, and for promotion `pg_promote(false)` — and
+they are legal in recovery because none of them writes WAL: `ALTER SYSTEM` writes
+`postgresql.auto.conf` and the rest touch shared memory only.
+
+What the switch dispatches is chosen so that no statement on a segment ever holds the
+frozen image: the per-node step is `CALL gg_dr_switch_node(...)`, a procedure that drops
+the snapshot its portal pushed before it does anything, and the poll is
+`SHOW gg_dr_paused_restore_point`, a read-only GUC whose show hook reads the startup
+process's shared state — `SHOW` is one of the utility statements that take no snapshot at
+all. Neither goes through the executor, so neither is refused while a node has nothing to
+serve, and neither can be cancelled by a recovery conflict.
 
 Ordering matters in both, and is the reason these are functions rather than a documented
 recipe: `switch` must re-point *before* resuming, or a node free-runs past the target to the
@@ -1020,7 +1029,10 @@ $ ggdr create -t /archive/dr_topology.tsv \
 - `gg_stat_dr_replica` (view, `pg_catalog`) — per-node recovery state.
 - `gg_stat_dr_replica_summary` (view, `pg_catalog`) — cluster rollup incl.
   `consistent_restore_point`, `rpo_seconds`.
-- `gg_dr_switch(text)` → `bool` (OID 7017) — advance the cluster to a restore point.
+- `gg_dr_switch(text)` procedure (OID 7017) — advance the cluster to a restore point;
+  `CALL` it. `gg_dr_switch_node(text, bool)` procedure (OID 7021) is its per-node half.
+- `gg_dr_paused_restore_point` (read-only GUC) — the point this node is paused at, or
+  empty; what the coordinator `SHOW`s on each segment while a switch waits.
 - `gg_dr_promote()` → `bool` (OID 7018) — promote at the current cut.
 
 ### 10.4 Test fixture

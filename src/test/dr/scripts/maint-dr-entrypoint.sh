@@ -114,11 +114,11 @@ advance() {
 	# `out=$(cmd); rc=$?` does NOT work under set -e: the assignment itself is the
 	# failing command, so the shell exits before rc=$? runs.  Putting the
 	# assignment in an `if` condition is what makes the failure catchable.
-	if out=$(psql -p "$PORT_BASE" -d postgres -Atc "select gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
-	if [ "$rc" != 0 ] || [ "$out" != t ]; then
+	if out=$(psql -p "$PORT_BASE" -d postgres -Atc "call gg_dr_switch('$1');" 2>&1); then rc=0; else rc=$?; fi
+	if [ "$rc" != 0 ] || echo "$out" | grep -qi "error"; then
 		log "maint-dr: gg_dr_switch('$1') -> rc=$rc out='$out' (retrying once)"
 		sleep 10
-		out=$(psql -p "$PORT_BASE" -d postgres -Atc "select gg_dr_switch('$1');" 2>&1) || true
+		out=$(psql -p "$PORT_BASE" -d postgres -Atc "call gg_dr_switch('$1');" 2>&1) || true
 		log "maint-dr: gg_dr_switch('$1') retry -> '$out'"
 	fi
 	return 0

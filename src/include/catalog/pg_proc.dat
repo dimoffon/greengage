@@ -6103,10 +6103,16 @@
   prosrc => 'pg_last_served_restore_point_time' },
 
 # Greengage DR: cluster-wide recovery control (see xlogfuncs_gp.c).
-{ oid => '7017', descr => 'advance the whole DR cluster to a restore point and pause there',
-  proname => 'gg_dr_switch', provolatile => 'v', proparallel => 'u',
-  prorettype => 'bool', proargtypes => 'text',
+{ oid => '7017',
+  descr => 'advance the whole DR cluster to a restore point and serve it there; a procedure so that it waits without holding a snapshot',
+  proname => 'gg_dr_switch', prokind => 'p', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'text',
   prosrc => 'gg_dr_switch' },
+{ oid => '7021',
+  descr => 'per-node half of gg_dr_switch(): arm the pause target (false) or publish the frozen image (true); dispatched by the coordinator',
+  proname => 'gg_dr_switch_node', prokind => 'p', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'text bool',
+  prosrc => 'gg_dr_switch_node' },
 
 { oid => '7018', descr => 'promote the DR cluster to online read-write at its current restore point',
   proname => 'gg_dr_promote', provolatile => 'v', proparallel => 'u',

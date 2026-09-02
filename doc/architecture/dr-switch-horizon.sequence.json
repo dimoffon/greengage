@@ -20,7 +20,7 @@
     { "from": 390, "to": 502, "label": "Publish the cut" }
   ],
   "messages": [
-    { "from": "op", "to": "qd", "y": 176, "label": "SELECT gg_dr_switch('N')", "variant": "emphasis" },
+    { "from": "op", "to": "qd", "y": 176, "label": "CALL gg_dr_switch('N')", "variant": "emphasis" },
     { "from": "qd", "to": "seg", "y": 210, "label": "dispatch gg_dr_switch('N'): arm pause target", "variant": "emphasis" },
     { "from": "qd", "to": "seg", "y": 264, "label": "pg_reload_conf(), then guarded pg_wal_replay_resume()" },
     { "from": "seg", "to": "slot", "y": 298, "label": "replay to rp 'N': freeze snapshot into pending slot" },

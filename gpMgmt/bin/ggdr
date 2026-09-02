@@ -15,7 +15,7 @@ taken while replay advances have no cross-node guarantee to offer.
 The cluster-wide steps below are also available as SQL, so a client that can
 reach only the coordinator can drive recovery without this tool:
 
-    SELECT gg_dr_switch('rp_hourly_42');      -- advance + wait, cluster-wide
+    CALL gg_dr_switch('rp_hourly_42');        -- advance + wait, cluster-wide
     SELECT gg_dr_promote();                   -- promote at the current cut
     SELECT * FROM gg_stat_dr_replica_summary; -- status
 
@@ -182,7 +182,16 @@ def node_state(content, address, port):
         "          where pg_is_in_recovery())::text,'');"
         % {"s": FIELDSEP}
     )
-    rc, out, err = _psql(port, sql, host=host)
+    # A utility-mode read on a replica answers from the image frozen at the served
+    # point, so while this node replays it can be cancelled ("canceling statement
+    # due to conflict with recovery") just like any other read.  Everything asked
+    # for here lives in shared memory, so asking again is always right -- a
+    # bounded retry turns a spurious UNREACHABLE into the answer.
+    for attempt in range(3):
+        rc, out, err = _psql(port, sql, host=host)
+        if rc == 0 or "conflict with recovery" not in err:
+            break
+        time.sleep(0.2)
     if rc != 0 or not out:
         return {"content": content, "ok": False, "err": err or "no response"}
     parts = (out.split(FIELDSEP) + [""] * 7)[:7]
@@ -333,15 +342,21 @@ def cmd_switch(restore_point, contents=None):
     # the new point while the slow ones still served the old one.
     print("ggdr switch: waiting for every node to reach '%s' "
           "(no timeout -- Ctrl-C cancels) ..." % restore_point)
+    # CALL, not SELECT: gg_dr_switch() is a procedure so that it can drop its
+    # snapshot before waiting.  A function's snapshot is the image frozen at the
+    # served point, and holding one while replay runs gets the backend cancelled
+    # by the first replayed prune -- which is what a SELECT form did, on every
+    # switch that overlapped production activity.  A procedure returns nothing,
+    # so success is psql's exit status (ON_ERROR_STOP=1 makes any ERROR non-zero).
     quoted = restore_point.replace("'", "''")
     rc, out, err = _psql_dispatch_watched(
-        "select pg_catalog.gg_dr_switch('%s');" % quoted, nodes, restore_point)
-    if rc == 0 and out in ("t", "true"):
+        "call pg_catalog.gg_dr_switch('%s');" % quoted, nodes, restore_point)
+    if rc == 0 and "ERROR" not in err:
         print("ggdr switch: DONE -- all %d node(s) paused at '%s' "
               "(consistent serve point)" % (len(nodes), restore_point))
         return 0
     print("ggdr switch: FAILED -- %s"
-          % (err.splitlines()[0] if err else "gg_dr_switch() did not report success"))
+          % (err.splitlines()[0] if err else "gg_dr_switch() exited %d" % rc))
     states = [node_state(*n) for n in nodes]
     for s in states:
         if s["ok"]:
@@ -406,11 +421,12 @@ def cmd_switch_content(restore_point, targets):
     DRServedSnapshotPublishIfNothingServed) -- and such a node is refused here, so
     every node this touches already has an image and keeps the one it has.
 
-    gg_dr_switch() itself is not reachable per node -- on a segment it is the
-    dispatched primitive (Gp_role == GP_ROLE_EXECUTE), and a utility-mode caller
-    lands in dr_control_precheck(), which refuses anything that is not a
-    coordinator in dispatch mode.  So the steps are spelled out here in SQL, in
-    the same order and with the same guards the backend uses.
+    gg_dr_switch() itself is not reachable per node: a utility-mode caller lands
+    in dr_control_precheck(), which refuses anything that is not a coordinator in
+    dispatch mode.  Its per-node half, gg_dr_switch_node(), is CALLable on a node
+    in utility mode, but it arms and returns -- the wait is the coordinator's job
+    -- so the steps are spelled out here in SQL, in the same order and with the
+    same guards the backend uses, followed by the wait this command adds.
     """
     if not restore_point:
         sys.exit("ggdr switch: restore point name cannot be empty.")
