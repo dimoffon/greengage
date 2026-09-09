@@ -214,10 +214,10 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1802110)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307144)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1802110)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307144)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -273,6 +273,32 @@ NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: sum(double precision)
          ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
 (5 rows)
+
+-- a projection DuckDB cannot compute (upper) is computed by the executor in
+-- the leaf; the aggregates above it are regions
+EXPLAIN (COSTS OFF) SELECT upper(note) AS u, count(*), sum(qty) FROM d_orders GROUP BY 1;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c2) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (upper(d_orders.note))
+               ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(7 rows)
+
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT upper(note) AS u, count(*) AS n, sum(qty) AS s FROM d_orders GROUP BY 1 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'u' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'u' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ d_check 
+---------
+ 0 | 0
+(1 row)
 
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;

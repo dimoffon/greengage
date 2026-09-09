@@ -736,8 +736,30 @@ gg_duckdb_post_planner(PlannedStmt *stmt, Query *parse, int cursorOptions,
 		stmt->planTree = (Plan *) wrap_mutator((Node *) stmt->planTree, &ctx);
 	else
 	{
+		ListCell   *lc;
+		int			i = 0;
+
 		ctx.hints = gg_duckdb_hints_collect(parse, stmt);
 		stmt->planTree = (Plan *) pass_mutator((Node *) stmt->planTree, &ctx);
+
+		/*
+		 * InitPlans and correlated subqueries are plans of their own, each
+		 * rooted in the slice subplan_sliceIds names (-1: never dispatched).
+		 * A region in a correlated one is rescanned with each new value of
+		 * its parameters.
+		 */
+		foreach(lc, stmt->subplans)
+		{
+			Plan	   *sub = (Plan *) lfirst(lc);
+
+			if (sub != NULL)
+			{
+				ctx.slice = stmt->subplan_sliceIds ? stmt->subplan_sliceIds[i] : -1;
+				ctx.parent = NULL;
+				lfirst(lc) = pass_mutator((Node *) sub, &ctx);
+			}
+			i++;
+		}
 		gg_duckdb_hints_report(ctx.hints);
 	}
 

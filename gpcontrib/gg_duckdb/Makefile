@@ -10,7 +10,7 @@ OBJS = src/gg_duckdb.o src/guc.o src/instance.o src/funcs.o src/types.o src/leaf
 EXTENSION = gg_duckdb
 DATA = gg_duckdb--1.0.sql
 
-REGRESS = setup basic region deparse joins hints foreign teardown
+REGRESS = setup basic region deparse joins hints foreign params teardown
 
 with_llvm = no
 

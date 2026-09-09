@@ -34,6 +34,7 @@ bool		gg_duckdb_reserve_memory = true;
 bool		gg_duckdb_strict = false;
 char	   *gg_duckdb_data_directories = NULL;
 char	   *gg_duckdb_http_proxy = NULL;
+bool		gg_duckdb_allow_float_aggregates = false;
 double		gg_duckdb_cost_fixed = 50.0;
 double		gg_duckdb_cost_convert_row = 0.001;
 double		gg_duckdb_cost_convert_byte = 0.0003;
@@ -248,6 +249,15 @@ gg_duckdb_define_gucs(void)
 							   PGC_SUSET,
 							   GUC_GPDB_NEED_SYNC,
 							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.allow_float_aggregates",
+							 "Let DuckDB compute sum and avg of float4/float8, whose result depends on the order of summation.",
+							 "Off by default: the last bits of such sums differ from the standard executor's.",
+							 &gg_duckdb_allow_float_aggregates,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("gg_duckdb");
 }

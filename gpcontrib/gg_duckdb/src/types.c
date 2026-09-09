@@ -331,19 +331,66 @@ scaled_to_numeric_text(int128 v, int scale)
 
 /* ---------- writing a Datum into row `row` of a DuckDB vector ---------- */
 
+/* DuckDB's validity mask: one bit per row, 64 rows per word, set = valid. */
+static inline void
+validity_set(uint64_t *validity, idx_t row, bool valid)
+{
+	uint64_t   *word = &validity[row / 64];
+	uint64_t	bit = UINT64CONST(1) << (row % 64);
+
+	if (valid)
+		*word |= bit;
+	else
+		*word &= ~bit;
+}
+
 /*
- * `data` is duckdb_vector_get_data(vec); `validity` was made writable by the
- * caller.  Strings go through the vector's own heap.
+ * Resolve the vector's data and validity (made writable here) and, for a
+ * numeric aggregate state, its children's, so that rows can be written
+ * without calling DuckDB.
  */
 void
-gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
-					  uint64_t *validity, idx_t row, Datum d, bool isnull)
+gg_duckdb_vector_target(duckdb_vector vec, const GGTypeInfo *ti, GGVectorTarget *t)
 {
+	memset(t, 0, sizeof(*t));
+	t->vec = vec;
+	t->data = duckdb_vector_get_data(vec);
+	duckdb_vector_ensure_validity_writable(vec);
+	t->validity = duckdb_vector_get_validity(vec);
+	if (ti->duck == DUCKDB_TYPE_STRUCT)
+	{
+		duckdb_vector sv = duckdb_struct_vector_get_child(vec, 0);
+		duckdb_vector nv = duckdb_struct_vector_get_child(vec, 1);
+
+		t->sum_data = duckdb_vector_get_data(sv);
+		duckdb_vector_ensure_validity_writable(sv);
+		t->sum_validity = duckdb_vector_get_validity(sv);
+		t->count_data = duckdb_vector_get_data(nv);
+	}
+}
+
+/*
+ * Write one value.  Everything is a plain memory write into the target
+ * except strings, which are handed back through `str`/`len` (pointing into
+ * the datum, which the caller keeps alive) for the caller to give DuckDB
+ * once it is outside its PG_TRY block: DuckDB's string heap allocates, and
+ * an allocation failure is a C++ exception that would unwind through the
+ * block and leave PostgreSQL's exception stack pointing into a dead frame.
+ */
+void
+gg_duckdb_write_datum(const GGTypeInfo *ti, const GGVectorTarget *t, idx_t row,
+					  Datum d, bool isnull, const char **str, int *len)
+{
+	void	   *data = t->data;
+
+	*str = NULL;
+	*len = -1;
 	if (isnull)
 	{
-		duckdb_validity_set_row_invalid(validity, row);
+		validity_set(t->validity, row, false);
 		return;
 	}
+	validity_set(t->validity, row, true);
 
 	switch (ti->duck)
 	{
@@ -388,24 +435,19 @@ gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
 		case DUCKDB_TYPE_STRUCT:
 			{
 				/* a numeric aggregate state: sum and count children */
-				duckdb_vector sv = duckdb_struct_vector_get_child(vec, 0);
-				duckdb_vector nv = duckdb_struct_vector_get_child(vec, 1);
-				duckdb_hugeint *h = &((duckdb_hugeint *) duckdb_vector_get_data(sv))[row];
+				duckdb_hugeint *h = &((duckdb_hugeint *) t->sum_data)[row];
 				bool		sum_null;
 				int128		sum;
 				int64		n;
 
 				numeric_state_unpack(d, ti->scale, &sum_null, &sum, &n);
-				duckdb_vector_ensure_validity_writable(sv);
-				if (sum_null)
-					duckdb_validity_set_row_invalid(duckdb_vector_get_validity(sv), row);
-				else
+				validity_set(t->sum_validity, row, !sum_null);
+				if (!sum_null)
 				{
-					duckdb_validity_set_row_valid(duckdb_vector_get_validity(sv), row);
 					h->lower = (uint64) (sum & 0xffffffffffffffffULL);
 					h->upper = (int64) (sum >> 64);
 				}
-				((int64 *) duckdb_vector_get_data(nv))[row] = n;
+				((int64 *) t->count_data)[row] = n;
 				break;
 			}
 		case DUCKDB_TYPE_VARCHAR:
@@ -413,12 +455,13 @@ gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
 			{
 				struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
 				const char *p = VARDATA_ANY(v);
-				int			len = VARSIZE_ANY_EXHDR(v);
+				int			l = VARSIZE_ANY_EXHDR(v);
 
 				/* bpchar: the blank padding is not part of the value */
 				if (ti->typid == BPCHAROID)
-					len = bpchartruelen((char *) p, len);
-				duckdb_vector_assign_string_element_len(vec, row, p, len);
+					l = bpchartruelen((char *) p, l);
+				*str = p;
+				*len = l;
 				break;
 			}
 		case DUCKDB_TYPE_DATE:

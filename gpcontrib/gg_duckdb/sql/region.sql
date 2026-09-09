@@ -73,7 +73,7 @@ SELECT id FROM region_types WHERE 1 / (id - 3) > 0 ORDER BY id;
 SELECT count(*) FROM region_big;
 
 -- a DuckDB-side error inside the region is an error, never a short result
-SET gg_duckdb.debug_region_sql = 'SELECT c1 + 2147483647 AS c1, c2 FROM gg_leaf(0)';
+SET gg_duckdb.debug_region_sql = 'SELECT c1 + 2147483644 AS c1, c2 FROM gg_leaf(0)';
 SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;
 SET gg_duckdb.debug_region_sql = 'SELECT c1::VARCHAR AS c1, c2 FROM gg_leaf(0)';
 SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;

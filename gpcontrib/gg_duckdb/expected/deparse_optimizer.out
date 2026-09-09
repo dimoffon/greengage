@@ -198,10 +198,10 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1797757)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307487)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1797757)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307487)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -257,6 +257,33 @@ NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: sum(double precision)
          ->  Seq Scan on d_orders
  Optimizer: GPORCA
 (5 rows)
+
+-- a projection DuckDB cannot compute (upper) is computed by the executor in
+-- the leaf; the aggregates above it are regions
+EXPLAIN (COSTS OFF) SELECT upper(note) AS u, count(*), sum(qty) FROM d_orders GROUP BY 1;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(sum(n1.c2) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c2) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region_1.u
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(9 rows)
+
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT upper(note) AS u, count(*) AS n, sum(qty) AS s FROM d_orders GROUP BY 1 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
 
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;

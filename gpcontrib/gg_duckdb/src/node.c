@@ -305,8 +305,18 @@ region_begin(CustomScanState *node, EState *estate, int eflags)
 		node->ss.ps.cdbexplainfun = region_explain_end;
 	}
 
-	gg_duckdb_query_set_output(&st->q, node->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
-							   st->q.outtypes, st->q.ncols, NULL);
+	{
+		TupleDesc	desc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+		int		   *colmap = NULL;
+
+		if (desc->natts == 0 && st->q.ncols == 1)
+		{
+			/* a region without columns: the placeholder column is discarded */
+			colmap = palloc(sizeof(int));
+			colmap[0] = -1;
+		}
+		gg_duckdb_query_set_output(&st->q, desc, st->q.outtypes, st->q.ncols, colmap);
+	}
 }
 
 /*

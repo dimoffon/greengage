@@ -22,6 +22,10 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/vmem_tracker.h"
+#include "utils/faultinjector.h"
+#include "executor/execExpr.h"
+#include "executor/nodeSubplan.h"
+#include "nodes/makefuncs.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -45,6 +49,28 @@ gg_duckdb_query_release_query(GGDuckQuery *q)
 		duckdb_destroy_prepare(&q->stmt);
 	q->pending = NULL;
 	q->stmt = NULL;
+	q->prepared_sql = NULL;
+	q->chunk_size = 0;
+	q->chunk_row = 0;
+}
+
+/* The execution only: the connection and the prepared statement stay. */
+static void
+release_execution(GGDuckQuery *q)
+{
+	if (q->chunk)
+	{
+		duckdb_destroy_data_chunk(&q->chunk);
+		q->chunk = NULL;
+	}
+	if (q->has_result)
+	{
+		duckdb_destroy_result(&q->result);
+		q->has_result = false;
+	}
+	if (q->pending)
+		duckdb_destroy_pending(&q->pending);
+	q->pending = NULL;
 	q->chunk_size = 0;
 	q->chunk_row = 0;
 }
@@ -165,7 +191,85 @@ gg_duckdb_query_raise(GGDuckQuery *q, const char *what, const char *msg)
 			 errmsg("gg_duckdb: %s: %s", what, msg ? msg : "unknown error")));
 }
 
-/* Bind the constants as $1..$n and the file lists after them. */
+/*
+ * The value of an executor parameter the deparser turned into $n: an
+ * InitPlan's result (PARAM_EXEC, dispatched to the segments, or evaluated
+ * here when its plan sits in this process) or a prepared statement's
+ * argument (PARAM_EXTERN), as a Const of the parameter's type.
+ */
+static Const *
+param_value(GGDuckQuery *q, Param *param)
+{
+	EState	   *estate = q->ps ? q->ps->state : NULL;
+	Datum		value = (Datum) 0;
+	bool		isnull = true;
+	int16		typlen;
+	bool		typbyval;
+
+	if (estate == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("gg_duckdb: a parameter reference outside a plan")));
+	if (param->paramkind == PARAM_EXEC)
+	{
+		ParamExecData *prm;
+		int			nexec = estate->es_plannedstmt ?
+		list_length(estate->es_plannedstmt->paramExecTypes) : 0;
+
+		if (param->paramid < 0 || param->paramid >= nexec)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("gg_duckdb: executor parameter %d is out of range", param->paramid)));
+		prm = &estate->es_param_exec_vals[param->paramid];
+		if (prm->execPlan != NULL)
+		{
+			/* an InitPlan of this process not run yet: run it, as ExecEvalParamExec does */
+			ExecSetParamPlan((SubPlanState *) prm->execPlan, q->ps->ps_ExprContext, NULL);
+			if (prm->execPlan != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("gg_duckdb: InitPlan of parameter %d did not run", param->paramid)));
+		}
+		value = prm->value;
+		isnull = prm->isnull;
+	}
+	else if (param->paramkind == PARAM_EXTERN)
+	{
+		ParamListInfo params = estate->es_param_list_info;
+		ParamExternData *prm;
+		ParamExternData prmdata;
+
+		if (params == NULL || param->paramid < 1 || param->paramid > params->numParams)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("gg_duckdb: no value found for parameter %d", param->paramid)));
+		if (params->paramFetch != NULL)
+			prm = params->paramFetch(params, param->paramid, false, &prmdata);
+		else
+			prm = &params->params[param->paramid - 1];
+		if (!OidIsValid(prm->ptype))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("gg_duckdb: no value found for parameter %d", param->paramid)));
+		if (prm->ptype != param->paramtype)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("gg_duckdb: type of parameter %d (%s) does not match that when preparing the plan (%s)",
+							param->paramid, format_type_be(prm->ptype), format_type_be(param->paramtype))));
+		value = prm->value;
+		isnull = prm->isnull;
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gg_duckdb: unsupported parameter kind %d", (int) param->paramkind)));
+
+	get_typlenbyval(param->paramtype, &typlen, &typbyval);
+	return makeConst(param->paramtype, param->paramtypmod, param->paramcollid,
+					 typlen, isnull ? (Datum) 0 : value, isnull, typbyval);
+}
+
+/* Bind the constants and executor parameters as $1..$n, the file lists after them. */
 static void
 bind_params(GGDuckQuery *q)
 {
@@ -174,8 +278,13 @@ bind_params(GGDuckQuery *q)
 
 	foreach(lc, q->params)
 	{
-		Const	   *c = (Const *) lfirst(lc);
+		Const	   *c;
 		duckdb_state rc;
+
+		if (IsA(lfirst(lc), Param))
+			c = param_value(q, (Param *) lfirst(lc));
+		else
+			c = (Const *) lfirst(lc);
 
 		if (c->constisnull)
 			rc = duckdb_bind_null(q->stmt, idx);
@@ -363,33 +472,49 @@ gg_duckdb_query_start(GGDuckQuery *q, GGBindContext *bctx)
 				i;
 	GGBindContext *saved_bctx;
 
-	q->conn = gg_duckdb_connect();
+	SIMPLE_FAULT_INJECTOR("gg_duckdb_query_start");
+	/*
+	 * A rescan keeps the connection and, when the text is unchanged, the
+	 * prepared statement: only the parameters are bound again.
+	 */
+	if (q->conn == NULL)
+		q->conn = gg_duckdb_connect();
+	if (q->stmt != NULL && (q->prepared_sql == NULL || strcmp(q->prepared_sql, q->sql) != 0))
+	{
+		duckdb_destroy_prepare(&q->stmt);
+		q->stmt = NULL;
+		q->prepared_sql = NULL;
+	}
 	saved_bctx = gg_duckdb_bind_context_push(bctx);
 
 	PG_TRY();
 	{
 		ListCell   *lc;
 
-		query_memory(q);
-		foreach(lc, q->pre_sql)
-		{
-			const char *pre = (const char *) lfirst(lc);
-			duckdb_result res;
-
-			if (duckdb_query(q->conn, pre, &res) == DuckDBError)
-			{
-				const char *msg = duckdb_result_error(&res);
-				char	   *copy = pstrdup(msg ? msg : "unknown error");
-
-				duckdb_destroy_result(&res);
-				gg_duckdb_query_raise(q, pre, copy);
-			}
-			duckdb_destroy_result(&res);
-		}
-
-		q->stmt = gg_duckdb_prepare_with(bctx, q->conn, q->sql, &err);
 		if (q->stmt == NULL)
-			gg_duckdb_query_raise(q, psprintf("could not prepare the %s query", q->what), err);
+		{
+			query_memory(q);
+			foreach(lc, q->pre_sql)
+			{
+				const char *pre = (const char *) lfirst(lc);
+				duckdb_result res;
+
+				if (duckdb_query(q->conn, pre, &res) == DuckDBError)
+				{
+					const char *msg = duckdb_result_error(&res);
+					char	   *copy = pstrdup(msg ? msg : "unknown error");
+
+					duckdb_destroy_result(&res);
+					gg_duckdb_query_raise(q, pre, copy);
+				}
+				duckdb_destroy_result(&res);
+			}
+
+			q->stmt = gg_duckdb_prepare_with(bctx, q->conn, q->sql, &err);
+			if (q->stmt == NULL)
+				gg_duckdb_query_raise(q, psprintf("could not prepare the %s query", q->what), err);
+			q->prepared_sql = MemoryContextStrdup(q->query_cxt, q->sql);
+		}
 		bind_params(q);
 
 		if (duckdb_pending_prepared_streaming(q->stmt, &q->pending) == DuckDBError)
@@ -490,6 +615,7 @@ next_chunk(GGDuckQuery *q)
 	q->chunk_size = size;
 	q->chunk_row = 0;
 	q->chunks++;
+	SIMPLE_FAULT_INJECTOR("gg_duckdb_after_chunk");
 
 	for (i = 0; i < q->ncols; i++)
 	{
@@ -577,7 +703,7 @@ gg_duckdb_query_next(GGDuckQuery *q, TupleTableSlot *slot)
 void
 gg_duckdb_query_reset(GGDuckQuery *q)
 {
-	gg_duckdb_query_release_query(q);
+	release_execution(q);
 	q->started = false;
 	q->finished = false;
 	q->pending_error = NULL;

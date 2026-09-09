@@ -2,7 +2,7 @@
 
 `gg_duckdb` embeds [DuckDB](https://duckdb.org) in every Greengage backend as a
 second executor for segment-local, Motion-free parts of a plan. This directory
-is at **milestone M5**: the library builds into the tree, loads on the
+is at **milestone M6**: the library builds into the tree, loads on the
 coordinator and on every segment, opens a per-backend DuckDB instance lazily on
 the backend thread, and with `gg_duckdb.mode = auto|force` a planner pass turns
 eligible segment-local subtrees into DuckDB regions: hash, merge and nested-loop
@@ -14,7 +14,8 @@ and `LIMIT/OFFSET` over a whitelist of types, operators and functions whose
 DuckDB semantics equal PostgreSQL's. Leaves (scans, Motion receivers, shared
 scans, subquery scans, joins DuckDB may not run, anything else) stay ordinary
 plan nodes pulled by DuckDB on the backend thread, and the subtree under a leaf
-gets regions of its own. Every region query is prepared on the coordinator
+gets regions of its own; a projection DuckDB cannot compute stays with the
+executor as a leaf and the region goes on above it. Every region query is prepared on the coordinator
 before it is used, so an ineligible or unbindable subtree simply stays on the
 standard executor. Partial `sum(numeric)` and `avg(numeric)` phases run in
 DuckDB too: the region packs DuckDB's exact sum and count into the aggregate
@@ -25,7 +26,11 @@ DuckDB's, conversion included. The `gg_duckdb` foreign data wrapper reads
 Parquet, CSV and JSON files through DuckDB on every segment, each file by
 exactly one segment, and the pass inlines such a scan into a region as a
 native reader, so joins and aggregates above it see no row conversion on the
-way in. The design is in `doc/architecture/gg-duckdb-executor.md`.
+way in. Executor parameters (an InitPlan's result, a correlated subquery's
+outer values, a prepared statement's or PL/pgSQL generic plan's arguments) are
+bound as DuckDB parameters, regions form inside InitPlans and correlated
+subqueries too, and a rescanned region binds the new values into its kept
+prepared statement. The design is in `doc/architecture/gg-duckdb-executor.md`.
 
 ## Design in one paragraph
 
@@ -36,7 +41,11 @@ legal for DuckDB callbacks (the future leaf table functions) to call back into
 the backend, whose buffer manager, memory contexts, error handling and vmem
 tracker are all main-thread only. Only DuckDB's C API (`duckdb.h`) is used: it is
 the stable client surface across DuckDB minors and the coming 2.0 ABI freeze,
-and it keeps the extension in C.
+and it keeps the extension in C. The one rule those callbacks live by: the
+`PG_TRY` barrier around the PostgreSQL work holds no DuckDB call that can
+allocate, because DuckDB reports an allocation failure under its memory limit
+as a C++ exception, and one unwinding through a `PG_TRY` block would leave the
+backend's exception stack pointing into a dead frame.
 
 ## Building
 
@@ -92,9 +101,12 @@ declined, or its DuckDB query; the gate's estimates go to the DEBUG1 log),
 `reserve_memory` (reserve the region's budget with the vmem tracker, on),
 `temp_directory` (default `base/pgsql_tmp/pgsql_tmp_gg_duckdb_<pid>` under
 each node's data directory), `max_temp_directory_size`,
-`release_instance_at_end`, and the development aids `debug_wrap` and
-`debug_region_sql`. The core GUC `optimizer_enable_duckdb` gates plans
-produced by GPORCA.
+`release_instance_at_end`, `allow_float_aggregates` (`sum`/`avg`/`min`/`max`
+over float4/float8 inside regions, off: DuckDB's summation order differs, so
+the last digits of a float sum can differ from the standard executor's),
+`data_directories` and `http_proxy` (see the foreign data wrapper), and the
+development aids `debug_wrap` and `debug_region_sql`. The core GUC
+`optimizer_enable_duckdb` gates plans produced by GPORCA.
 
 ## Hints
 
@@ -205,8 +217,24 @@ both optimizers. `foreign` (an `input/*.source` test: it writes its Parquet,
 CSV and JSON files into `data/` with the coordinator's DuckDB) covers the
 foreign data wrapper: sharding, every carried type against a PostgreSQL
 reference, pushed and local quals, the reader inlined into regions,
-rescans, ANALYZE, IMPORT FOREIGN SCHEMA, and the refused locations.
-`bench/` holds the TPC-H-shaped benchmark (see its README).
+rescans, ANALYZE, IMPORT FOREIGN SCHEMA, and the refused locations. `params`
+covers executor parameters inside regions (an InitPlan's result in a HAVING
+clause and a join condition, a generic plan's arguments, a PL/pgSQL variable,
+correlated subqueries rescanned with new values) and the float-aggregate
+opt-in. `bench/` holds the TPC-H-shaped benchmark (see its README).
+
+```sh
+make -C gpcontrib/gg_duckdb/isolation2 installcheck
+```
+
+runs the fault-injection tests (a build with `--enable-debug-extensions`):
+cancellation while a segment is suspended inside a leaf batch,
+`statement_timeout`, a LIMIT stopping regions on other segments, the
+out-of-memory error under a small DuckDB memory limit and the recovery after
+it, a PostgreSQL error raised inside a leaf on one segment, and two regions
+nested in one backend through SPI. The fault points are
+`gg_duckdb_before_batch` (every leaf batch), `gg_duckdb_query_start` and
+`gg_duckdb_after_chunk`. Its answer files hold under both optimizers.
 
 ## Measured on the development host (DuckDB 1.5.5, 2026-09-09)
 

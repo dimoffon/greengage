@@ -1,0 +1,11 @@
+-- gpcontrib/gg_duckdb/isolation2/init_file: masks for the isolation2 output,
+-- applied on top of src/test/regress/init_file.  The pid suffixes of errors
+-- raised on segments vary, and the sizes in DuckDB memory errors do too.
+-- start_matchsubs
+m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+m/\(seg\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ [\d.]+:\d+ pid=\d+\)/(segN host:port pid=N)/
+m/Out of Memory Error: .*/
+s/Out of Memory Error: .*/Out of Memory Error: MASKED/
+-- end_matchsubs

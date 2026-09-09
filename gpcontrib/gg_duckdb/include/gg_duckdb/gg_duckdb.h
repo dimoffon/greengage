@@ -54,6 +54,7 @@ extern bool gg_duckdb_reserve_memory;
 extern bool gg_duckdb_strict;
 extern char *gg_duckdb_data_directories;
 extern char *gg_duckdb_http_proxy;
+extern bool gg_duckdb_allow_float_aggregates;
 extern double gg_duckdb_cost_fixed;
 extern double gg_duckdb_cost_convert_row;
 extern double gg_duckdb_cost_convert_byte;
@@ -124,8 +125,27 @@ typedef struct GGTypeInfo
 extern bool gg_duckdb_type_map(Oid typid, int32 typmod, GGTypeInfo *ti);
 extern duckdb_logical_type gg_duckdb_logical_type(const GGTypeInfo *ti);
 extern const char *gg_duckdb_type_name(duckdb_type t);
-extern void gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
-								  uint64_t *validity, idx_t row, Datum d, bool isnull);
+/*
+ * Where a column's values go: the vector's data and validity, and for a
+ * numeric aggregate state the two children.  Resolved before any PostgreSQL
+ * work starts, so that filling a row is plain memory writes (see leaf.c on
+ * why no DuckDB call may sit inside a PG_TRY block).
+ */
+typedef struct GGVectorTarget
+{
+	duckdb_vector vec;
+	void	   *data;
+	uint64_t   *validity;
+	void	   *sum_data;		/* STRUCT: the sum child */
+	uint64_t   *sum_validity;
+	void	   *count_data;		/* STRUCT: the count child */
+} GGVectorTarget;
+
+extern void gg_duckdb_vector_target(duckdb_vector vec, const GGTypeInfo *ti,
+									GGVectorTarget *t);
+extern void gg_duckdb_write_datum(const GGTypeInfo *ti, const GGVectorTarget *t,
+								  idx_t row, Datum d, bool isnull,
+								  const char **str, int *len);
 extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
 								  duckdb_vector vec, void *data, uint64_t *validity, idx_t row,
 								  bool *isnull);
@@ -201,7 +221,7 @@ typedef struct GGDuckQuery
 	PlanState  *ps;				/* the node running the query: memory quota */
 	const char *what;			/* "region" or "foreign scan", for messages */
 	const char *sql;
-	List	   *params;			/* Consts bound as $1..$n */
+	List	   *params;			/* Consts and executor Params bound as $1..$n */
 	List	   *file_lists;		/* List of List of char *, bound as $n+1.. */
 	List	   *pre_sql;		/* statements run on the connection before the query */
 
@@ -222,6 +242,7 @@ typedef struct GGDuckQuery
 	/* DuckDB objects, released idempotently */
 	duckdb_connection conn;
 	duckdb_prepared_statement stmt;
+	const char *prepared_sql;	/* what stmt was prepared from (query_cxt) */
 	duckdb_pending_result pending;
 	duckdb_result result;
 	bool		has_result;
@@ -306,7 +327,8 @@ typedef struct GGRegionSpec
 	char	   *sql;
 	List	   *leaves;			/* Plan nodes, in gg_leaf index order */
 	int			nleaves;
-	List	   *params;			/* Consts bound as $1..$n */
+	List	   *params;			/* Consts and executor Params bound as $1..$n */
+	int			nexecparams;	/* of those, executor parameters */
 	int			ncols;
 	GGTypeInfo *outtypes;		/* DuckDB shape of every output column */
 	int			flags;
@@ -318,6 +340,7 @@ typedef struct GGRegionSpec
 	double		rows_out;		/* estimated rows the region returns */
 	double		bytes_out;
 	double		parent_limit;	/* in: rows a Limit right above the root keeps, else 0 */
+	bool		rescanned;		/* the root has outer parameters: expect rescans */
 	int			ninterior;
 	int			naggs;
 	int			nsorts;

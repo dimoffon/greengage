@@ -10,7 +10,8 @@
  * directly.  Every batch is a PG_TRY barrier: a PostgreSQL error is copied
  * into the region, flushed, and reported to DuckDB as the function's error;
  * the region re-raises the original error when the DuckDB query fails.  A
- * longjmp never crosses DuckDB's frames.
+ * longjmp never crosses DuckDB's frames, and no DuckDB call that can throw
+ * (allocate) runs inside the barrier: see leaf_scan.
  *
  *-------------------------------------------------------------------------
  */
@@ -20,9 +21,12 @@
 #include <stdlib.h>
 
 #include "executor/executor.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/memutils.h"
+
+#include "utils/faultinjector.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -138,7 +142,22 @@ leaf_init(duckdb_init_info info)
 
 /*
  * Pull up to one vector's worth of rows from the leaf into `output`.
+ *
+ * Two phases.  Inside the PG_TRY barrier the rows are pulled and converted:
+ * fixed-width values are written straight into the vectors' memory, strings
+ * are copied into the batch context and remembered.  Outside it the strings
+ * are handed to DuckDB.  No DuckDB call that can allocate runs inside the
+ * barrier: an allocation failure under the memory limit is a C++ exception,
+ * which unwinds through this C frame to DuckDB's own handler; it must not
+ * skip a PG_END_TRY, or the backend's exception stack would point into a
+ * dead frame and the next ereport would jump into it.
  */
+typedef struct StagedStrings
+{
+	int32	   *offset;			/* per row: into `buf`, or -1 for NULL */
+	int32	   *len;
+} StagedStrings;
+
 static void
 leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 {
@@ -151,9 +170,10 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 	MemoryContext oldcxt;
 	int			maxattno = 0;
 	int			j;
-	duckdb_vector *vecs;
-	void	  **data;
-	uint64_t  **validity;
+	GGVectorTarget *targets;
+	StagedStrings *staged;
+	bool		any_strings = false;
+	StringInfoData buf;
 
 	if (lf->eof || region->q.pending_error != NULL)
 	{
@@ -161,17 +181,32 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 		return;
 	}
 
-	vecs = (duckdb_vector *) alloca(sizeof(duckdb_vector) * Max(id->ncols, 1));
-	data = (void **) alloca(sizeof(void *) * Max(id->ncols, 1));
-	validity = (uint64_t **) alloca(sizeof(uint64_t *) * Max(id->ncols, 1));
+	targets = (GGVectorTarget *) alloca(sizeof(GGVectorTarget) * Max(id->ncols, 1));
+	staged = (StagedStrings *) alloca(sizeof(StagedStrings) * Max(id->ncols, 1));
 	for (j = 0; j < id->ncols; j++)
 	{
-		vecs[j] = duckdb_data_chunk_get_vector(output, j);
-		data[j] = duckdb_vector_get_data(vecs[j]);
-		duckdb_vector_ensure_validity_writable(vecs[j]);
-		validity[j] = duckdb_vector_get_validity(vecs[j]);
-		if (id->col[j] < lf->desc.ncols && id->col[j] + 1 > maxattno)
-			maxattno = id->col[j] + 1;
+		duckdb_vector vec = duckdb_data_chunk_get_vector(output, j);
+		int			col = id->col[j];
+
+		staged[j].offset = NULL;
+		staged[j].len = NULL;
+		if (col < lf->desc.ncols)
+		{
+			const GGTypeInfo *ti = &lf->desc.cols[col].type;
+
+			gg_duckdb_vector_target(vec, ti, &targets[j]);
+			if (ti->duck == DUCKDB_TYPE_VARCHAR || ti->duck == DUCKDB_TYPE_BLOB)
+				any_strings = true;
+			if (col + 1 > maxattno)
+				maxattno = col + 1;
+		}
+		else
+		{
+			/* the placeholder column of a leaf without columns */
+			memset(&targets[j], 0, sizeof(targets[j]));
+			targets[j].vec = vec;
+			targets[j].data = duckdb_vector_get_data(vec);
+		}
 	}
 
 	/*
@@ -182,10 +217,31 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 	 */
 	oldcxt = CurrentMemoryContext;
 	MemoryContextReset(region->q.batch_cxt);
+	buf.data = NULL;
 
 	PG_TRY();
 	{
 		CHECK_FOR_INTERRUPTS();
+		SIMPLE_FAULT_INJECTOR("gg_duckdb_before_batch");
+
+		if (any_strings)
+		{
+			MemoryContextSwitchTo(region->q.batch_cxt);
+			initStringInfo(&buf);
+			for (j = 0; j < id->ncols; j++)
+			{
+				int			col = id->col[j];
+
+				if (col < lf->desc.ncols &&
+					(lf->desc.cols[col].type.duck == DUCKDB_TYPE_VARCHAR ||
+					 lf->desc.cols[col].type.duck == DUCKDB_TYPE_BLOB))
+				{
+					staged[j].offset = palloc(sizeof(int32) * capacity);
+					staged[j].len = palloc(sizeof(int32) * capacity);
+				}
+			}
+			MemoryContextSwitchTo(oldcxt);
+		}
 
 		while (n < capacity)
 		{
@@ -202,16 +258,32 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 			for (j = 0; j < id->ncols; j++)
 			{
 				int			col = id->col[j];
+				const char *str;
+				int			len;
 
 				if (col >= lf->desc.ncols)
 				{
-					/* the placeholder column of a leaf without columns */
-					((bool *) data[j])[n] = false;
+					((bool *) targets[j].data)[n] = false;
 					continue;
 				}
-				gg_duckdb_write_datum(&lf->desc.cols[col].type,
-									  vecs[j], data[j], validity[j], n,
-									  slot->tts_values[col], slot->tts_isnull[col]);
+				gg_duckdb_write_datum(&lf->desc.cols[col].type, &targets[j], n,
+									  slot->tts_values[col], slot->tts_isnull[col],
+									  &str, &len);
+				if (staged[j].offset != NULL)
+				{
+					/* the datum lives only until the next row: copy it */
+					if (str == NULL)
+					{
+						staged[j].offset[n] = -1;
+						staged[j].len[n] = -1;
+					}
+					else
+					{
+						staged[j].offset[n] = buf.len;
+						staged[j].len[n] = len;
+						appendBinaryStringInfo(&buf, str, len);
+					}
+				}
 			}
 			MemoryContextSwitchTo(oldcxt);
 			n++;
@@ -235,6 +307,22 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 		return;
 	}
 	PG_END_TRY();
+
+	/* outside the barrier: the strings go into DuckDB's heap */
+	for (j = 0; j < id->ncols; j++)
+	{
+		idx_t		r;
+
+		if (staged[j].offset == NULL)
+			continue;
+		for (r = 0; r < n; r++)
+		{
+			if (staged[j].offset[r] >= 0)
+				duckdb_vector_assign_string_element_len(targets[j].vec, r,
+														buf.data + staged[j].offset[r],
+														staged[j].len[r]);
+		}
+	}
 
 	duckdb_data_chunk_set_size(output, n);
 }

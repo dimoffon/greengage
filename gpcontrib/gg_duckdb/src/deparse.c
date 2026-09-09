@@ -651,7 +651,8 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 							 a.data, ta.scale);
 			return true;
 		}
-		if (strcmp(name, "count") == 0 || strcmp(name, "sum") == 0)
+		if ((strcmp(name, "count") == 0 || strcmp(name, "sum") == 0) &&
+			!(type_is_float(argtype) && gg_duckdb_allow_float_aggregates))
 		{
 			ok = argtype == INT8OID && agg->aggtype == INT8OID;
 			gg_duckdb_type_map(INT8OID, -1, type);
@@ -660,7 +661,14 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 		}
 		else if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
 		{
-			ok = argtype == agg->aggtype && !type_is_float(argtype) ;
+			ok = argtype == agg->aggtype && (!type_is_float(argtype) || gg_duckdb_allow_float_aggregates);
+			*type = ta;
+			cast = gg_duckdb_type_sql(type);
+		}
+		else if (strcmp(name, "sum") == 0 && type_is_float(argtype) && gg_duckdb_allow_float_aggregates)
+		{
+			/* partial float sums are plain floats; summation order differs from PostgreSQL's */
+			ok = argtype == agg->aggtype;
 			*type = ta;
 			cast = gg_duckdb_type_sql(type);
 		}
@@ -688,6 +696,12 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 		}
 		else if (partial && argtype == NUMERICOID && ta.duck == DUCKDB_TYPE_DECIMAL)
 			return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
+		else if (type_is_float(argtype) && gg_duckdb_allow_float_aggregates)
+		{
+			/* the sum of floats depends on the order of summation: opted in */
+			*type = ta;
+			cast = gg_duckdb_type_sql(type);
+		}
 		else if (partial)
 			REJECT(ctx, "partial sum(%s) serialises an internal state", format_type_be(argtype));
 		else if (argtype == INT8OID)
@@ -734,6 +748,13 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	else if (strcmp(name, "avg") == 0 && partial && argtype == NUMERICOID &&
 			 ta.duck == DUCKDB_TYPE_DECIMAL)
 		return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
+	else if (strcmp(name, "avg") == 0 && !partial && !final && type_is_float(argtype) &&
+			 gg_duckdb_allow_float_aggregates)
+	{
+		/* PostgreSQL's avg of floats is a double; DuckDB's too */
+		gg_duckdb_type_map(FLOAT8OID, -1, type);
+		cast = "DOUBLE";
+	}
 	else
 		REJECT(ctx, "aggregate %s", name);
 
@@ -970,7 +991,23 @@ deparse_expr(DeparseCtx *ctx, Node *node, StringInfo out, GGTypeInfo *type)
 				return true;
 			}
 		case T_Param:
-			REJECT(ctx, "parameter reference");
+			{
+				/*
+				 * An InitPlan's result or a prepared statement's argument:
+				 * a $n the executing node binds from the executor's state.
+				 */
+				Param	   *param = (Param *) node;
+
+				if (param->paramkind != PARAM_EXEC && param->paramkind != PARAM_EXTERN)
+					REJECT(ctx, "parameter of kind %d", (int) param->paramkind);
+				if (!map_type(ctx, param->paramtype, param->paramtypmod, type))
+					return false;
+				ctx->spec->params = lappend(ctx->spec->params, copyObject(param));
+				ctx->spec->nexecparams++;
+				appendStringInfo(out, "CAST($%d AS %s)", list_length(ctx->spec->params),
+								 gg_duckdb_type_sql(type));
+				return true;
+			}
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 			REJECT(ctx, "subplan");
@@ -1608,8 +1645,42 @@ join_is_interior(Plan *plan)
 	return join_leaf_reason(plan) == NULL;
 }
 
+/* Does a Motion run somewhere below this node? */
 static bool
-node_is_interior_base(Plan *plan)
+contains_motion(Plan *plan)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return false;
+	switch (nodeTag(plan))
+	{
+		case T_Motion:
+			return true;
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				if (contains_motion((Plan *) lfirst(lc)))
+					return true;
+			return false;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				if (contains_motion((Plan *) lfirst(lc)))
+					return true;
+			return false;
+		case T_Sequence:
+			foreach(lc, ((Sequence *) plan)->subplans)
+				if (contains_motion((Plan *) lfirst(lc)))
+					return true;
+			return false;
+		case T_SubqueryScan:
+			return contains_motion(((SubqueryScan *) plan)->subplan);
+		default:
+			return contains_motion(plan->lefttree) || contains_motion(plan->righttree);
+	}
+}
+
+static bool
+node_is_interior_base(DeparseCtx *ctx, Plan *plan)
 {
 	switch (nodeTag(plan))
 	{
@@ -1653,8 +1724,16 @@ node_is_interior_base(Plan *plan)
 			{
 				Material   *m = (Material *) plan;
 
-				return plan->lefttree != NULL && plan->initPlan == NIL &&
-					!m->cdb_strict && !m->cdb_shield_child_from_rescans;
+				if (plan->lefttree == NULL || plan->initPlan != NIL ||
+					m->cdb_strict || m->cdb_shield_child_from_rescans)
+					return false;
+
+				/*
+				 * A rescanned region needs rescannable leaves: over a Motion
+				 * the executor's Material is the one that buffers rows, so
+				 * it stays a leaf then.
+				 */
+				return !(ctx->spec->rescanned && contains_motion(plan->lefttree));
 			}
 		default:
 			return false;
@@ -1732,6 +1811,13 @@ collect_selector_params(Node *node, PruneCtx *pctx)
 {
 	if (node == NULL)
 		return false;
+	/*
+	 * A SubPlan (an InitPlan reference too) is a separate plan: whatever it
+	 * selects is its own business, and plan_tree_walker would look its plan
+	 * up through a base this context does not carry.
+	 */
+	if (IsA(node, SubPlan))
+		return false;
 	if (IsA(node, PartitionSelector))
 		pctx->paramids = lappend_int(pctx->paramids, ((PartitionSelector *) node)->paramid);
 	return plan_tree_walker(node, collect_selector_params, pctx, false);
@@ -1747,6 +1833,8 @@ uses_selector_params(Node *node, PruneCtx *pctx)
 		return false;
 	switch (nodeTag(node))
 	{
+		case T_SubPlan:
+			return false;
 		case T_DynamicSeqScan:
 			ids = ((DynamicSeqScan *) node)->join_prune_paramids;
 			break;
@@ -1798,12 +1886,50 @@ partition_selector_hazard(Plan *outer, Plan *inner)
 static bool deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols);
 static bool deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols);
 
+static bool deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols);
+
 static bool
 deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
-	if (!node_is_interior_base(plan))
+	if (!node_is_interior_base(ctx, plan))
 		return deparse_leaf(ctx, plan, out, cols);
 
+	if (IsA(plan, Result))
+	{
+		/*
+		 * A projection DuckDB cannot compute (a function outside the
+		 * whitelist, say) stays with the executor: the Result becomes a
+		 * leaf and the region goes on above it.  The failed attempt is
+		 * undone first: the leaves, parameters and readers it collected,
+		 * the aliases and costs it took.
+		 */
+		GGRegionSpec saved_spec = *ctx->spec;
+		DeparseCtx	saved_ctx = *ctx;
+		int			nleaves = list_length(ctx->spec->leaves);
+		int			nparams = list_length(ctx->spec->params);
+		int			nnatives = list_length(ctx->spec->natives);
+		StringInfoData attempt;
+
+		initStringInfo(&attempt);
+		if (deparse_interior(ctx, plan, &attempt, cols))
+		{
+			appendBinaryStringInfo(out, attempt.data, attempt.len);
+			return true;
+		}
+		*ctx->spec = saved_spec;
+		*ctx = saved_ctx;
+		ctx->spec->leaves = list_truncate(ctx->spec->leaves, nleaves);
+		ctx->spec->params = list_truncate(ctx->spec->params, nparams);
+		ctx->spec->natives = list_truncate(ctx->spec->natives, nnatives);
+		ctx->spec->reject = NULL;
+		return deparse_leaf(ctx, plan, out, cols);
+	}
+	return deparse_interior(ctx, plan, out, cols);
+}
+
+static bool
+deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
+{
 	if (IsA(plan, HashJoin) || IsA(plan, MergeJoin) || IsA(plan, NestLoop))
 		return deparse_join(ctx, plan, out, cols);
 	if (IsA(plan, Append))
@@ -2168,6 +2294,8 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->leaves = NIL;
 	spec->natives = NIL;
 	spec->rows_native = 0;
+	spec->nexecparams = 0;
+	spec->rescanned = root->extParam != NULL;
 	spec->params = NIL;
 	spec->rows_in = 0;
 	spec->ninterior = 0;
@@ -2180,7 +2308,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	/* the top chain: [Limit] [Unique] [Sort], Materials in between are transparent */
 	for (;;)
 	{
-		if (IsA(node, Material) && node_is_interior_base(node))
+		if (IsA(node, Material) && node_is_interior_base(&ctx, node))
 		{
 			node = node->lefttree;
 			continue;
@@ -2253,7 +2381,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 			add_op_cost(&ctx, sort_cost(rows_of(node), bound));
 		}
 	}
-	else if (spec->agg_order != NULL && node_is_interior_base(node) && IsA(node, Agg))
+	else if (spec->agg_order != NULL && node_is_interior_base(&ctx, node) && IsA(node, Agg))
 	{
 		appendStringInfoString(&sql, spec->agg_order);
 		spec->ordered = true;
@@ -2286,6 +2414,17 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->nleaves = list_length(spec->leaves);
 	spec->ncols = cols.ncols;
 	spec->outtypes = cols.types;
+	if (cols.ncols == 0)
+	{
+		/*
+		 * A root without columns (count(*) above a subquery: the optimizer
+		 * keeps only the rows): its "1 AS c1" placeholder is the one result
+		 * column, which the region discards.
+		 */
+		spec->ncols = 1;
+		spec->outtypes = palloc0(sizeof(GGTypeInfo));
+		gg_duckdb_type_map(INT4OID, -1, &spec->outtypes[0]);
+	}
 	spec->flags = (spec->naggs > 0 || sort != NULL || uniq != NULL) ?
 		(CUSTOMSCAN_GP_MEMORY_INTENSIVE | CUSTOMSCAN_GP_BLOCKING) : 0;
 	{

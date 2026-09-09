@@ -30,7 +30,9 @@ Material, Unique, Append) is executed by DuckDB. This needs no DuckDB catalog, n
 AO/AOCO column projection come free from the leaves; and a region may sit directly above
 a Redistribute/Broadcast receiver, which is where MPP joins and second-phase aggregates
 run. A `gg_duckdb` foreign table (D8) is the one leaf that is inlined as a DuckDB-native
-source instead of being pulled.
+source instead of being pulled. A `Result` whose projection or filter DuckDB cannot
+compute (a function outside the whitelist) becomes a leaf too, so the region goes on
+above it; ORCA emits such a `Result` for most computed expressions.
 
 **D2 — Handover as SQL text from our own deparser; "eligible" means "generates".**
 Each leaf `i` is a registered table function `gg_leaf(i)`; each interior node a nested
@@ -52,7 +54,11 @@ callable off its main thread (buffer manager, memory contexts, elog, the vmem tr
 and this is what makes the leaf callbacks legal. Every host callback is a `PG_TRY`
 barrier: a PG error becomes `duckdb_function_set_error`, never a `longjmp` through DuckDB
 frames; DuckDB errors surface from the task loop and are re-raised with `ereport`. The
-C API is the stable client surface across DuckDB minors and the 2.0 ABI freeze, works
+barrier holds only PostgreSQL work: no DuckDB call that can allocate runs inside it,
+because DuckDB reports an allocation failure under its memory limit as a C++ exception
+that unwinds through the extension's C frames to DuckDB's own handler, and one that
+crossed a `PG_TRY` block would leave the backend's exception stack pointing into a dead
+frame (M6 findings). The C API is the stable client surface across DuckDB minors and the 2.0 ABI freeze, works
 with a prebuilt `libduckdb.so`, and keeps the extension in C. It costs the custom
 allocator hook (C++ only), which is why memory is budgeted rather than tracked per
 allocation (D5). In an MPP with several primaries per host, one thread per QE is the
@@ -63,11 +69,17 @@ end of `standard_planner()` on both the ORCA branch and the PostgreSQL-planner b
 Both deliver the same state there: slices numbered, plan node ids assigned, setrefs-form
 Vars, pg_hint_plan's `Set()` hints live. The pass walks with `plan_tree_mutator`, tracks
 the slice through `Motion.motionID`, and replaces each maximal eligible region that
-passes the gate. Boundary rules that matter for correctness: a join whose inner subtree
-holds a PartitionSelector feeding a `Dynamic*Scan` on the outer side is never interior
-(DuckDB gives no build-side-first guarantee); a Material that shields a Motion from
-rescans stays a boundary; a Motion leaf is allowed only when the region has no external
-params. The gate needs at least one join/aggregate/sort/unique operator, a minimum row
+passes the gate; the statement's subplans (InitPlans and correlated subqueries) are
+walked the same way in the slices `subplan_sliceIds` names. Boundary rules that matter
+for correctness: a join whose inner subtree holds a PartitionSelector feeding a
+`Dynamic*Scan` on the outer side is never interior (DuckDB gives no build-side-first
+guarantee); a Material that shields a Motion from rescans stays a boundary, and so does
+any Material over a Motion when the region has external parameters, since the region
+will be rescanned and the executor's Material is what buffers the Motion's rows; a
+Motion leaf is allowed only when the region has no external params. Executor parameters
+(an InitPlan's result, a correlated subquery's outer values, a generic plan's arguments)
+are bound as DuckDB parameters when the query starts, and a rescan binds them again
+into the kept prepared statement. The gate needs at least one join/aggregate/sort/unique operator, a minimum row
 count, and a PostgreSQL-unit cost model over per-segment row estimates (ORCA's
 `total_cost` is in ORCA units and is not compared); `gg_duckdb.mode = force` bypasses
 the gate, never eligibility.
@@ -114,13 +126,116 @@ skipping. Files are sharded deterministically by `hash(path) % numsegments`.
 
 ## Milestones
 
-M0 foundation (this) — M1 identity region end to end — M2 deparser, plan-time
+M0 foundation — M1 identity region end to end — M2 deparser, plan-time
 validation, the pass and its GUC gate — M3 joins, Append, two-phase aggregates,
 Motion/ShareInputScan leaves — M4 hints, cost calibration, benchmarks — M5 native readers
-(FDW) — M6 hardening and opt-ins (InitPlan params, float aggregates, threads > 1,
-per-allocation accounting, DuckDB 2.0). Out of scope: DuckDB tables, DDL or writes
+(FDW) — M6 hardening and opt-ins (executor parameters, subplans, float aggregates, the
+isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed and
+deferred). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
+
+## M6 findings (2026-09-10)
+
+- **Executor parameters are DuckDB parameters.** A `Param` of kind `PARAM_EXEC` (an
+  InitPlan's result, dispatched to the segments with the plan, or the outer row's values
+  in a correlated subquery) or `PARAM_EXTERN` (a prepared statement's or a PL/pgSQL
+  generic plan's argument) deparses as `CAST($n AS T)`, appended to the region's
+  parameter list after the constants met so far; the query start reads it from
+  `es_param_exec_vals` (running the InitPlan first when its plan sits in this process,
+  as `ExecEvalParamExec` does) or from `es_param_list_info` through `paramFetch`, and
+  checks the type against the plan's. Where the parameter lands decides what this buys:
+  both optimizers push `id > (SELECT ...)` into the scan leaf, where it costs nothing;
+  a parameter in a HAVING clause, a join condition or a projection sits in the region
+  text. ORCA mostly plans an InitPlan away, into a Broadcast join or a `SubPlan`
+  projected by the leaf scan, so the region sees a column. The `params` regress test
+  covers the cases under both optimizers, custom and generic plans included.
+- **Subplans are walked.** The pass only mutated `stmt->planTree`; InitPlans and
+  correlated subqueries (`stmt->subplans`, each rooted in the slice `subplan_sliceIds`
+  names) never got regions. They do now. Under the PostgreSQL planner a correlated
+  subquery runs on the segments and its region is rescanned once per outer row; ORCA
+  puts such subqueries on the coordinator, where regions need `on_coordinator`. For the
+  rescan to be legal a Material over a Motion is a leaf whenever the region has external
+  parameters (the executor's Material buffers the Motion's rows and rewinds; DuckDB's
+  would ask the Motion again), and the region keeps its connection and its prepared
+  statement across rescans, binding the new values only — before, every start opened a
+  connection without closing the previous one and prepared again. Measured on a scalar
+  subquery rescanned 1999 times (planner, 3 segments): 1.24 s with regions, 1.66 s
+  without.
+- **A crash under the memory limit, and the rule it taught.** A hash aggregate with wide
+  string keys under a 16 MB limit segfaulted every QE. The core dump showed `longjmp`
+  into a dead frame from inside error handling: DuckDB had thrown its
+  `OutOfMemoryException` from the string allocation in the leaf callback
+  (`duckdb_vector_assign_string_element_len` goes through the buffer manager's allocator,
+  which enforces `memory_limit`), the exception unwound through the callback's `PG_TRY`
+  block to DuckDB's handler, `PG_exception_stack` kept pointing at the abandoned
+  `sigjmp_buf`, and the `ereport` that reported the DuckDB error jumped into it. The
+  leaf callback now has two phases: inside the barrier the rows are pulled and
+  converted, fixed-width values written straight into the vectors' memory and strings
+  copied into the batch context; outside it the strings are handed to DuckDB. The same
+  query now fails with DuckDB's `Out of Memory Error` and the backend goes on (the
+  isolation2 `memory` test). The rule is recorded in D3. `max_temp_directory_size`
+  does reach the segments' instances (`current_setting` shows it), but no region was
+  found to spill at these sizes — a 21 MB sort under a 16 MB limit with a 1 MB cap
+  completes — so the temp cap has no test.
+- **Regions without columns.** `count(*)` above a subquery makes ORCA keep only the
+  rows: the aggregate below projects nothing, and the region's `1 AS c1` placeholder
+  was one column where the plan-time check expected none, so such subtrees were
+  declined. The placeholder is now the region's one result column, discarded on the
+  way out.
+- **A projection DuckDB cannot compute is a leaf.** ORCA puts computed expressions
+  into a `Result` above the scan, so one function outside the whitelist in a projection
+  (`upper(v)` as a group key, say) used to make the whole subtree ineligible, while the
+  PostgreSQL planner, which computes the same expression in the scan's target list,
+  got a region. The deparser now tries a `Result` as interior and, when that fails,
+  undoes the attempt (the leaves, parameters and readers it collected, the aliases and
+  costs it took) and deparses the node as a leaf: the executor computes the projection,
+  DuckDB does the aggregate or join above it. Under ORCA `upper(v), count(*), sum(id)
+  ... GROUP BY 1` is now two regions, one per aggregate phase, with the `Result` as the
+  lower one's leaf.
+- **A walker that crashed on SubPlans.** The PartitionSelector-hazard walkers ran
+  `plan_tree_walker` with a context that carried no plan base; the first SubPlan node
+  in a join's inner side (ORCA attaches an InitPlan there) dereferenced it. They skip
+  SubPlan nodes now: what a subplan selects is its own business.
+- **Float aggregates** (`sum`, `avg`, `min`, `max` over float4/float8) are eligible only
+  under `gg_duckdb.allow_float_aggregates`, off by default: DuckDB's summation order
+  differs, so the last digits of a float sum can differ from the standard executor's;
+  `min`/`max` are exact either way but ride on the same switch for simplicity.
+- **isolation2.** `gpcontrib/gg_duckdb/isolation2/` drives the extension's fault points
+  (`gg_duckdb_before_batch` at every leaf batch, `gg_duckdb_query_start`,
+  `gg_duckdb_after_chunk`): `cancel` suspends a segment inside a leaf batch and cancels
+  the session (the usual "canceling statement due to user request", instance intact,
+  no reopen); `timeout` lets `statement_timeout` fire while a leaf sleeps; `squelch`
+  holds one segment inside its first batch while the coordinator's LIMIT is satisfied by
+  the others, then releases it, once with a scan leaf and once with a Motion leaf (the
+  query completes and the session goes on); `memory` is the out-of-memory case above,
+  followed by the same query under a larger limit; `leaf_error` raises a PostgreSQL
+  error in the third batch of one segment and sees it verbatim on the client;
+  `nested` runs a region on the coordinator whose leaf calls a function whose SPI query
+  is a region itself (the backend's counter shows one outer and one inner query per
+  row), then a segment leaf calling a function that runs a plain SPI query there. The
+  suite restarts the cluster around itself like the regress suite does, and its
+  answer files are the same under both optimizers.
+- **DuckDB 2.0 has not shipped** (checked 2026-09-10: the newest release is 1.5.5 of
+  2026-07-22; no 2.0 tag or release candidate). The pin stays at 1.5.5; the C-API
+  surface in use is the table-function registration, prepared statements with bound
+  values (LIST included), pending results, streaming chunks, vectors and validity, all
+  of which are in the documented stable subset. Per-allocation memory accounting (D5)
+  stays deferred with it.
+- **`threads > 1` per QE: designed, not built.** DuckDB worker threads would run
+  `gg_leaf` callbacks off the backend thread, which is illegal. The shape that works
+  keeps every PostgreSQL call on the backend thread: the leaf callback becomes a
+  consumer of a bounded queue of finished DuckDB chunks that the backend thread fills
+  between its own `duckdb_pending_execute_task` calls (pull, convert, enqueue, with the
+  signal-masking discipline of the interconnect receiver thread when a worker must
+  wait), `duckdb_init_set_max_threads` opened for the leaf function, and the memory
+  budget of D5 split across threads. It is worth building only where a QE owns a host,
+  since a demo-style cluster runs several primaries per host and one thread per QE is
+  already the parallelism; it stays an opt-in for later.
+- **`mode` default.** Still `off`. The gate is calibrated on one host and one data
+  set, and D5's accounting is coarse; both are what a default needs before it flips.
+  `auto` is the evaluation setting, and every benchmark query of M4 runs within noise
+  of the better engine under it.
 
 ## M5 findings (2026-09-09)
 

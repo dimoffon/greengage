@@ -97,6 +97,12 @@ SET gg_duckdb.explain_decisions = on;
 SET gg_duckdb.validate_at_plan_time = on;
 EXPLAIN (COSTS OFF) SELECT id, sum(f8) FROM d_orders GROUP BY id;   -- float sum: not eligible
 
+-- a projection DuckDB cannot compute (upper) is computed by the executor in
+-- the leaf; the aggregates above it are regions
+EXPLAIN (COSTS OFF) SELECT upper(note) AS u, count(*), sum(qty) FROM d_orders GROUP BY 1;
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT upper(note) AS u, count(*) AS n, sum(qty) AS s FROM d_orders GROUP BY 1 $q$);
+
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;
