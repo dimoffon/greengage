@@ -3,7 +3,8 @@
 # gg_duckdb.mode = off, force and auto, and report medians, the number of
 # DuckDB regions in the forced plan, and the speedup.
 #   run.sh [-n RUNS] [-q GLOB] [-o CSV] [-c]
-#   -c  also print the cost gate's estimates (client_min_messages = debug1)
+#   -n 0  plan only (no timing)
+#   -c    also print the cost gate's estimates (client_min_messages = debug1)
 # Connection settings come from the PG* environment; PGOPTIONS may select the
 # optimizer (PGOPTIONS='-c optimizer=on').
 set -uo pipefail
@@ -29,6 +30,7 @@ median() {
 
 time_query() {	# mode file -> median ms
 	local mode=$1 file=$2 i t
+	[ "$runs" -gt 0 ] || { echo "-"; return; }
 	for ((i = 0; i < runs; i++)); do
 		t=$(psql -X -q -At -v ON_ERROR_STOP=1 <<-SQL 2>&1 | grep '^Time:' | tail -1 | sed 's/Time: \([0-9.,]*\) ms.*/\1/; s/,/./'
 			SET search_path = tpch;
@@ -43,11 +45,12 @@ time_query() {	# mode file -> median ms
 }
 
 regions_in_plan() {	# file -> count of GGDuckDBRegion nodes under force
+	local file=$1
 	psql -X -q -At -v ON_ERROR_STOP=1 <<-SQL 2>/dev/null | grep -c GGDuckDBRegion
 		SET search_path = tpch;
 		SET gg_duckdb.mode = force;
 		EXPLAIN (COSTS OFF)
-		\\i $file
+		$(cat "$file")
 	SQL
 }
 
@@ -59,7 +62,7 @@ for f in "$here"/queries/$glob; do
 	off=$(time_query off "$f")
 	force=$(time_query force "$f")
 	auto=$(time_query auto "$f")
-	speedup=$(awk -v a="$off" -v b="$force" 'BEGIN { if (b > 0) printf "%.2f", a / b; else print "-" }')
+	speedup=$(awk -v a="$off" -v b="$force" 'BEGIN { if (a + 0 > 0 && b + 0 > 0) printf "%.2f", a / b; else print "-" }')
 	printf "%-8s %7s %10s %10s %10s %8s\n" "$name" "$regions" "$off" "$force" "$auto" "$speedup"
 	[ -n "$csv" ] && echo "$name,$regions,$off,$force,$auto,$speedup" >> "$csv"
 	if [ "$costs" = 1 ]; then
@@ -68,7 +71,7 @@ for f in "$here"/queries/$glob; do
 			SET gg_duckdb.mode = auto;
 			SET client_min_messages = debug1;
 			EXPLAIN (COSTS OFF)
-			\\i $f
+			$(cat "$f")
 		SQL
 	fi
 done

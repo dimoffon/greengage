@@ -67,8 +67,8 @@ psql -c "SELECT gp_segment_id, (gg_duckdb.status()).* FROM gp_dist_random('gp_id
 GUCs (all `gg_duckdb.*`): `mode` (off/auto/force; off by default: auto applies
 the gate, force takes every eligible region), `min_rows` (estimated input rows
 a region needs under auto, 100000), the cost gate's constants `cost_fixed`
-(planner cost units per region, 100), `cost_convert_row` (0.005) and
-`cost_convert_byte` (0.00005) per row and byte converted into or out of DuckDB,
+(planner cost units per region, 50), `cost_convert_row` (0.001) and
+`cost_convert_byte` (0.0003) per row and byte converted into or out of DuckDB,
 `cost_op_factor` (DuckDB's cost of an interior operator relative to the
 standard executor's, 0.25) and `cost_margin` (DuckDB must win by this fraction,
 0.25), `explain_decisions` (NOTICE per candidate subtree with the reason it was
@@ -133,3 +133,14 @@ both optimizers. `bench/` holds the TPC-H-shaped benchmark (see its README).
 Opening the instance costs about 30 ms and 15–20 MB of RSS per backend
 (a segment QE grows from ~21 MB to ~40 MB); a 2M-row group-by adds ~4 MB;
 the thread count of a QE stays at two (main + interconnect receiver).
+
+On the TPC-H-shaped benchmark (`bench/`, SF 1, 3 primaries, medians of 3),
+regions win by 1.5–1.9x where the interior does much work per input row
+(Q1's eight aggregates, Q4's semi join, Q13's left join and counts, Q18's
+large group-by) and lose by up to 2x where a large input is converted for a
+join that produces little (Q3, Q5, Q10, the local top-N join): converting a
+row into DuckDB costs about as much as the executor's own hash join probe.
+The cost gate is calibrated on those measurements, and under `mode = auto`
+every query of the set runs within noise of the better engine under both
+optimizers. `mode` stays `off` by default until the hardening milestone; see
+`doc/architecture/gg-duckdb-executor.md` for the numbers and the decision.

@@ -1276,11 +1276,41 @@ rows_of(Plan *plan)
 	return Max(plan->plan_rows, 1.0);
 }
 
+/*
+ * As cost_sort: comparisons of an in-memory sort, or of a bounded (top-N)
+ * one when a LIMIT above it caps the output.
+ */
 static double
-sort_cost(double rows)
+sort_cost(double rows, double limit_rows)
 {
-	rows = Max(rows, 2.0);
-	return 2.0 * cpu_operator_cost * rows * log(rows) / log(2.0);
+	double		n = Max(rows, 2.0);
+	double		l = limit_rows > 0 && limit_rows < n ? Max(2.0 * limit_rows, 2.0) : n;
+
+	return 2.0 * cpu_operator_cost * n * log(l) / log(2.0);
+}
+
+static bool
+count_aggrefs_walker(Node *node, int *count)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		(*count)++;
+		return false;
+	}
+	return expression_tree_walker(node, count_aggrefs_walker, count);
+}
+
+/* The aggregates an Agg node evaluates, as cost_agg counts them. */
+static int
+count_aggrefs(Plan *plan)
+{
+	int			count = 0;
+
+	count_aggrefs_walker((Node *) plan->targetlist, &count);
+	count_aggrefs_walker((Node *) plan->qual, &count);
+	return Max(count, 1);
 }
 
 static bool partition_selector_hazard(Plan *outer, Plan *inner);
@@ -1644,10 +1674,10 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			ctx->spec->naggs++;
 			/* as cost_agg: one operator per input row per aggregate and group key */
 			add_op_cost(ctx, cpu_operator_cost * rows_of(child) *
-						(list_length(plan->targetlist) + agg->numCols) +
+						(count_aggrefs(plan) + agg->numCols) +
 						cpu_tuple_cost * rows_of(plan) +
 						(agg->aggstrategy == AGG_SORTED && agg->numCols > 0 ?
-						 sort_cost(rows_of(child)) : 0.0));
+						 sort_cost(rows_of(child), 0) : 0.0));
 			if (!deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL,
 									agg->numCols > 0 ? gb.data : NULL, true, out, cols))
 				return false;
@@ -1760,8 +1790,8 @@ deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			add_op_cost(ctx, cpu_operator_cost * orows * irows * nclauses);
 		else if (IsA(plan, MergeJoin))
 			add_op_cost(ctx, cpu_operator_cost * (orows + irows) * nclauses +
-						(IsA(plan->lefttree, Sort) ? sort_cost(orows) : 0.0) +
-						(IsA(plan->righttree, Sort) ? sort_cost(irows) : 0.0));
+						(IsA(plan->lefttree, Sort) ? sort_cost(orows, 0) : 0.0) +
+						(IsA(plan->righttree, Sort) ? sort_cost(irows, 0) : 0.0));
 		else
 			add_op_cost(ctx, cpu_operator_cost * (orows + irows) * nclauses +
 						cpu_tuple_cost * irows);
@@ -1973,7 +2003,21 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		spec->nsorts++;
 		spec->ninterior++;
 		spec->ordered = true;
-		add_op_cost(&ctx, sort_cost(rows_of(node)));
+		{
+			double		bound = 0;
+			int64		count = 0,
+						offset = 0;
+			bool		has_count = false,
+						has_offset = false;
+
+			if (limit != NULL && uniq == NULL &&
+				limit_value(&ctx, limit->limitCount, &count, &has_count) &&
+				limit_value(&ctx, limit->limitOffset, &offset, &has_offset) && has_count)
+				bound = (double) count + (has_offset ? (double) offset : 0);
+			else if (limit == NULL && uniq == NULL && spec->parent_limit > 0)
+				bound = spec->parent_limit;		/* the executor's sort is bounded by the Limit above */
+			add_op_cost(&ctx, sort_cost(rows_of(node), bound));
+		}
 	}
 	else if (spec->agg_order != NULL && node_is_interior_base(node) && IsA(node, Agg))
 	{

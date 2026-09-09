@@ -84,12 +84,12 @@ SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 SET gg_duckdb.min_rows = 0;
--- ... and the cost gate must favour DuckDB; the fixed cost alone decides for a tiny input
+-- ... and the cost gate must favour DuckDB; for a tiny input it does not
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
-SET gg_duckdb.cost_fixed = 0;
+SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_row = 0; SET gg_duckdb.cost_convert_byte = 0;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 RESET gg_duckdb.min_rows;
-RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_row; RESET gg_duckdb.cost_convert_byte;
 
 -- a bad query never leaves the planner: plan-time validation declines it
 SET gg_duckdb.mode = force;

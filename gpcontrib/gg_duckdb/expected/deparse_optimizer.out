@@ -198,10 +198,10 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1765761)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1797757)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1765761)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1797757)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -216,7 +216,7 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 (5 rows)
 
 SET gg_duckdb.min_rows = 0;
--- ... and the cost gate must favour DuckDB; the fixed cost alone decides for a tiny input
+-- ... and the cost gate must favour DuckDB; for a tiny input it does not
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
                 QUERY PLAN                
 ------------------------------------------
@@ -230,19 +230,19 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
  Optimizer: GPORCA
 (8 rows)
 
-SET gg_duckdb.cost_fixed = 0;
+SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_row = 0; SET gg_duckdb.cost_convert_byte = 0;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  HashAggregate
-         Group Key: id
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
          ->  Seq Scan on d_orders
  Optimizer: GPORCA
 (5 rows)
 
 RESET gg_duckdb.min_rows;
-RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_row; RESET gg_duckdb.cost_convert_byte;
 -- a bad query never leaves the planner: plan-time validation declines it
 SET gg_duckdb.mode = force;
 SET gg_duckdb.explain_decisions = on;

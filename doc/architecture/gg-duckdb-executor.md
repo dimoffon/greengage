@@ -168,6 +168,56 @@ page reading.
   repeat once that subtree has itself become a region: the region's `custom_private` (v3)
   therefore records every leaf column's DuckDB shape, and the segment only cross-checks
   them against the tuple descriptors. A NaN in a state is refused with an error.
+- **Benchmark (bench/, TPC-H-shaped, SF 1: 6M lineitem rows, heap, 3 primaries on this
+  20-core host, medians of 3, ms).** `off` is the standard executor, `force` every
+  eligible region, `auto` the calibrated gate; the speedup is off/force.
+
+  | query | what the region covers | ORCA off | force | auto | speedup | planner off | force | auto | speedup |
+  |---|---|---|---|---|---|---|---|---|---|
+  | q01 | 8 numeric aggregates over 2M rows/segment | 1630 | 1052 | 1051 | 1.55 | 1562 | 1018 | 1018 | 1.53 |
+  | q04 | semi join + count | 675 | 391 | 387 | 1.73 | 351 | 341 | 349 | 1.03 |
+  | q13 | left join, count, count of counts | 372 | 223 | 207 | 1.66 | 339 | 201 | 192 | 1.69 |
+  | q18 | join + 800k-group sum (both phases) | 1527 | 954 | 899 | 1.60 | 1609 | 846 | 835 | 1.90 |
+  | l01 | co-located join + 5 aggregates | 876 | 848 | 882 | 1.03 | 742 | 808 | 740 | 0.92 |
+  | q14 | join under a CASE the region declines | 268 | 278 | 258 | 0.97 | 216 | 257 | 218 | 0.84 |
+  | q12 | join + CASE sums | 355 | 373 | 347 | 0.95 | 308 | 341 | 303 | 0.90 |
+  | q19 | join with OR-of-IN predicates | 322 | 351 | 333 | 0.92 | 280 | 301 | 283 | 0.93 |
+  | q06 | filtered sum over 150k rows | 264 | 284 | 246 | 0.93 | 224 | 248 | 223 | 0.91 |
+  | q10 | 3-way join, 7 group columns, top-20 | 439 | 488 | 432 | 0.90 | 339 | 430 | 352 | 0.79 |
+  | q03 | 3-way join, 185k groups, top-10 | 444 | 550 | 436 | 0.81 | 375 | 507 | 374 | 0.74 |
+  | l02 | co-located join, 77k groups, top-50 | 408 | 610 | 411 | 0.67 | 321 | 558 | 321 | 0.58 |
+  | q05 | 6-way join, 9 groups | 471 | 748 | 472 | 0.63 | 319 | 653 | 312 | 0.49 |
+
+  The first calibrated run had one misprediction, q03 under ORCA: the gate declined the
+  `Limit Sort Join Join Agg` region and then accepted the `Sort Join Join Agg` region
+  below the Limit, costing the executor's sort as a full sort while it is a bounded top-N
+  sort under the Limit, and DuckDB had to sort and hand back every row. The gate now costs
+  a Sort right under a constant Limit as bounded (`GGRegionSpec.parent_limit`), which
+  declines it; the table shows the run after that fix. The pattern: DuckDB wins by 1.5-1.9x
+  where the interior does much work per input row (many aggregates, semi/anti joins,
+  large group-bys) and loses, by up to 2x, where a large input is converted for a join
+  that produces little: converting rows into DuckDB (about 30-60 ns per column per row)
+  costs as much as the executor's own hash join probe, so a region that only replaces
+  joins over big inputs cannot pay for itself.
+  This is the expected shape for a pass that leaves the scans to the executor; the
+  native readers of M5 remove the conversion on the input side.
+- **Calibration and the gate's constants.** For each top-level candidate the pass logs
+  rows and bytes in and out and both estimates; the 13 queries above were fitted for a
+  decision that accepts exactly the queries with a measured win (`bench/run.sh -c`
+  prints the estimates). Perfect separation is reached by many constant sets; the
+  shipped one is physically sensible: `cost_fixed 50`, `cost_convert_row 0.001`,
+  `cost_convert_byte 0.0003`, `cost_op_factor 0.25`, `cost_margin 0.25` (one planner unit
+  is about 15 µs on this host, so a region's fixed cost is under a millisecond and a byte
+  converted costs about 4.5 ns). Under `auto` every query then runs within noise of the
+  better engine under both optimizers. The constants are per-segment estimates of
+  per-segment work, so they should transfer to other cluster sizes; a faster or slower
+  host shifts `cost_op_factor` and the conversion constants together, so the decisions
+  are less host-dependent than the constants.
+- **`gg_duckdb.mode` default.** It stays `off` in this milestone: the gate is fitted on
+  13 queries on one host, the executor path is four milestones old, and the hardening of
+  M6 (isolation2 cancel/OOM tests, per-allocation memory accounting) has not landed.
+  `auto` is the setting for evaluation and is what the numbers above recommend; the
+  decision is revisited after M5 and M6.
 - **EXPLAIN VERBOSE above a partial region.** ruleutils resolves a final-phase Aggref's
   argument down the plan and insists on finding the partial Aggref
   (`get_agg_combine_expr`). A region's `custom_scan_tlist` therefore describes an output

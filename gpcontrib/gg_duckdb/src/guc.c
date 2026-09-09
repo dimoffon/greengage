@@ -32,9 +32,9 @@ bool		gg_duckdb_validate_at_plan_time = true;
 bool		gg_duckdb_on_coordinator = false;
 bool		gg_duckdb_reserve_memory = true;
 bool		gg_duckdb_strict = false;
-double		gg_duckdb_cost_fixed = 100.0;
-double		gg_duckdb_cost_convert_row = 0.005;
-double		gg_duckdb_cost_convert_byte = 0.00005;
+double		gg_duckdb_cost_fixed = 50.0;
+double		gg_duckdb_cost_convert_row = 0.001;
+double		gg_duckdb_cost_convert_byte = 0.0003;
 double		gg_duckdb_cost_op_factor = 0.25;
 double		gg_duckdb_cost_margin = 0.25;
 
@@ -188,7 +188,7 @@ gg_duckdb_define_gucs(void)
 							 "Cost gate: fixed cost of a region (preparing and starting a DuckDB query), in planner cost units.",
 							 NULL,
 							 &gg_duckdb_cost_fixed,
-							 100.0, 0.0, 1e9,
+							 50.0, 0.0, 1e9,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -197,7 +197,7 @@ gg_duckdb_define_gucs(void)
 							 "Cost gate: cost of converting one row into or out of DuckDB, in planner cost units.",
 							 NULL,
 							 &gg_duckdb_cost_convert_row,
-							 0.005, 0.0, 1e9,
+							 0.001, 0.0, 1e9,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -206,7 +206,7 @@ gg_duckdb_define_gucs(void)
 							 "Cost gate: cost of converting one byte into or out of DuckDB, in planner cost units.",
 							 NULL,
 							 &gg_duckdb_cost_convert_byte,
-							 0.00005, 0.0, 1e9,
+							 0.0003, 0.0, 1e9,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

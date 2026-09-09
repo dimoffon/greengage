@@ -267,6 +267,7 @@ typedef struct GGRegionSpec
 	double		op_cost;		/* PostgreSQL-unit cost of the interior operators */
 	double		rows_out;		/* estimated rows the region returns */
 	double		bytes_out;
+	double		parent_limit;	/* in: rows a Limit right above the root keeps, else 0 */
 	int			ninterior;
 	int			naggs;
 	int			nsorts;

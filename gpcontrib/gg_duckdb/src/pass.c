@@ -454,6 +454,24 @@ try_region(PassContext *ctx, Plan *plan)
 	GGHintVerdict verdict;
 
 	memset(&spec, 0, sizeof(spec));
+	if (ctx->parent != NULL && IsA(ctx->parent, Limit))
+	{
+		/*
+		 * A Sort right under a Limit is a bounded (top-N) sort for the
+		 * executor; a region rooted at the Sort would sort everything and
+		 * hand every row back.  The gate must see the executor's real cost.
+		 */
+		Limit	   *lim = (Limit *) ctx->parent;
+
+		if (lim->limitCount && IsA(lim->limitCount, Const) &&
+			!((Const *) lim->limitCount)->constisnull)
+		{
+			spec.parent_limit = (double) DatumGetInt64(((Const *) lim->limitCount)->constvalue);
+			if (lim->limitOffset && IsA(lim->limitOffset, Const) &&
+				!((Const *) lim->limitOffset)->constisnull)
+				spec.parent_limit += (double) DatumGetInt64(((Const *) lim->limitOffset)->constvalue);
+		}
+	}
 	if (!gg_duckdb_deparse_region(ctx->stmt, plan, &spec))
 	{
 		decision(ctx, plan, "not eligible: %s", spec.reject ? spec.reject : "?");
@@ -495,10 +513,10 @@ try_region(PassContext *ctx, Plan *plan)
 			(spec.rows_in + spec.rows_out) * gg_duckdb_cost_convert_row +
 			(spec.bytes_in + spec.bytes_out) * gg_duckdb_cost_convert_byte;
 
-		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in, %.0f rows out, "
-			 "standard executor %.1f, DuckDB %.1f (margin %.2f)",
-			 plan->plan_node_id, spec.label, spec.rows_in, spec.rows_out,
-			 pg_cost, duck_cost, gg_duckdb_cost_margin);
+		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in (%.0f bytes), "
+			 "%.0f rows out (%.0f bytes), standard executor %.1f, DuckDB %.1f (margin %.2f)",
+			 plan->plan_node_id, spec.label, spec.rows_in, spec.bytes_in,
+			 spec.rows_out, spec.bytes_out, pg_cost, duck_cost, gg_duckdb_cost_margin);
 		if (spec.rows_in < (double) gg_duckdb_min_rows)
 		{
 			decision(ctx, plan, "estimated input rows below gg_duckdb.min_rows");
