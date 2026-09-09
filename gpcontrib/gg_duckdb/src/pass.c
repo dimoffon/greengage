@@ -326,9 +326,10 @@ try_region(PassContext *ctx, Plan *plan)
 		decision(ctx, plan, "not eligible: %s", spec.reject ? spec.reject : "?");
 		return NULL;
 	}
-	if (spec.naggs == 0 && spec.nsorts == 0 && strstr(spec.label, "Unique") == NULL)
+	if (spec.naggs == 0 && spec.nsorts == 0 && spec.njoins == 0 &&
+		strstr(spec.label, "Unique") == NULL)
 	{
-		decision(ctx, plan, "nothing worth handing to DuckDB (no aggregate, sort or distinct)");
+		decision(ctx, plan, "nothing worth handing to DuckDB (no join, aggregate, sort or distinct)");
 		return NULL;
 	}
 	if (parent_needs_order(ctx->parent) && !spec.ordered)
@@ -365,21 +366,43 @@ try_region(PassContext *ctx, Plan *plan)
 }
 
 /*
- * After a region is made: its Motion leaves lead to other slices, which
- * get their own regions.
+ * Only a node the deparser can make interior is worth trying as a region
+ * root; scans and the Greengage-specific nodes are leaves at best, and a
+ * decision notice for them would be noise.
+ */
+static bool
+could_be_root(Node *node)
+{
+	switch (nodeTag(node))
+	{
+		case T_Agg:
+		case T_Sort:
+		case T_Unique:
+		case T_Limit:
+		case T_Result:
+		case T_Material:
+		case T_HashJoin:
+		case T_MergeJoin:
+		case T_NestLoop:
+		case T_Append:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * After a region is made, its leaves are visited in turn: a Motion leads to
+ * another slice, a SubqueryScan, ShareInputScan or an ineligible join has
+ * a subtree of its own, and each may hold further regions.
  */
 static void
-descend_into_motion_leaves(PassContext *ctx, CustomScan *cs)
+descend_into_leaves(PassContext *ctx, CustomScan *cs)
 {
 	ListCell   *lc;
 
 	foreach(lc, cs->custom_plans)
-	{
-		Plan	   *leaf = (Plan *) lfirst(lc);
-
-		if (IsA(leaf, Motion))
-			lfirst(lc) = pass_mutator((Node *) leaf, ctx);
-	}
+		lfirst(lc) = pass_mutator((Node *) lfirst(lc), ctx);
 }
 
 static Node *
@@ -406,7 +429,7 @@ pass_mutator(Node *node, PassContext *ctx)
 		return result;
 	}
 
-	if (is_plan_node(node) && slice_runs_on_segments(ctx))
+	if (is_plan_node(node) && could_be_root(node) && slice_runs_on_segments(ctx))
 	{
 		Plan	   *region = try_region(ctx, (Plan *) node);
 
@@ -414,7 +437,7 @@ pass_mutator(Node *node, PassContext *ctx)
 		{
 			saved_parent = ctx->parent;
 			ctx->parent = region;
-			descend_into_motion_leaves(ctx, (CustomScan *) region);
+			descend_into_leaves(ctx, (CustomScan *) region);
 			ctx->parent = saved_parent;
 			return (Node *) region;
 		}

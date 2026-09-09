@@ -62,6 +62,7 @@ typedef struct GGDuckStats
 {
 	int64		queries_executed;
 	int64		errors;
+	int64		reopens;		/* instances reopened after invalidation */
 	char	   *last_error;		/* TopMemoryContext copy, or NULL */
 } GGDuckStats;
 
@@ -110,6 +111,7 @@ extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int widt
 
 #define GG_DUCKDB_REGION_NAME		"GGDuckDBRegion"
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
+#define GG_DUCKDB_LEAF_PLACEHOLDER "_gg_row"
 #define GG_DUCKDB_PRIVATE_VERSION	2
 
 /*
@@ -240,6 +242,7 @@ typedef struct GGRegionSpec
 	int			ninterior;
 	int			naggs;
 	int			nsorts;
+	int			njoins;
 	bool		ordered;		/* the query ends with the root's ORDER BY */
 	char	   *agg_order;		/* ORDER BY restoring a sorted Agg's output order, or NULL */
 } GGRegionSpec;

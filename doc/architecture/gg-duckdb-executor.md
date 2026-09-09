@@ -122,6 +122,43 @@ per-allocation accounting, DuckDB 2.0). Out of scope: DuckDB tables, DDL or writ
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
 
+## M3 findings (2026-09-09)
+
+- The region grammar grows to `base := Join(base, base) | Append(base...) |
+  Result(base) | Agg(base) | Material(base) | leaf`. A join is `SELECT <tlist> FROM
+  (outer) AS a <kind> JOIN (inner) AS b ON <hash/merge clauses AND joinqual> [WHERE
+  qual]`; the Hash node of a hash join and the Sorts of a merge join are dropped, so
+  DuckDB picks its own build side and join order. SEMI and ANTI joins map onto DuckDB's
+  `SEMI JOIN`/`ANTI JOIN`. Append is a `UNION ALL` of its children when their column
+  lists agree in DuckDB type, width and scale.
+- Both optimizers leave `HashJoin.hashqualclauses` empty for an equality join and fill
+  it only for `IS NOT DISTINCT FROM` joins. A join stays a leaf when it is a `NOT IN`
+  join, a deduplicating variant, a parameterised nested loop, or when a
+  PartitionSelector on its inner side prunes dynamic scans on its outer side (the
+  executor guarantees the build side runs first; DuckDB does not). A leaf join is still
+  a leaf of the region above it, so `Agg` over such a join is a region.
+- Two-phase aggregates: the partial phase (`AGGSPLIT_INITIAL_SERIAL`) is a region when
+  every transition value is a plain value (`count`, `sum` of `int2/int4`, `min`, `max`,
+  `bool_and/or`); the final phase (`AGGSPLIT_FINAL_DESERIAL`) above the Redistribute
+  Motion is a region that sums the partial counts and sums and takes min/max of the
+  partial extremes. The planner keeps `aggstar` set on a final `count(*)` whose single
+  argument is the partial count; ORCA clears it. `sum(int8)`, `sum(numeric)` and `avg`
+  serialise an `internal` state as `bytea` between the phases and stay on the executor.
+- A leaf that projects nothing (a join or scan under `count(*)`) is given a placeholder
+  BOOLEAN column: DuckDB requires a table function to return at least one column, and
+  with projection pushdown it asks for column 0 when it needs none.
+- DuckDB invalidates its whole database instance after an `INTERNAL` error during
+  execution (`ClientContext::ExecuteTaskInternal`) but not during `duckdb_prepare`. The
+  connection that follows any DuckDB error probes the instance with `SELECT 1` and
+  reopens it when it was invalidated (`gg_duckdb.status()` counts `reopens`).
+- After a region is made the pass visits every leaf: a Motion leads to another slice,
+  a SubqueryScan, ShareInputScan or leaf join has a subtree of its own, and each may hold
+  further regions. Decision notices are emitted only for nodes that can be a region root
+  (joins, Agg, Sort, Unique, Limit, Result, Material, Append).
+- Shared CTEs work in both optimizers with ShareInputScan producers and consumers as
+  leaves; the planner's `gp_cte_sharing = on` shape puts the producer under a
+  SubqueryScan leaf, where the aggregate below it becomes a region.
+
 ## M2 findings (2026-09-09)
 
 - The region grammar that ships: `[Limit] [Unique] [Sort] base`, hoisted into one

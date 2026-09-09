@@ -94,6 +94,18 @@ leaf_bind(duckdb_bind_info info)
 		duckdb_bind_add_result_column(info, lf->cols[i].name, lt);
 		duckdb_destroy_logical_type(&lt);
 	}
+	if (lf->ncols == 0)
+	{
+		/*
+		 * A leaf that projects nothing (count(*) above it) still has rows.
+		 * DuckDB requires a table function to return a column, so it gets a
+		 * placeholder that nothing references; leaf_scan fills it with false.
+		 */
+		duckdb_logical_type lt = duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN);
+
+		duckdb_bind_add_result_column(info, GG_DUCKDB_LEAF_PLACEHOLDER, lt);
+		duckdb_destroy_logical_type(&lt);
+	}
 	duckdb_bind_set_cardinality(info, (idx_t) Max(lf->plan_rows, 1.0), false);
 
 	bd = (LeafBindData *) malloc(sizeof(LeafBindData));
@@ -158,7 +170,7 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 		data[j] = duckdb_vector_get_data(vecs[j]);
 		duckdb_vector_ensure_validity_writable(vecs[j]);
 		validity[j] = duckdb_vector_get_validity(vecs[j]);
-		if (id->col[j] + 1 > maxattno)
+		if (id->col[j] < lf->desc.ncols && id->col[j] + 1 > maxattno)
 			maxattno = id->col[j] + 1;
 	}
 
@@ -191,6 +203,12 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 			{
 				int			col = id->col[j];
 
+				if (col >= lf->desc.ncols)
+				{
+					/* the placeholder column of a leaf without columns */
+					((bool *) data[j])[n] = false;
+					continue;
+				}
 				gg_duckdb_write_datum(&lf->desc.cols[col].type,
 									  vecs[j], data[j], validity[j], n,
 									  slot->tts_values[col], slot->tts_isnull[col]);

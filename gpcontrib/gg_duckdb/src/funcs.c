@@ -182,8 +182,8 @@ Datum
 gg_duckdb_status(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[11];
-	bool		nulls[11];
+	Datum		values[12];
+	bool		nulls[12];
 	const char *tempdir = gg_duckdb_instance_temp_directory();
 	int			i = 0;
 
@@ -220,11 +220,12 @@ gg_duckdb_status(PG_FUNCTION_ARGS)
 	}
 	values[i++] = Int64GetDatum(gg_duckdb_stats.queries_executed);
 	values[i++] = Int64GetDatum(gg_duckdb_stats.errors);
+	values[i++] = Int64GetDatum(gg_duckdb_stats.reopens);
 	if (gg_duckdb_stats.last_error)
 		values[i++] = PointerGetDatum(cstring_to_text(gg_duckdb_stats.last_error));
 	else
 		nulls[i++] = true;
-	Assert(i == 11);
+	Assert(i == 12);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

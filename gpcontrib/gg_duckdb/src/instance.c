@@ -32,6 +32,13 @@ static int	instance_threads = 0;
 static int	applied_max_memory_mb = -1;
 static char *applied_max_temp_size = NULL;
 
+/*
+ * Set by every DuckDB error.  DuckDB invalidates the whole database after an
+ * internal or fatal error, and every later query on it fails; the next
+ * connection probes a suspect instance and reopens it if that happened.
+ */
+static bool instance_suspect = false;
+
 static void
 duck_error(const char *what, const char *msg)
 {
@@ -45,6 +52,7 @@ void
 gg_duckdb_note_error(const char *msg)
 {
 	gg_duckdb_stats.errors++;
+	instance_suspect = true;
 	if (gg_duckdb_stats.last_error)
 		pfree(gg_duckdb_stats.last_error);
 	gg_duckdb_stats.last_error =
@@ -285,6 +293,24 @@ apply_settings(duckdb_connection conn)
 	}
 }
 
+/*
+ * Is the instance still usable after an error?  DuckDB refuses every query on
+ * an invalidated database with a fatal error, so a trivial one decides.
+ */
+static bool
+instance_is_valid(duckdb_connection conn)
+{
+	duckdb_result res;
+	bool		ok;
+
+	ok = duckdb_query(conn, "SELECT 1", &res) != DuckDBError;
+	if (!ok)
+		elog(LOG, "gg_duckdb: the embedded DuckDB is unusable after an earlier error: %s",
+			 duckdb_result_error(&res) ? duckdb_result_error(&res) : "unknown error");
+	duckdb_destroy_result(&res);
+	return ok;
+}
+
 duckdb_connection
 gg_duckdb_connect(void)
 {
@@ -293,6 +319,20 @@ gg_duckdb_connect(void)
 
 	if (duckdb_connect(db, &conn) == DuckDBError)
 		duck_error("could not connect to the embedded DuckDB", NULL);
+
+	if (instance_suspect)
+	{
+		instance_suspect = false;
+		if (!instance_is_valid(conn))
+		{
+			duckdb_disconnect(&conn);
+			gg_duckdb_instance_close();
+			gg_duckdb_stats.reopens++;
+			db = gg_duckdb_instance();
+			if (duckdb_connect(db, &conn) == DuckDBError)
+				duck_error("could not connect to the embedded DuckDB", NULL);
+		}
+	}
 
 	PG_TRY();
 	{

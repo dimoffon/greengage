@@ -31,6 +31,7 @@ CREATE FUNCTION gg_duckdb.status(
     OUT temp_dir_writable boolean,
     OUT queries_executed bigint,
     OUT errors bigint,
+    OUT reopens bigint,
     OUT last_error text)
 RETURNS record
 AS 'MODULE_PATHNAME', 'gg_duckdb_status'

@@ -41,6 +41,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "utils/builtins.h"
+#include "optimizer/walkers.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -57,7 +58,10 @@ typedef struct DeparseCtx
 {
 	GGRegionSpec *spec;
 	int			next_alias;
-	NodeCols   *child;			/* columns of the child of the node being deparsed */
+	NodeCols   *child;			/* columns of the outer child of the node being deparsed */
+	const char *outer_alias;	/* its alias in the FROM clause, or NULL */
+	NodeCols   *inner;			/* columns of the inner child (joins), or NULL */
+	const char *inner_alias;
 	bool		in_agg;			/* Aggrefs are allowed (Agg tlist / HAVING) */
 } DeparseCtx;
 
@@ -220,14 +224,30 @@ deparse_const(DeparseCtx *ctx, Const *c, StringInfo out, GGTypeInfo *type)
 static bool
 deparse_var(DeparseCtx *ctx, Var *var, StringInfo out, GGTypeInfo *type)
 {
-	if (var->varno != OUTER_VAR)
+	NodeCols   *cols;
+	const char *alias;
+
+	if (var->varno == OUTER_VAR)
+	{
+		cols = ctx->child;
+		alias = ctx->outer_alias;
+	}
+	else if (var->varno == INNER_VAR)
+	{
+		cols = ctx->inner;
+		alias = ctx->inner_alias;
+	}
+	else
 		REJECT(ctx, "unexpected Var reference (varno %d)", (int) var->varno);
-	if (ctx->child == NULL || var->varattno < 1 || var->varattno > ctx->child->ncols)
+	if (cols == NULL || var->varattno < 1 || var->varattno > cols->ncols)
 		REJECT(ctx, "Var attno %d out of range", (int) var->varattno);
 	if (var->varlevelsup != 0)
 		REJECT(ctx, "outer-level Var");
-	*type = ctx->child->types[var->varattno - 1];
-	appendStringInfo(out, "c%d", (int) var->varattno);
+	*type = cols->types[var->varattno - 1];
+	if (alias)
+		appendStringInfo(out, "%s.c%d", alias, (int) var->varattno);
+	else
+		appendStringInfo(out, "c%d", (int) var->varattno);
 	return true;
 }
 
@@ -429,16 +449,23 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	Oid			argtype = InvalidOid;
 	const char *cast;
 
+	bool		partial = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL;
+	bool		final = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+
 	if (!ctx->in_agg)
 		REJECT(ctx, "aggregate outside an Agg node");
-	if (agg->aggsplit != AGGSPLIT_SIMPLE)
-		REJECT(ctx, "partial or final aggregate");
+	if (agg->aggsplit != AGGSPLIT_SIMPLE && !partial && !final)
+		REJECT(ctx, "aggregate split mode %d", (int) agg->aggsplit);
 	if (agg->aggorder != NIL || agg->aggdirectargs != NIL)
 		REJECT(ctx, "ordered-set or ordered aggregate");
 	if (agg->aggkind != AGGKIND_NORMAL)
 		REJECT(ctx, "non-normal aggregate");
 	if (list_length(agg->args) > 1)
 		REJECT(ctx, "aggregate with %d arguments", list_length(agg->args));
+	if ((partial || final) && agg->aggdistinct != NIL)
+		REJECT(ctx, "DISTINCT in a split aggregate");
+	if (final && (agg->aggfilter != NULL || list_length(agg->args) != 1))
+		REJECT(ctx, "unexpected shape of a final aggregate");
 
 	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(agg->aggfnoid));
 	if (!HeapTupleIsValid(tup))
@@ -451,9 +478,13 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 		REJECT(ctx, "aggregate %s is not a builtin", name);
 
 	initStringInfo(&a);
-	if (agg->aggstar || agg->args == NIL)
+	if (!final && (agg->aggstar || agg->args == NIL))
 	{
-		/* count(*); ORCA leaves aggstar unset and the argument list empty */
+		/*
+		 * count(*): ORCA leaves aggstar unset and the argument list empty.
+		 * A final count(*) keeps aggstar but its argument is the partial
+		 * count, which is what it must sum.
+		 */
 		if (strcmp(name, "count") != 0)
 			REJECT(ctx, "aggregate %s without arguments", name);
 		appendStringInfoChar(&a, '*');
@@ -467,8 +498,41 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 			return false;
 	}
 
-	/* the result type as PostgreSQL declares it, with DuckDB's shape */
-	if (strcmp(name, "count") == 0)
+	/*
+	 * The result type as PostgreSQL declares it, with DuckDB's shape.  A
+	 * final aggregate's single argument is the partial result column; only
+	 * aggregates whose transition value is a plain value (count and integer
+	 * sums carry an int8, min/max their type, bool_and/or a bool) can be
+	 * split: the others serialise an internal state DuckDB cannot produce.
+	 */
+	if (final)
+	{
+		bool		ok = false;
+
+		if (strcmp(name, "count") == 0 || strcmp(name, "sum") == 0)
+		{
+			ok = argtype == INT8OID && agg->aggtype == INT8OID;
+			gg_duckdb_type_map(INT8OID, -1, type);
+			cast = "BIGINT";
+			name = "sum";		/* counts are combined by adding them */
+		}
+		else if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
+		{
+			ok = argtype == agg->aggtype && !type_is_float(argtype) ;
+			*type = ta;
+			cast = gg_duckdb_type_sql(type);
+		}
+		else if (strcmp(name, "bool_and") == 0 || strcmp(name, "bool_or") == 0)
+		{
+			ok = argtype == BOOLOID;
+			gg_duckdb_type_map(BOOLOID, -1, type);
+			cast = "BOOLEAN";
+		}
+		if (!ok)
+			REJECT(ctx, "final %s over a %s partial", name,
+				   OidIsValid(argtype) ? format_type_be(argtype) : "?");
+	}
+	else if (strcmp(name, "count") == 0)
 	{
 		gg_duckdb_type_map(INT8OID, -1, type);
 		cast = "BIGINT";
@@ -480,6 +544,8 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 			gg_duckdb_type_map(INT8OID, -1, type);
 			cast = "BIGINT";
 		}
+		else if (partial)
+			REJECT(ctx, "partial sum(%s) serialises an internal state", format_type_be(argtype));
 		else if (argtype == INT8OID)
 		{
 			memset(type, 0, sizeof(*type));
@@ -523,6 +589,11 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	}
 	else
 		REJECT(ctx, "aggregate %s", name);
+
+	/* the type PostgreSQL expects from this node must be what we produce */
+	if (agg->aggtype != type->typid)
+		REJECT(ctx, "aggregate %s declares %s, %s generated", name,
+			   format_type_be(agg->aggtype), format_type_be(type->typid));
 
 	appendStringInfo(out, "CAST(%s(%s%s)", name, agg->aggdistinct ? "DISTINCT " : "", a.data);
 	if (agg->aggfilter)
@@ -792,19 +863,30 @@ deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 }
 
 /*
- * SELECT <tlist> FROM (<child>) AS n<k> [WHERE ...] [GROUP BY ...] [HAVING ...]
+ * SELECT <tlist> FROM <from_clause> [WHERE ...] [GROUP BY ...] [HAVING ...]
+ *
+ * Vars of the node's expressions resolve through `outer`/`inner` and their
+ * aliases, which `from_clause` must have introduced.
  */
 static bool
-deparse_projection(DeparseCtx *ctx, Plan *plan, const char *child_sql, NodeCols *childcols,
+deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
+				   NodeCols *outer, const char *outer_alias,
+				   NodeCols *inner, const char *inner_alias,
 				   const char *group_by, bool is_agg, StringInfo out, NodeCols *cols)
 {
 	NodeCols   *saved_child = ctx->child;
+	NodeCols   *saved_inner = ctx->inner;
+	const char *saved_oa = ctx->outer_alias;
+	const char *saved_ia = ctx->inner_alias;
 	bool		saved_in_agg = ctx->in_agg;
 	ListCell   *lc;
 	int			k = 0;
 	bool		ok = true;
 
-	ctx->child = childcols;
+	ctx->child = outer;
+	ctx->outer_alias = outer_alias;
+	ctx->inner = inner;
+	ctx->inner_alias = inner_alias;
 	ctx->in_agg = is_agg;
 	cols->ncols = list_length(plan->targetlist);
 	cols->types = palloc0(sizeof(GGTypeInfo) * Max(cols->ncols, 1));
@@ -828,7 +910,7 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *child_sql, NodeCols 
 	}
 	if (ok)
 	{
-		appendStringInfo(out, " FROM (%s) AS n%d", child_sql, ctx->next_alias++);
+		appendStringInfo(out, " FROM %s", from_clause);
 		if (!is_agg && plan->qual != NIL)
 		{
 			ListCell   *qc;
@@ -871,8 +953,83 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *child_sql, NodeCols 
 		}
 	}
 	ctx->child = saved_child;
+	ctx->inner = saved_inner;
+	ctx->outer_alias = saved_oa;
+	ctx->inner_alias = saved_ia;
 	ctx->in_agg = saved_in_agg;
 	return ok;
+}
+
+/* "(<sql>) AS n<k>" with a fresh alias; the alias is returned through *alias. */
+static char *
+subquery_from(DeparseCtx *ctx, const char *sql, char **alias)
+{
+	*alias = psprintf("n%d", ctx->next_alias++);
+	return psprintf("(%s) AS %s", sql, *alias);
+}
+
+static bool partition_selector_hazard(Plan *outer, Plan *inner);
+
+/*
+ * Why a join must stay a leaf, or NULL when DuckDB can run it.
+ */
+static const char *
+join_leaf_reason(Plan *plan)
+{
+	Join	   *join = (Join *) plan;
+
+	if (plan->initPlan != NIL)
+		return "join with an InitPlan";
+	if (plan->lefttree == NULL || plan->righttree == NULL)
+		return "join without two inputs";
+	/* the executor keeps the build-side-first order such a join needs */
+	if (partition_selector_hazard(plan->lefttree, plan->righttree))
+		return "a PartitionSelector on the inner side prunes the outer side";
+	switch (join->jointype)
+	{
+		case JOIN_INNER:
+		case JOIN_LEFT:
+		case JOIN_RIGHT:
+		case JOIN_FULL:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+			break;
+		case JOIN_LASJ_NOTIN:
+			return "NOT IN join";
+		default:
+			return "join type with deduplication";
+	}
+	if (IsA(plan, NestLoop))
+	{
+		NestLoop   *nl = (NestLoop *) plan;
+
+		if (nl->nestParams != NIL)
+			return "nested loop with parameters";
+		if (nl->shared_outer || nl->singleton_outer)
+			return "nested loop with a shared or singleton outer side";
+		return NULL;
+	}
+	if (IsA(plan, HashJoin))
+	{
+		HashJoin   *hj = (HashJoin *) plan;
+
+		/*
+		 * Both optimizers leave hashqualclauses empty for an equality join;
+		 * only IS NOT DISTINCT FROM joins fill it (nodeHashjoin.c).
+		 */
+		if (hj->hashqualclauses != NIL)
+			return "IS NOT DISTINCT FROM join";
+		if (!IsA(plan->righttree, Hash))
+			return "hash join without a Hash input";
+		return NULL;
+	}
+	return IsA(plan, MergeJoin) ? NULL : "unknown join node";
+}
+
+static bool
+join_is_interior(Plan *plan)
+{
+	return join_leaf_reason(plan) == NULL;
 }
 
 static bool
@@ -880,6 +1037,17 @@ node_is_interior_base(Plan *plan)
 {
 	switch (nodeTag(plan))
 	{
+		case T_HashJoin:
+		case T_MergeJoin:
+		case T_NestLoop:
+			return join_is_interior(plan);
+		case T_Append:
+			{
+				Append	   *ap = (Append *) plan;
+
+				return plan->initPlan == NIL && ap->appendplans != NIL &&
+					ap->part_prune_info == NULL && ap->join_prune_paramids == NIL;
+			}
 		case T_Result:
 			{
 				Result	   *r = (Result *) plan;
@@ -892,7 +1060,10 @@ node_is_interior_base(Plan *plan)
 				Agg		   *agg = (Agg *) plan;
 
 				if (plan->lefttree == NULL || plan->initPlan != NIL ||
-					agg->aggsplit != AGGSPLIT_SIMPLE || agg->groupingSets != NIL ||
+					(agg->aggsplit != AGGSPLIT_SIMPLE &&
+					 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
+					 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL) ||
+					agg->groupingSets != NIL ||
 					agg->chain != NIL || agg->aggParams != NULL)
 					return false;
 				if (agg->aggstrategy == AGG_PLAIN || agg->aggstrategy == AGG_HASHED)
@@ -967,11 +1138,100 @@ sorted_agg_order(DeparseCtx *ctx, Agg *agg, Sort *sort, NodeCols *cols)
 	return true;
 }
 
+/*
+ * A PartitionSelector on the inner side of a join feeds the dynamic scans on
+ * its outer side through a parameter, which is only complete once the inner
+ * side is exhausted.  DuckDB gives no build-side-first guarantee, so such a
+ * join is never interior: it stays a leaf run by the executor.
+ */
+typedef struct PruneCtx
+{
+	plan_tree_base_prefix base;
+	List	   *paramids;
+	bool		hit;
+} PruneCtx;
+
+static bool
+collect_selector_params(Node *node, PruneCtx *pctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, PartitionSelector))
+		pctx->paramids = lappend_int(pctx->paramids, ((PartitionSelector *) node)->paramid);
+	return plan_tree_walker(node, collect_selector_params, pctx, false);
+}
+
+static bool
+uses_selector_params(Node *node, PruneCtx *pctx)
+{
+	List	   *ids = NIL;
+	ListCell   *lc;
+
+	if (node == NULL)
+		return false;
+	switch (nodeTag(node))
+	{
+		case T_DynamicSeqScan:
+			ids = ((DynamicSeqScan *) node)->join_prune_paramids;
+			break;
+		case T_DynamicIndexScan:
+			ids = ((DynamicIndexScan *) node)->join_prune_paramids;
+			break;
+		case T_DynamicIndexOnlyScan:
+			ids = ((DynamicIndexOnlyScan *) node)->join_prune_paramids;
+			break;
+		case T_DynamicBitmapHeapScan:
+			ids = ((DynamicBitmapHeapScan *) node)->join_prune_paramids;
+			break;
+		case T_DynamicForeignScan:
+			ids = ((DynamicForeignScan *) node)->join_prune_paramids;
+			break;
+		case T_Append:
+			ids = ((Append *) node)->join_prune_paramids;
+			break;
+		case T_MergeAppend:
+			ids = ((MergeAppend *) node)->join_prune_paramids;
+			break;
+		default:
+			break;
+	}
+	foreach(lc, ids)
+	{
+		if (list_member_int(pctx->paramids, lfirst_int(lc)))
+		{
+			pctx->hit = true;
+			return true;
+		}
+	}
+	return plan_tree_walker(node, uses_selector_params, pctx, false);
+}
+
+static bool
+partition_selector_hazard(Plan *outer, Plan *inner)
+{
+	PruneCtx	pctx;
+
+	memset(&pctx, 0, sizeof(pctx));
+	collect_selector_params((Node *) inner, &pctx);
+	if (pctx.paramids == NIL)
+		return false;
+	uses_selector_params((Node *) outer, &pctx);
+	return pctx.hit;
+}
+
+static bool deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols);
+static bool deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols);
+
 static bool
 deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
 	if (!node_is_interior_base(plan))
 		return deparse_leaf(ctx, plan, out, cols);
+
+	if (IsA(plan, HashJoin) || IsA(plan, MergeJoin) || IsA(plan, NestLoop))
+		return deparse_join(ctx, plan, out, cols);
+	if (IsA(plan, Append))
+		return deparse_append(ctx, (Append *) plan, out, cols);
 
 	if (IsA(plan, Material))
 		return deparse_base(ctx, plan->lefttree, out, cols);
@@ -980,6 +1240,8 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 		StringInfoData child_sql;
 		NodeCols	childcols;
 		Plan	   *child = plan->lefttree;
+		char	   *from;
+		char	   *alias;
 
 		/* the Sort that groups a sorted Agg is not needed: DuckDB hashes */
 		if (IsA(plan, Agg) && ((Agg *) plan)->aggstrategy == AGG_SORTED &&
@@ -1023,18 +1285,21 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 
 				initStringInfo(&cq);
 				ctx->child = &childcols;
+				ctx->outer_alias = NULL;
 				ok = deparse_expr(ctx, r->resconstantqual, &cq, &t);
 				ctx->child = NULL;
 				if (!ok)
 					return false;
 				plan->qual = lappend(list_copy(plan->qual), r->resconstantqual);
-				ok = deparse_projection(ctx, plan, child_sql.data, &childcols, NULL, false, out, cols);
+				from = subquery_from(ctx, child_sql.data, &alias);
+				ok = deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 				plan->qual = saved_qual;
 				ctx->spec->ninterior++;
 				return ok;
 			}
 			ctx->spec->ninterior++;
-			return deparse_projection(ctx, plan, child_sql.data, &childcols, NULL, false, out, cols);
+			from = subquery_from(ctx, child_sql.data, &alias);
+			return deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 		}
 		else
 		{
@@ -1042,6 +1307,7 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			StringInfoData gb;
 			int			i;
 
+			from = subquery_from(ctx, child_sql.data, &alias);
 			initStringInfo(&gb);
 			if (agg->numCols > 0)
 			{
@@ -1054,12 +1320,12 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 						REJECT(ctx, "grouping column out of range");
 					if (type_is_float(childcols.types[col - 1].typid))
 						REJECT(ctx, "grouping by a float");
-					appendStringInfo(&gb, "%sc%d", i > 0 ? ", " : "", col);
+					appendStringInfo(&gb, "%s%s.c%d", i > 0 ? ", " : "", alias, col);
 				}
 			}
 			ctx->spec->ninterior++;
 			ctx->spec->naggs++;
-			if (!deparse_projection(ctx, plan, child_sql.data, &childcols,
+			if (!deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL,
 									agg->numCols > 0 ? gb.data : NULL, true, out, cols))
 				return false;
 			if (agg->aggstrategy == AGG_SORTED && agg->numCols > 0)
@@ -1067,6 +1333,153 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			return true;
 		}
 	}
+}
+
+/*
+ * A join: SELECT <tlist> FROM (<outer>) AS a <kind> JOIN (<inner>) AS b
+ * ON <clauses> [WHERE <plan.qual>].  DuckDB picks its own join order and
+ * build side; the Sort children PostgreSQL added for a merge join and the
+ * Hash node of a hash join are not needed.
+ */
+static bool
+deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
+{
+	Join	   *join = (Join *) plan;
+	Plan	   *outerp = plan->lefttree;
+	Plan	   *innerp = plan->righttree;
+	StringInfoData osql,
+				isql,
+				cond,
+				from;
+	NodeCols	ocols,
+				icols;
+	char	   *oalias,
+			   *ialias;
+	List	   *clauses = NIL;
+	ListCell   *lc;
+	const char *kind;
+	NodeCols   *saved_child = ctx->child;
+	NodeCols   *saved_inner = ctx->inner;
+	const char *saved_oa = ctx->outer_alias;
+	const char *saved_ia = ctx->inner_alias;
+	bool		ok = true;
+
+	if (IsA(innerp, Hash))
+		innerp = innerp->lefttree;
+	if (IsA(outerp, Sort) && outerp->initPlan == NIL)
+		outerp = outerp->lefttree;
+	if (IsA(innerp, Sort) && innerp->initPlan == NIL)
+		innerp = innerp->lefttree;
+
+	initStringInfo(&osql);
+	initStringInfo(&isql);
+	if (!deparse_base(ctx, outerp, &osql, &ocols) ||
+		!deparse_base(ctx, innerp, &isql, &icols))
+		return false;
+
+	switch (join->jointype)
+	{
+		case JOIN_INNER: kind = "JOIN"; break;
+		case JOIN_LEFT: kind = "LEFT JOIN"; break;
+		case JOIN_RIGHT: kind = "RIGHT JOIN"; break;
+		case JOIN_FULL: kind = "FULL OUTER JOIN"; break;
+		case JOIN_SEMI: kind = "SEMI JOIN"; break;
+		case JOIN_ANTI: kind = "ANTI JOIN"; break;
+		default: REJECT(ctx, "join type %d", (int) join->jointype);
+	}
+
+	if (IsA(plan, HashJoin))
+		clauses = list_copy(((HashJoin *) plan)->hashclauses);
+	else if (IsA(plan, MergeJoin))
+		clauses = list_copy(((MergeJoin *) plan)->mergeclauses);
+	clauses = list_concat(clauses, list_copy(join->joinqual));
+
+	initStringInfo(&from);
+	appendStringInfoString(&from, subquery_from(ctx, osql.data, &oalias));
+	appendStringInfo(&from, " %s ", kind);
+	appendStringInfoString(&from, subquery_from(ctx, isql.data, &ialias));
+
+	ctx->child = &ocols;
+	ctx->outer_alias = oalias;
+	ctx->inner = &icols;
+	ctx->inner_alias = ialias;
+	initStringInfo(&cond);
+	if (clauses == NIL)
+		appendStringInfoString(&cond, "TRUE");
+	foreach(lc, clauses)
+	{
+		GGTypeInfo	t;
+
+		if (lc != list_head(clauses))
+			appendStringInfoString(&cond, " AND ");
+		if (!deparse_expr(ctx, (Node *) lfirst(lc), &cond, &t))
+		{
+			ok = false;
+			break;
+		}
+	}
+	ctx->child = saved_child;
+	ctx->inner = saved_inner;
+	ctx->outer_alias = saved_oa;
+	ctx->inner_alias = saved_ia;
+	if (!ok)
+		return false;
+	appendStringInfo(&from, " ON %s", cond.data);
+
+	ctx->spec->ninterior++;
+	ctx->spec->njoins++;
+	return deparse_projection(ctx, plan, from.data, &ocols, oalias, &icols, ialias,
+							  NULL, false, out, cols);
+}
+
+/*
+ * Append: SELECT <tlist> FROM ((<child1>) UNION ALL (<child2>) ...) AS n<k>.
+ * Every child exposes the same columns in the same order.
+ */
+static bool
+deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols)
+{
+	StringInfoData u;
+	NodeCols	first;
+	ListCell   *lc;
+	char	   *alias;
+	char	   *from;
+	bool		have_first = false;
+
+	initStringInfo(&u);
+	foreach(lc, ap->appendplans)
+	{
+		Plan	   *child = (Plan *) lfirst(lc);
+		StringInfoData csql;
+		NodeCols	ccols;
+
+		initStringInfo(&csql);
+		if (!deparse_base(ctx, child, &csql, &ccols))
+			return false;
+		if (have_first)
+		{
+			int			i;
+
+			if (ccols.ncols != first.ncols)
+				REJECT(ctx, "Append children with different column counts");
+			for (i = 0; i < ccols.ncols; i++)
+				if (ccols.types[i].duck != first.types[i].duck ||
+					ccols.types[i].width != first.types[i].width ||
+					ccols.types[i].scale != first.types[i].scale)
+					REJECT(ctx, "Append children with different column types");
+			appendStringInfoString(&u, " UNION ALL ");
+		}
+		else
+		{
+			first = ccols;
+			have_first = true;
+		}
+		appendStringInfo(&u, "(%s)", csql.data);
+	}
+	ctx->spec->ninterior++;
+	from = subquery_from(ctx, u.data, &alias);
+	return deparse_projection(ctx, (Plan *) ap, from, &first, alias, NULL, NULL,
+							  NULL, false, out, cols);
 }
 
 /*
@@ -1156,6 +1569,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->ninterior = 0;
 	spec->naggs = 0;
 	spec->nsorts = 0;
+	spec->njoins = 0;
 	spec->agg_order = NULL;
 	spec->ordered = false;
 
@@ -1203,7 +1617,11 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	if (!deparse_base(&ctx, node, &base_sql, &cols))
 		return false;
 	if (limit == NULL && uniq == NULL && sort == NULL && spec->ninterior == 0)
+	{
+		if (IsA(node, HashJoin) || IsA(node, MergeJoin) || IsA(node, NestLoop))
+			REJECT(&ctx, "%s", join_leaf_reason(node));
 		REJECT(&ctx, "nothing for DuckDB to do");
+	}
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql, "SELECT %s* FROM (%s) AS n%d", uniq ? "DISTINCT " : "",
@@ -1256,9 +1674,11 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 			appendStringInfoString(&label, "Unique ");
 		if (sort)
 			appendStringInfoString(&label, "Sort ");
+		for (i = 0; i < spec->njoins; i++)
+			appendStringInfoString(&label, "Join ");
 		for (i = 0; i < spec->naggs; i++)
 			appendStringInfoString(&label, "Agg ");
-		appendStringInfo(&label, "over %d leaf%s", spec->nleaves, spec->nleaves == 1 ? "" : "ves");
+		appendStringInfo(&label, "over %d %s", spec->nleaves, spec->nleaves == 1 ? "leaf" : "leaves");
 		spec->label = label.data;
 	}
 	return true;

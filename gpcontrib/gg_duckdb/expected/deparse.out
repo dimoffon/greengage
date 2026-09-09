@@ -21,7 +21,7 @@ SET gp_enable_multiphase_agg = off;
 EXPLAIN (COSTS OFF)
 SELECT id, count(*), sum(qty), min(amount), max(ts), bool_and(flag)
   FROM d_orders WHERE id < 3000 GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(c3) AS BIGINT) AS c3, CAST(min(c4) AS DECIMAL(12,2)) AS c4, CAST(max(c5) AS TIMESTAMP) AS c5, CAST(bool_and(c8) AS BOOLEAN) AS c6 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c4) AS DECIMAL(12,2)) AS c4, CAST(max(n1.c5) AS TIMESTAMP) AS c5, CAST(bool_and(n1.c8) AS BOOLEAN) AS c6 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -34,15 +34,15 @@ NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT id, count(*) AS n FROM d_orders WHERE id < 30 GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2 ORDER BY c1 ASC NULLS LAST
-                                                                               QUERY PLAN                                                                               
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
+                                                                                  QUERY PLAN                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Output: gg_duckdb_region.id, gg_duckdb_region.n
    ->  Custom Scan (GGDuckDBRegion)
          Output: gg_duckdb_region.id, gg_duckdb_region.n
          DuckDB: Agg over 1 leaf
-         DuckDB SQL: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2 ORDER BY c1 ASC NULLS LAST
+         DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
          ->  Seq Scan on public.d_orders
                Output: d_orders.id
                Filter: (d_orders.id < 30)
@@ -70,7 +70,6 @@ EXPLAIN (COSTS OFF)
 SELECT note, id FROM d_orders ORDER BY note, id LIMIT 3;
 NOTICE:  gg_duckdb: Limit (plan node 2): not eligible: sorting text under a non-C collation
 NOTICE:  gg_duckdb: Sort (plan node 3): not eligible: sorting text under a non-C collation
-NOTICE:  gg_duckdb: SeqScan (plan node 4): not eligible: nothing for DuckDB to do
                    QUERY PLAN                   
 ------------------------------------------------
  Limit
@@ -215,10 +214,10 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1655781)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1702324)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1655781)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1702324)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -250,7 +249,6 @@ SET gg_duckdb.explain_decisions = on;
 SET gg_duckdb.validate_at_plan_time = on;
 EXPLAIN (COSTS OFF) SELECT id, sum(f8) FROM d_orders GROUP BY id;   -- float sum: not eligible
 NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: sum(double precision)
-NOTICE:  gg_duckdb: SeqScan (plan node 2): not eligible: nothing for DuckDB to do
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)

@@ -2,19 +2,22 @@
 
 `gg_duckdb` embeds [DuckDB](https://duckdb.org) in every Greengage backend as a
 second executor for segment-local, Motion-free parts of a plan. This directory
-is at **milestone M2**: the library builds into the tree, loads on the
+is at **milestone M3**: the library builds into the tree, loads on the
 coordinator and on every segment, opens a per-backend DuckDB instance lazily on
 the backend thread, and with `gg_duckdb.mode = auto|force` a planner pass turns
-eligible segment-local subtrees into DuckDB regions: plain, hashed and sorted
-aggregates (`count`, `sum`, `min`, `max`, `bool_and`, `bool_or`, with DISTINCT
-and FILTER), projections, and top chains of `ORDER BY`, `DISTINCT` and
-`LIMIT/OFFSET` over a whitelist of types, operators and functions whose DuckDB
-semantics equal PostgreSQL's. Leaves (scans, Motion receivers, anything else)
-stay ordinary plan nodes pulled by DuckDB on the backend thread. Every region
-query is prepared on the coordinator before it is used, so an ineligible or
-unbindable subtree simply stays on the standard executor. Joins, Append and
-two-phase aggregates come with M3; the design is in
-`doc/architecture/gg-duckdb-executor.md`.
+eligible segment-local subtrees into DuckDB regions: hash, merge and nested-loop
+joins (inner, left, right, full, semi, anti), `UNION ALL` appends, plain,
+hashed and sorted aggregates (`count`, `sum`, `min`, `max`, `bool_and`,
+`bool_or`, with DISTINCT and FILTER) including the partial and final phases of
+a two-phase aggregate, projections, and top chains of `ORDER BY`, `DISTINCT`
+and `LIMIT/OFFSET` over a whitelist of types, operators and functions whose
+DuckDB semantics equal PostgreSQL's. Leaves (scans, Motion receivers, shared
+scans, subquery scans, joins DuckDB may not run, anything else) stay ordinary
+plan nodes pulled by DuckDB on the backend thread, and the subtree under a leaf
+gets regions of its own. Every region query is prepared on the coordinator
+before it is used, so an ineligible or unbindable subtree simply stays on the
+standard executor. Hints and the cost calibration come with M4; the design is
+in `doc/architecture/gg-duckdb-executor.md`.
 
 ## Design in one paragraph
 
@@ -85,7 +88,12 @@ deparser: EXPLAIN shapes and decision notices, nine differential comparisons
 (grouped aggregates with expressions, FILTER, DISTINCT, collated min, int8 and
 numeric sums; sort-limit chains with NULLS FIRST/LAST and OFFSET; DISTINCT;
 regions above Redistribute Motion leaves), division by zero, the auto-mode
-gate, and the collation and float-sum rejections.
+gate, and the collation and float-sum rejections. `joins` covers milestone M3
+with 19 differential comparisons: every join kind with NULL keys, three-way
+joins, a nested loop with an inequality, `UNION ALL` under an aggregate,
+two-phase aggregates across a Redistribute Motion (forced and as the
+optimizers choose them), a shared CTE, `NOT IN` and dynamic partition
+elimination (both stay leaves), and LIMIT early stop across slices.
 
 ## Measured on the development host (DuckDB 1.5.5, 2026-09-09)
 
