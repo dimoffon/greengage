@@ -178,10 +178,43 @@ page reading.
   to a PostgreSQL-generated reference through the standalone scan and through regions;
   pushed and local quals; the reader inlined into a partial aggregate region; correlated
   rescans; ANALYZE statistics; IMPORT; refused locations and formats; a table over a
-  single file (two segments read nothing). Not in this milestone: remote object stores
-  (DuckDB's `httpfs` is not in the build, and it bundles its own OpenSSL while the
-  backend's libcrypto is loaded globally), row-group-level sharding of a single large
-  file, writes through DuckDB.
+  single file (two segments read nothing). Not in this milestone: row-group-level
+  sharding of a single large file, writes through DuckDB.
+- **S3 and Apache Iceberg.** `duckdb/build.sh` with `DUCKDB_REMOTE_EXTENSIONS=1` and
+  `DUCKDB_VCPKG=<checkout>` links DuckDB's `httpfs`, `avro` and `iceberg` extensions at
+  the commits 1.5.5 pins; their native dependencies (OpenSSL, curl, the AWS SDK, avro-c,
+  roaring) come from vcpkg at the tag DuckDB pins, as in DuckDB's own extension builds
+  (`httpfs` insists on a static OpenSSL, so vcpkg's 3.6 is linked in; the library is
+  linked with `--exclude-libs,ALL`, which leaves the 1300 `duckdb_*` C API symbols
+  exported and hides the 1600 OpenSSL and curl ones that would otherwise interpose on
+  the backend's libssl/libcrypto 3.0). httpfs takes the process environment's
+  `http_proxy` as its default and rejected this host's spelling of it at the first
+  request; the instance clears it at open and `gg_duckdb.http_proxy` sets one explicitly.
+  A server carries `s3_endpoint`, `s3_region`, `s3_url_style`, `s3_use_ssl`, a user
+  mapping `s3_access_key_id`, `s3_secret_access_key`, `s3_session_token`; before a scan
+  lists its files the wrapper issues `CREATE OR REPLACE TEMPORARY SECRET` per bucket of
+  the table's locations in the backend's instance (secrets are instance-wide and stay in
+  memory). DuckDB's `allowed_directories` sandbox normalises every entry to a local path,
+  so a remote prefix in `gg_duckdb.data_directories` leaves `enable_external_access` on
+  for that backend: the wrapper's validator and run-time checks are the guard, and
+  `gg_duckdb.query()` is a superuser tool. `format 'iceberg'` reads the table's current
+  snapshot with `iceberg_scan(location, allow_moved_paths=true)`; the "file list" of such
+  a table is its one location, so on an all-segments table exactly one segment reads it
+  and the others substitute the empty relation, while `mpp_execute 'coordinator'` reads
+  it on the coordinator. A table read by its directory needs DuckDB's
+  `unsafe_enable_version_guessing` (catalog-written tables have no `version-hint.text`;
+  DuckDB picks the lexicographically newest `metadata/*.metadata.json`), which the scan's
+  connection sets; a metadata file as the location reads exactly that version. Sharding
+  an Iceberg table by data file (possible when its snapshot carries no delete files) and
+  reading through a REST catalog (`ATTACH ... (TYPE ICEBERG)`) are later refinements.
+  Verified against the stack under both optimizers: six Parquet parts read by three
+  segments with none read twice, results equal to the reference through the scan and
+  through regions, CSV and JSON, the Iceberg table's current snapshot (5900 rows after
+  the delete) with quals and in regions, ANALYZE and IMPORT over S3. `test/external/` provides a
+  Compose stack (MinIO on 9100, `tabulario/iceberg-rest` on 8181, a pyiceberg job that
+  writes six Parquet parts, a CSV, a JSON and the table `demo.events` with two appends
+  and a delete) and `run.sh` with the checks against a reference generated in
+  PostgreSQL.
 - **Trap found on the way.** A query state on the stack with a memory-context reset
   callback pointing at it crashes when the context is deleted after the function returned
   (ANALYZE's sampler): such states are palloc'd in the parent context.

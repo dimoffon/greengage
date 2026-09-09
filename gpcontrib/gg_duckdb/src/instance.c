@@ -236,10 +236,43 @@ open_instance(void)
 				appendStringInfoChar(&list, ']');
 				run_setting(conn, list.data);
 			}
-			run_setting(conn, "SET enable_external_access = false");
+			/*
+			 * DuckDB's sandbox knows only local directories: a remote prefix
+			 * (s3://, http://) in the list needs external access, and then
+			 * the wrapper's own checks are the guard.
+			 */
+			if (strstr(dirs, "://") == NULL)
+				run_setting(conn, "SET enable_external_access = false");
+			else
+				elog(DEBUG1, "gg_duckdb: gg_duckdb.data_directories names a remote location; DuckDB's external access stays on");
 			if (applied_data_directories)
 				pfree(applied_data_directories);
 			applied_data_directories = MemoryContextStrdup(TopMemoryContext, dirs);
+
+			/*
+			 * httpfs, when linked, takes the process environment's http_proxy
+			 * as its default and rejects some spellings of it at the first
+			 * request; a server takes its proxy from gg_duckdb.http_proxy.
+			 * Without httpfs the setting does not exist: ignored.
+			 */
+			{
+				const char *proxy = gg_duckdb_http_proxy ? gg_duckdb_http_proxy : "";
+				StringInfoData psql;
+				duckdb_result pres;
+
+				initStringInfo(&psql);
+				appendStringInfoString(&psql, "SET http_proxy = '");
+				for (; *proxy; proxy++)
+				{
+					if (*proxy == '\'')
+						appendStringInfoChar(&psql, '\'');
+					appendStringInfoChar(&psql, *proxy);
+				}
+				appendStringInfoChar(&psql, '\'');
+				(void) duckdb_query(conn, psql.data, &pres);
+				duckdb_destroy_result(&pres);
+				pfree(psql.data);
+			}
 
 			gg_duckdb_register_leaf_function(conn);
 		}

@@ -52,7 +52,16 @@ make && make install                                       # copies libduckdb.so
 Without `--with-duckdb` the directory is skipped entirely. `build.sh` builds the
 `core_functions`, `parquet`, `icu` and `json` extensions statically, disables
 runtime extension loading, sanitizers and `OVERRIDE_NEW_DELETE`, and keeps the
-DuckDB CLI in `PREFIX/bin` for data generation.
+DuckDB CLI in `PREFIX/bin` for data generation. For S3 and Apache Iceberg
+add DuckDB's `httpfs`, `avro` and `iceberg` extensions at the commits 1.5.5
+pins (`duckdb/extensions.cmake`); their native dependencies come from vcpkg
+at the tag DuckDB pins, and the static archives' symbols are hidden so the
+bundled OpenSSL and curl never meet the backend's own:
+
+```sh
+git clone --branch 2025.12.12 https://github.com/microsoft/vcpkg $HOME/vcpkg && $HOME/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+DUCKDB_REMOTE_EXTENSIONS=1 DUCKDB_VCPKG=$HOME/vcpkg gpcontrib/gg_duckdb/duckdb/build.sh $HOME/duckdb-1.5.5   # ~15 min more
+```
 
 ## Running
 
@@ -128,7 +137,34 @@ the default, `csv` or `json`, also settable on the server or the wrapper),
 options `header`, `delim`, `quote`, `escape`, `nullstr`, `skip`,
 `dateformat`, `timestampformat`, `compression`, `sample_size`,
 `maximum_object_size`, passed to DuckDB's `read_csv`/`read_json`; a column
-option `column_name` maps a column to a differently named file column. The
+option `column_name` maps a column to a differently named file column. With
+a DuckDB built with `DUCKDB_REMOTE_EXTENSIONS=1` (see `duckdb/build.sh`) the
+location may be an S3 URL and the format `iceberg`:
+
+```sql
+CREATE SERVER minio FOREIGN DATA WRAPPER gg_duckdb
+    OPTIONS (s3_endpoint 'localhost:9100', s3_url_style 'path', s3_use_ssl 'false', s3_region 'us-east-1');
+CREATE USER MAPPING FOR CURRENT_USER SERVER minio
+    OPTIONS (s3_access_key_id 'ggadmin', s3_secret_access_key 'gg-secret-1');
+CREATE FOREIGN TABLE events (...) SERVER minio OPTIONS (location 's3://ggduck/files/events/*.parquet');
+CREATE FOREIGN TABLE ice (...) SERVER minio OPTIONS (location 's3://ggduck/warehouse/demo/events', format 'iceberg');
+```
+
+The endpoint, region, URL style and TLS flag are server options, the keys
+(and an optional `s3_session_token`) user mapping options; the wrapper turns
+them into a DuckDB secret scoped to the table's buckets in each backend's
+instance. An Iceberg location is the table's directory (its `metadata/`
+inside) or a metadata file; the table's current snapshot is read by one
+process (the segment its location falls to, or the coordinator with
+`mpp_execute 'coordinator'`), with deletes applied by DuckDB's reader.
+`gg_duckdb.data_directories` must list the remote prefix (`s3://ggduck/`); a
+remote prefix keeps DuckDB's external access on for that backend, since
+DuckDB's own sandbox knows only local directories, so the wrapper's checks
+are the guard there and `gg_duckdb.query()` stays a superuser tool. The
+process environment's `http_proxy` is ignored; `gg_duckdb.http_proxy`
+(`host:port`, superuser) names one when remote files need it.
+`test/external/` holds a Compose stack (MinIO, an Iceberg REST catalog, a
+job that fills them) and `run.sh` with the checks. The
 wrapper's default `mpp_execute` is `all segments`: every segment expands
 the location and reads the files whose path hash falls to it, so a table
 over N files is read by min(N, segments) segments in parallel; a table with

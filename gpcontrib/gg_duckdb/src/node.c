@@ -383,6 +383,7 @@ region_exec(CustomScanState *node)
 		bctx.leaves = descs;
 		st->q.sql = gg_duckdb_region_sql(st->sql, st->natives, list_length(st->q.params),
 										 true, &st->q.file_lists);
+		st->q.pre_sql = gg_duckdb_native_pre_sql(st->natives);
 		gg_duckdb_query_start(&st->q, &bctx);
 	}
 	gg_duckdb_query_next(&st->q, slot);

@@ -25,6 +25,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_user_mapping.h"
 #include "cdb/cdbpathlocus.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
@@ -58,6 +59,9 @@ PG_FUNCTION_INFO_V1(gg_duckdb_foreign_files);
 
 #define GG_FDW_PRIVATE_VERSION	1
 
+static char *duck_literal(const char *s);
+static List *duck_text_column(const char *sql, const char *what);
+
 /* ---------- options ---------- */
 
 typedef struct GGForeignOptions
@@ -80,6 +84,14 @@ static const GGOptionDef valid_options[] =
 	{"format", ForeignDataWrapperRelationId},
 	{"format", ForeignServerRelationId},
 	{"format", ForeignTableRelationId},
+	/* S3-compatible stores: the endpoint on the server, the keys on the user mapping */
+	{"s3_endpoint", ForeignServerRelationId},
+	{"s3_region", ForeignServerRelationId},
+	{"s3_url_style", ForeignServerRelationId},
+	{"s3_use_ssl", ForeignServerRelationId},
+	{"s3_access_key_id", UserMappingRelationId},
+	{"s3_secret_access_key", UserMappingRelationId},
+	{"s3_session_token", UserMappingRelationId},
 	{"location", ForeignTableRelationId},
 	{"hive_partitioning", ForeignServerRelationId},
 	{"hive_partitioning", ForeignTableRelationId},
@@ -121,7 +133,13 @@ static bool
 format_is_known(const char *format)
 {
 	return strcmp(format, "parquet") == 0 || strcmp(format, "csv") == 0 ||
-		strcmp(format, "json") == 0;
+		strcmp(format, "json") == 0 || strcmp(format, "iceberg") == 0;
+}
+
+static bool
+is_remote(const char *path)
+{
+	return strstr(path, "://") != NULL;
 }
 
 /* Split a comma-separated location list; blanks around entries are dropped. */
@@ -181,7 +199,7 @@ location_allowed(const char *location, List *dirs)
 {
 	ListCell   *lc;
 
-	if (location[0] != '/')
+	if (location[0] != '/' && !is_remote(location))
 		return false;
 	foreach(lc, dirs)
 	{
@@ -209,7 +227,7 @@ check_locations(List *locations)
 		if (strstr(loc, "/../") != NULL || strstr(loc, "'") != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("gg_duckdb: location \"%s\" is not a plain absolute path", loc)));
+					 errmsg("gg_duckdb: location \"%s\" is not a plain absolute path or URL", loc)));
 		if (!location_allowed(loc, dirs))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -307,10 +325,143 @@ gg_duckdb_fdw_validator(PG_FUNCTION_ARGS)
 						 errmsg("gg_duckdb: location must name at least one file or pattern")));
 			check_locations(locs);
 		}
-		if (strcmp(def->defname, "hive_partitioning") == 0 || strcmp(def->defname, "union_by_name") == 0)
+		if (strcmp(def->defname, "hive_partitioning") == 0 || strcmp(def->defname, "union_by_name") == 0 ||
+			strcmp(def->defname, "s3_use_ssl") == 0)
 			(void) defGetBoolean(def);
+		if (strcmp(def->defname, "s3_url_style") == 0 &&
+			strcmp(defGetString(def), "path") != 0 && strcmp(defGetString(def), "vhost") != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("gg_duckdb: s3_url_style must be path or vhost")));
 	}
 	PG_RETURN_VOID();
+}
+
+/*
+ * The S3 credentials of a server: the endpoint and style from the server,
+ * the keys from the caller's user mapping, as a DuckDB secret scoped to the
+ * buckets of the table's locations.  Temporary secrets live in the backend's
+ * DuckDB instance; creating them again is cheap and picks up changes.
+ */
+static void ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o);
+
+static void
+ensure_s3_secrets(Oid relid, GGForeignOptions *o)
+{
+	ensure_s3_secrets_for_server(GetForeignTable(relid)->serverid, o);
+}
+
+static void
+ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o)
+{
+	ForeignServer *server = GetForeignServer(serverid);
+	UserMapping *um = NULL;
+	const char *endpoint = NULL,
+			   *region = NULL,
+			   *url_style = NULL,
+			   *key_id = NULL,
+			   *secret = NULL,
+			   *token = NULL;
+	bool		use_ssl = true;
+	bool		have_ssl = false;
+	ListCell   *lc;
+	List	   *scopes = NIL;
+	bool		any_s3 = false;
+
+	foreach(lc, o->locations)
+	{
+		const char *loc = (const char *) lfirst(lc);
+
+		if (strncmp(loc, "s3://", 5) == 0 || strncmp(loc, "s3a://", 6) == 0)
+		{
+			const char *b = strstr(loc, "://") + 3;
+			const char *e = strchr(b, '/');
+			char	   *scope = e ? psprintf("s3://%.*s", (int) (e - b), b) : psprintf("s3://%s", b);
+			bool		dup = false;
+			ListCell   *sc;
+
+			any_s3 = true;
+			foreach(sc, scopes)
+				if (strcmp((char *) lfirst(sc), scope) == 0)
+					dup = true;
+			if (!dup)
+				scopes = lappend(scopes, scope);
+		}
+	}
+	if (!any_s3)
+		return;
+
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "s3_endpoint") == 0)
+			endpoint = defGetString(def);
+		else if (strcmp(def->defname, "s3_region") == 0)
+			region = defGetString(def);
+		else if (strcmp(def->defname, "s3_url_style") == 0)
+			url_style = defGetString(def);
+		else if (strcmp(def->defname, "s3_use_ssl") == 0)
+		{
+			use_ssl = defGetBoolean(def);
+			have_ssl = true;
+		}
+	}
+	PG_TRY();
+	{
+		um = GetUserMapping(GetUserId(), server->serverid);
+	}
+	PG_CATCH();
+	{
+		/* no mapping: anonymous access, as DuckDB would do without a secret */
+		FlushErrorState();
+		um = NULL;
+	}
+	PG_END_TRY();
+	if (um != NULL)
+	{
+		foreach(lc, um->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "s3_access_key_id") == 0)
+				key_id = defGetString(def);
+			else if (strcmp(def->defname, "s3_secret_access_key") == 0)
+				secret = defGetString(def);
+			else if (strcmp(def->defname, "s3_session_token") == 0)
+				token = defGetString(def);
+		}
+	}
+	if (endpoint == NULL && region == NULL && key_id == NULL)
+		return;
+
+	foreach(lc, scopes)
+	{
+		const char *scope = (const char *) lfirst(lc);
+		StringInfoData sql;
+		List	   *res;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "CREATE OR REPLACE TEMPORARY SECRET gg_%u_%s (TYPE s3, SCOPE %s",
+						 server->serverid, scope + 5, duck_literal(scope));
+		if (key_id)
+			appendStringInfo(&sql, ", KEY_ID %s", duck_literal(key_id));
+		if (secret)
+			appendStringInfo(&sql, ", SECRET %s", duck_literal(secret));
+		if (token)
+			appendStringInfo(&sql, ", SESSION_TOKEN %s", duck_literal(token));
+		if (endpoint)
+			appendStringInfo(&sql, ", ENDPOINT %s", duck_literal(endpoint));
+		if (region)
+			appendStringInfo(&sql, ", REGION %s", duck_literal(region));
+		if (url_style)
+			appendStringInfo(&sql, ", URL_STYLE %s", duck_literal(url_style));
+		if (have_ssl)
+			appendStringInfo(&sql, ", USE_SSL %s", use_ssl ? "true" : "false");
+		appendStringInfoChar(&sql, ')');
+		res = duck_text_column(sql.data, "could not create the S3 secret");
+		(void) res;
+	}
 }
 
 /* ---------- DuckDB helpers ---------- */
@@ -448,6 +599,7 @@ gg_duckdb_native_files(Oid relid)
 
 	get_options(relid, &o);
 	check_locations(o.locations);
+	ensure_s3_secrets(relid, &o);
 	if (table->exec_location == FTEXECLOCATION_ALL_SEGMENTS &&
 		Gp_role == GP_ROLE_EXECUTE && GpIdentity.segindex >= 0 && getgpsegmentCount() > 1)
 		nseg = getgpsegmentCount();
@@ -456,8 +608,13 @@ gg_duckdb_native_files(Oid relid)
 	appendStringInfoString(&sql, "SELECT file FROM (");
 	foreach(lc, o.locations)
 	{
-		appendStringInfo(&sql, "%sSELECT file FROM glob(%s)", first ? "" : " UNION ALL ",
-						 duck_literal((const char *) lfirst(lc)));
+		/* an Iceberg location is one table, read whole by whichever process it falls to */
+		if (strcmp(o.format, "iceberg") == 0)
+			appendStringInfo(&sql, "%sSELECT %s AS file", first ? "" : " UNION ALL ",
+							 duck_literal((const char *) lfirst(lc)));
+		else
+			appendStringInfo(&sql, "%sSELECT file FROM glob(%s)", first ? "" : " UNION ALL ",
+							 duck_literal((const char *) lfirst(lc)));
 		first = false;
 	}
 	appendStringInfoString(&sql, ") AS g");
@@ -474,6 +631,8 @@ reader_function(const char *format)
 		return "read_csv";
 	if (strcmp(format, "json") == 0)
 		return "read_json";
+	if (strcmp(format, "iceberg") == 0)
+		return "iceberg_scan";
 	return "read_parquet";
 }
 
@@ -485,6 +644,12 @@ reader_call(GGForeignOptions *o)
 	ListCell   *lc;
 
 	initStringInfo(&buf);
+	if (strcmp(o->format, "iceberg") == 0)
+	{
+		/* the list parameter holds the one table location */
+		appendStringInfoString(&buf, "iceberg_scan(%s[1], allow_moved_paths=true)");
+		return buf.data;
+	}
 	appendStringInfo(&buf, "%s(%%s", reader_function(o->format));
 	if (strcmp(o->format, "parquet") == 0)
 		appendStringInfo(&buf, ", union_by_name=%s, hive_partitioning=%s",
@@ -585,6 +750,29 @@ gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *info, const cha
 	info->reader = reader_call(&o);
 	table_close(rel, AccessShareLock);
 	return true;
+}
+
+/*
+ * Statements a query with native readers runs first: an Iceberg table read
+ * by its directory needs DuckDB's permission to pick the newest metadata
+ * file when the table has no version hint (catalog-written tables have
+ * none); a concurrent writer's uncommitted metadata could be picked, which
+ * is why DuckDB calls it unsafe.  Give the metadata file itself as the
+ * location to avoid the guess.
+ */
+List *
+gg_duckdb_native_pre_sql(List *natives)
+{
+	ListCell   *lc;
+
+	foreach(lc, natives)
+	{
+		GGNativeLeaf *nl = (GGNativeLeaf *) lfirst(lc);
+
+		if (strstr(nl->reader, "iceberg_scan(") != NULL)
+			return list_make1("SET unsafe_enable_version_guessing = true");
+	}
+	return NIL;
 }
 
 char *
@@ -836,6 +1024,8 @@ fdw_begin(ForeignScanState *node, int eflags)
 	st->reader = ns.reader;
 	st->empty = ns.empty;
 	st->q.params = params;
+	if (strstr(ns.reader, "iceberg_scan(") != NULL)
+		st->q.pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
 
 	/* result column k is attribute attnos[k] of the scan tuple */
 	outtypes = palloc0(sizeof(GGTypeInfo) * Max(list_length(ns.attnos), 1));
@@ -1002,6 +1192,8 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 		gg_duckdb_query_init(q, NULL, CurrentMemoryContext, "analyze");
 		q->sql = csql.data;
 		q->file_lists = list_make1(files);
+		if (strstr(ns.reader, "iceberg_scan(") != NULL)
+			q->pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
 		outtypes = palloc0(sizeof(GGTypeInfo));
 		gg_duckdb_type_map(TEXTOID, -1, &outtypes[0]);
 		{
@@ -1029,6 +1221,8 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 	gg_duckdb_query_init(q, NULL, CurrentMemoryContext, "analyze");
 	q->sql = sql.data;
 	q->file_lists = list_make1(files);
+	if (strstr(ns.reader, "iceberg_scan(") != NULL)
+		q->pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
 	outtypes = palloc0(sizeof(GGTypeInfo) * Max(list_length(attnos), 1));
 	colmap = palloc0(sizeof(int) * Max(list_length(attnos), 1));
 	k = 0;
@@ -1145,14 +1339,22 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname)));
 	}
-	if (!format_is_known(format))
+	if (!format_is_known(format) || strcmp(format, "iceberg") == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-				 errmsg("gg_duckdb: format must be parquet, csv or json")));
+				 errmsg("gg_duckdb: IMPORT FOREIGN SCHEMA supports parquet, csv and json")));
 	ext = format;
 	if (dir[strlen(dir) - 1] == '/')
 		dir = pnstrdup(dir, strlen(dir) - 1);
 	check_locations(list_make1(dir));
+	if (is_remote(dir))
+	{
+		GGForeignOptions o;
+
+		memset(&o, 0, sizeof(o));
+		o.locations = list_make1(dir);
+		ensure_s3_secrets_for_server(serverOid, &o);
+	}
 
 	/* files right in the directory: one table each; subdirectories: one table each */
 	files = duck_text_column(psprintf("SELECT file FROM glob(%s) ORDER BY file",

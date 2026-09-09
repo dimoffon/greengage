@@ -53,6 +53,7 @@ extern bool gg_duckdb_on_coordinator;
 extern bool gg_duckdb_reserve_memory;
 extern bool gg_duckdb_strict;
 extern char *gg_duckdb_data_directories;
+extern char *gg_duckdb_http_proxy;
 extern double gg_duckdb_cost_fixed;
 extern double gg_duckdb_cost_convert_row;
 extern double gg_duckdb_cost_convert_byte;
@@ -202,6 +203,7 @@ typedef struct GGDuckQuery
 	const char *sql;
 	List	   *params;			/* Consts bound as $1..$n */
 	List	   *file_lists;		/* List of List of char *, bound as $n+1.. */
+	List	   *pre_sql;		/* statements run on the connection before the query */
 
 	int			ncols;			/* result columns */
 	GGTypeInfo *outtypes;
@@ -362,6 +364,7 @@ extern bool gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *inf
 extern bool gg_duckdb_is_native_scan(ForeignScan *fs, List *rtable);
 extern bool gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals);
 extern char *gg_duckdb_native_location_text(Oid relid);
+extern List *gg_duckdb_native_pre_sql(List *natives);
 
 extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);

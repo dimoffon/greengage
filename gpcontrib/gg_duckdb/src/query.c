@@ -368,7 +368,24 @@ gg_duckdb_query_start(GGDuckQuery *q, GGBindContext *bctx)
 
 	PG_TRY();
 	{
+		ListCell   *lc;
+
 		query_memory(q);
+		foreach(lc, q->pre_sql)
+		{
+			const char *pre = (const char *) lfirst(lc);
+			duckdb_result res;
+
+			if (duckdb_query(q->conn, pre, &res) == DuckDBError)
+			{
+				const char *msg = duckdb_result_error(&res);
+				char	   *copy = pstrdup(msg ? msg : "unknown error");
+
+				duckdb_destroy_result(&res);
+				gg_duckdb_query_raise(q, pre, copy);
+			}
+			duckdb_destroy_result(&res);
+		}
 
 		q->stmt = gg_duckdb_prepare_with(bctx, q->conn, q->sql, &err);
 		if (q->stmt == NULL)

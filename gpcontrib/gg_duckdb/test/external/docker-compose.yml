@@ -1,0 +1,63 @@
+# External systems for testing the gg_duckdb foreign data wrapper against S3
+# and Apache Iceberg: MinIO (S3 API on localhost:9100, console on 9101), an
+# Iceberg REST catalog (localhost:8181) with its warehouse in MinIO, and a
+# one-shot job that fills the bucket with Parquet/CSV/JSON files and creates
+# an Iceberg table through the catalog.  Ports avoid the demo cluster's 9000.
+#
+#   docker-compose up -d            # then wait for the init job: docker-compose logs -f init
+#   ../../test/external/run.sh      # the checks, against the demo cluster on the host
+#   docker-compose down -v
+version: "3.8"
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9101"
+    environment:
+      MINIO_ROOT_USER: ggadmin
+      MINIO_ROOT_PASSWORD: gg-secret-1
+    ports:
+      - "9100:9000"
+      - "9101:9101"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - minio-data:/data
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    environment:
+      AWS_ACCESS_KEY_ID: ggadmin
+      AWS_SECRET_ACCESS_KEY: gg-secret-1
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://ggduck/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  init:
+    image: python:3.12-slim
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ggadmin
+      AWS_SECRET_ACCESS_KEY: gg-secret-1
+      AWS_REGION: us-east-1
+      REST_ENDPOINT: http://iceberg-rest:8181
+    volumes:
+      - ./init:/init:ro
+    command: bash -c "pip install -q --root-user-action=ignore 'pyarrow>=17' 'boto3' 'pyiceberg[s3fs]>=0.8' && python /init/setup.py"
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_started
+
+volumes:
+  minio-data:
