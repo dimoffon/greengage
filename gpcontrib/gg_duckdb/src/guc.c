@@ -32,6 +32,7 @@ bool		gg_duckdb_validate_at_plan_time = true;
 bool		gg_duckdb_on_coordinator = false;
 bool		gg_duckdb_reserve_memory = true;
 bool		gg_duckdb_strict = false;
+char	   *gg_duckdb_data_directories = NULL;
 double		gg_duckdb_cost_fixed = 50.0;
 double		gg_duckdb_cost_convert_row = 0.001;
 double		gg_duckdb_cost_convert_byte = 0.0003;
@@ -228,6 +229,15 @@ gg_duckdb_define_gucs(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("gg_duckdb.data_directories",
+							   "Directories DuckDB may read files from (comma-separated absolute paths); empty allows none.",
+							   "The foreign data wrapper reads Parquet, CSV and JSON files under these directories on every node. DuckDB's own file access stays disabled outside them.",
+							   &gg_duckdb_data_directories,
+							   "",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("gg_duckdb");
 }

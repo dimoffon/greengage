@@ -36,3 +36,26 @@ CREATE FUNCTION gg_duckdb.status(
 RETURNS record
 AS 'MODULE_PATHNAME', 'gg_duckdb_status'
 LANGUAGE C STRICT VOLATILE;
+
+-- The foreign data wrapper: Parquet, CSV and JSON files read by DuckDB on
+-- every segment (each file by exactly one of them).
+CREATE FUNCTION gg_duckdb.fdw_handler()
+RETURNS fdw_handler
+AS 'MODULE_PATHNAME', 'gg_duckdb_fdw_handler'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION gg_duckdb.fdw_validator(text[], oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'gg_duckdb_fdw_validator'
+LANGUAGE C STRICT;
+
+CREATE FOREIGN DATA WRAPPER gg_duckdb
+    HANDLER gg_duckdb.fdw_handler
+    VALIDATOR gg_duckdb.fdw_validator
+    OPTIONS (mpp_execute 'all segments');
+
+-- The files every segment reads of a foreign table.
+CREATE FUNCTION gg_duckdb.foreign_files(regclass, OUT segment integer, OUT file text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'gg_duckdb_foreign_files'
+LANGUAGE C STRICT VOLATILE EXECUTE ON ALL SEGMENTS;

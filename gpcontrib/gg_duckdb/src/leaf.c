@@ -155,7 +155,7 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 	void	  **data;
 	uint64_t  **validity;
 
-	if (lf->eof || region->pending_error != NULL)
+	if (lf->eof || region->q.pending_error != NULL)
 	{
 		duckdb_data_chunk_set_size(output, 0);
 		return;
@@ -181,7 +181,7 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 	 * its values runs in the batch context, which is reset every batch.
 	 */
 	oldcxt = CurrentMemoryContext;
-	MemoryContextReset(region->batch_cxt);
+	MemoryContextReset(region->q.batch_cxt);
 
 	PG_TRY();
 	{
@@ -198,7 +198,7 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 			}
 			if (maxattno > 0)
 				slot_getsomeattrs(slot, maxattno);
-			MemoryContextSwitchTo(region->batch_cxt);
+			MemoryContextSwitchTo(region->q.batch_cxt);
 			for (j = 0; j < id->ncols; j++)
 			{
 				int			col = id->col[j];
@@ -224,12 +224,12 @@ leaf_scan(duckdb_function_info info, duckdb_data_chunk output)
 		ErrorData  *edata;
 
 		MemoryContextSwitchTo(oldcxt);
-		ecxt = MemoryContextSwitchTo(region->region_cxt);
+		ecxt = MemoryContextSwitchTo(region->q.query_cxt);
 		edata = CopyErrorData();
 		MemoryContextSwitchTo(ecxt);
 		FlushErrorState();
-		if (region->pending_error == NULL)
-			region->pending_error = edata;
+		if (region->q.pending_error == NULL)
+			region->q.pending_error = edata;
 		duckdb_function_set_error(info, edata->message ? edata->message : "error in leaf");
 		duckdb_data_chunk_set_size(output, 0);
 		return;

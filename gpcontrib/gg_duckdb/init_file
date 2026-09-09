@@ -9,6 +9,8 @@ s/pgsql_tmp_gg_duckdb_\d+/pgsql_tmp_gg_duckdb_PID/
 -- which segment reports an error first is not deterministic
 m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
 s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+m/\(seg\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ [\d.]+:\d+ pid=\d+\)/(segN host:port pid=N)/
 -- row estimates in decision notices depend on ANALYZE's sample
 m/\d+ estimated input rows/
 s/\d+ estimated input rows/N estimated input rows/

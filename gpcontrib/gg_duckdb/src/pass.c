@@ -340,7 +340,7 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 	cs->custom_exprs = NIL;
 	cs->custom_private = gg_duckdb_make_private(spec->sql, spec->flags, spec->leaves,
 												spec->label, spec->params,
-												spec->ncols, spec->outtypes);
+												spec->ncols, spec->outtypes, spec->natives);
 	cs->custom_scan_tlist = scan_tlist;
 	cs->custom_relids = bms_make_singleton(rteidx);
 	cs->methods = &gg_duckdb_scan_methods;
@@ -395,7 +395,10 @@ validate_region(GGRegionSpec *spec, char **why)
 	PG_TRY();
 	{
 		conn = gg_duckdb_connect();
-		stmt = gg_duckdb_prepare_with(&bctx, conn, spec->sql, &err);
+		stmt = gg_duckdb_prepare_with(&bctx, conn,
+									  gg_duckdb_region_sql(spec->sql, spec->natives,
+														   list_length(spec->params), false, NULL),
+									  &err);
 		if (stmt == NULL)
 		{
 			*why = psprintf("DuckDB could not prepare the query: %s", err);
@@ -508,10 +511,14 @@ try_region(PassContext *ctx, Plan *plan)
 	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO && verdict != GG_HINT_FORCE)
 	{
 		double		pg_cost = spec.op_cost;
+		double		rows_conv = spec.rows_in - spec.rows_native + spec.rows_out;
+		double		bytes_conv = spec.rows_in > 0 ?
+			spec.bytes_in * (spec.rows_in - spec.rows_native) / spec.rows_in + spec.bytes_out :
+			spec.bytes_out;
 		double		duck_cost = gg_duckdb_cost_fixed +
 			spec.op_cost * gg_duckdb_cost_op_factor +
-			(spec.rows_in + spec.rows_out) * gg_duckdb_cost_convert_row +
-			(spec.bytes_in + spec.bytes_out) * gg_duckdb_cost_convert_byte;
+			rows_conv * gg_duckdb_cost_convert_row +
+			bytes_conv * gg_duckdb_cost_convert_byte;
 
 		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in (%.0f bytes), "
 			 "%.0f rows out (%.0f bytes), standard executor %.1f, DuckDB %.1f (margin %.2f)",

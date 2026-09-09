@@ -6,3 +6,8 @@
 /tmp_check/
 /regression.diffs
 /regression.out
+/data/*
+!/data/.gitkeep
+/sql/foreign.sql
+/expected/foreign.out
+/expected/foreign_optimizer.out

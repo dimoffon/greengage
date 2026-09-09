@@ -1,0 +1,104 @@
+-- M5: the gg_duckdb foreign data wrapper.  Parquet, CSV and JSON files read
+-- by DuckDB on every segment, each file by exactly one of them; quals pushed
+-- into DuckDB; the reader inlined into regions; IMPORT FOREIGN SCHEMA and
+-- ANALYZE.  The files are written by the coordinator's DuckDB into the test
+-- directory, which every node of the demo cluster sees.
+CREATE EXTENSION IF NOT EXISTS gg_duckdb;
+SET gg_duckdb.data_directories = '@abs_srcdir@/data';
+-- six Parquet parts of one table, with every carried type and NULLs
+SELECT gg_duckdb.query($q$
+  COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt,
+               DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d,
+               i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8,
+               CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable
+        FROM range(0, 6000) t(i) WHERE i % 6 = 0)
+  TO '@abs_srcdir@/data/parts_0.parquet' (FORMAT parquet) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d, i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8, CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable FROM range(0, 6000) t(i) WHERE i % 6 = 1) TO '@abs_srcdir@/data/parts_1.parquet' (FORMAT parquet) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d, i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8, CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable FROM range(0, 6000) t(i) WHERE i % 6 = 2) TO '@abs_srcdir@/data/parts_2.parquet' (FORMAT parquet) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d, i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8, CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable FROM range(0, 6000) t(i) WHERE i % 6 = 3) TO '@abs_srcdir@/data/parts_3.parquet' (FORMAT parquet) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d, i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8, CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable FROM range(0, 6000) t(i) WHERE i % 6 = 4) TO '@abs_srcdir@/data/parts_4.parquet' (FORMAT parquet) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, i % 7 AS k, 'v' || i AS v, CAST(i * 1.25 AS DECIMAL(12,2)) AS amt, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS ts, DATE '2024-01-01' + INTERVAL (i % 100) DAY AS d, i % 3 = 0 AS flag, CAST(i AS SMALLINT) AS s, CAST(i AS INTEGER) AS n4, CAST(i AS DOUBLE) / 4 AS f8, CASE WHEN i % 13 = 0 THEN NULL ELSE i END AS nullable FROM range(0, 6000) t(i) WHERE i % 6 = 5) TO '@abs_srcdir@/data/parts_5.parquet' (FORMAT parquet) $q$);
+-- a CSV and a JSON file
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, 'c' || i AS name, CAST(i * 2 AS DECIMAL(8,2)) AS price FROM range(0, 50) t(i)) TO '@abs_srcdir@/data/items.csv' (HEADER) $q$);
+SELECT gg_duckdb.query($q$ COPY (SELECT i AS id, 'j' || i AS tag FROM range(0, 20) t(i)) TO '@abs_srcdir@/data/tags.json' (FORMAT json) $q$);
+-- the same rows generated in PostgreSQL, as the reference
+CREATE TABLE ref_parts AS
+SELECT i::bigint AS id, (i % 7)::bigint AS k, 'v' || i AS v, (i * 1.25)::numeric(12,2) AS amt,
+       (date '2024-01-01' + (i % 100))::timestamp AS ts, date '2024-01-01' + (i % 100) AS d,
+       i % 3 = 0 AS flag, i::smallint AS s, i::int AS n4, i::float8 / 4 AS f8,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE i::bigint END AS nullable
+FROM generate_series(0, 5999) i DISTRIBUTED BY (id);
+CREATE SERVER duck FOREIGN DATA WRAPPER gg_duckdb;
+CREATE FOREIGN TABLE parts (id bigint, k bigint, v text, amt numeric(12,2), ts timestamp, d date,
+                            flag boolean, s smallint, n4 integer, f8 float8, nullable bigint)
+  SERVER duck OPTIONS (location '@abs_srcdir@/data/parts_*.parquet');
+CREATE FOREIGN TABLE items (id bigint, name text, price numeric(8,2))
+  SERVER duck OPTIONS (location '@abs_srcdir@/data/items.csv', format 'csv', header 'true');
+CREATE FOREIGN TABLE tags (id bigint, tag text)
+  SERVER duck OPTIONS (location '@abs_srcdir@/data/tags.json', format 'json');
+-- every file is read by exactly one segment
+SELECT count(*) AS files, count(DISTINCT file) AS distinct_files, count(DISTINCT segment) AS segments
+FROM gg_duckdb.foreign_files('parts');
+SELECT count(*) FROM parts;
+-- the files equal the reference, through the foreign scan and through regions
+CREATE OR REPLACE FUNCTION f_check(q text, r text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE missing bigint; extra bigint;
+BEGIN
+  EXECUTE 'CREATE TEMP TABLE f_duck AS ' || q;
+  EXECUTE 'CREATE TEMP TABLE f_base AS ' || r;
+  EXECUTE 'SELECT count(*) FROM (TABLE f_base EXCEPT ALL TABLE f_duck) x' INTO missing;
+  EXECUTE 'SELECT count(*) FROM (TABLE f_duck EXCEPT ALL TABLE f_base) x' INTO extra;
+  DROP TABLE f_base; DROP TABLE f_duck;
+  RETURN missing || ' | ' || extra;
+END $$;
+SET gg_duckdb.mode = off;
+SELECT f_check('SELECT * FROM parts', 'SELECT * FROM ref_parts');
+SELECT f_check('SELECT id, v, amt FROM parts WHERE k = 3 AND amt > 100 AND v LIKE ''v1%'' AND nullable IS NOT NULL',
+               'SELECT id, v, amt FROM ref_parts WHERE k = 3 AND amt > 100 AND v LIKE ''v1%'' AND nullable IS NOT NULL');
+SELECT f_check('SELECT id, upper(v) FROM parts WHERE upper(v) = ''V42''', 'SELECT id, upper(v) FROM ref_parts WHERE upper(v) = ''V42''');
+SELECT * FROM items ORDER BY id LIMIT 3;
+SELECT * FROM tags ORDER BY id LIMIT 3;
+SET gg_duckdb.mode = force;
+SELECT f_check('SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn FROM parts GROUP BY k',
+               'SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn FROM ref_parts GROUP BY k');
+SELECT f_check('SELECT count(*) AS n, sum(amt) AS sa FROM parts WHERE k > 2 AND flag', 'SELECT count(*) AS n, sum(amt) AS sa FROM ref_parts WHERE k > 2 AND flag');
+SELECT f_check('SELECT p.k, i.name, count(*) AS n FROM parts p JOIN items i ON p.k = i.id GROUP BY p.k, i.name',
+               'SELECT p.k, i.name, count(*) AS n FROM ref_parts p JOIN items i ON p.k = i.id GROUP BY p.k, i.name');
+-- pushed quals show in the DuckDB query; a function DuckDB does not carry stays a Filter
+SET gg_duckdb.mode = off;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT id FROM parts WHERE k = 3 AND upper(v) = 'V3';
+-- the reader inlined into a region: no leaf, no conversion on the way in
+SET gg_duckdb.mode = force;
+SET gg_duckdb.explain_decisions = on;
+SET optimizer_force_multistage_agg = on; SET gp_eager_two_phase_agg = on;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT k, count(*), sum(amt) FROM parts WHERE flag GROUP BY k;
+RESET optimizer_force_multistage_agg; RESET gp_eager_two_phase_agg;
+SET gg_duckdb.explain_decisions = off;
+SET gg_duckdb.mode = off;
+-- a scan rescanned by a correlated subquery
+SELECT r.k, (SELECT count(*) FROM parts p WHERE p.k = r.k) FROM (SELECT DISTINCT k FROM ref_parts) r ORDER BY 1;
+-- statistics
+ANALYZE parts;
+SELECT reltuples FROM pg_class WHERE relname = 'parts';
+SELECT attname, n_distinct FROM pg_stats WHERE tablename = 'parts' AND attname IN ('k', 'flag') ORDER BY attname;
+-- IMPORT FOREIGN SCHEMA: one table per file, one per subdirectory
+CREATE SCHEMA imported;
+IMPORT FOREIGN SCHEMA "@abs_srcdir@/data" FROM SERVER duck INTO imported;
+SELECT foreign_table_name FROM information_schema.foreign_tables WHERE foreign_table_schema = 'imported' ORDER BY 1;
+\d imported.parts_0
+SELECT count(*) FROM imported.parts_3;
+-- locations outside gg_duckdb.data_directories are refused
+CREATE FOREIGN TABLE outside (id int) SERVER duck OPTIONS (location '/etc/passwd', format 'csv');
+CREATE FOREIGN TABLE badfmt (id int) SERVER duck OPTIONS (location '@abs_srcdir@/data/tags.json', format 'xml');
+-- a table over one file: the other segments have nothing to read
+CREATE FOREIGN TABLE one (id bigint, k bigint) SERVER duck OPTIONS (location '@abs_srcdir@/data/parts_4.parquet');
+SELECT count(*), count(DISTINCT segment) FROM gg_duckdb.foreign_files('one');
+SELECT count(*), min(id), max(id) FROM one;
+SET gg_duckdb.mode = force;
+SELECT k, count(*) FROM one GROUP BY k ORDER BY k LIMIT 3;
+RESET gg_duckdb.mode;
+DROP FUNCTION f_check(text, text);
+DROP SCHEMA imported CASCADE;
+DROP FOREIGN TABLE parts; DROP FOREIGN TABLE items; DROP FOREIGN TABLE tags; DROP FOREIGN TABLE one;
+DROP SERVER duck;
+DROP TABLE ref_parts;

@@ -122,6 +122,70 @@ per-allocation accounting, DuckDB 2.0). Out of scope: DuckDB tables, DDL or writ
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
 
+## M5 findings (2026-09-09)
+
+- **The wrapper.** `gg_duckdb` is a foreign data wrapper whose tables name files (`location`:
+  a path, a glob or a list) in Parquet, CSV or JSON. The wrapper carries
+  `mpp_execute 'all segments'` as its own option, so every table executes on all segments
+  unless a server or table says otherwise; the core maps that to a random-distributed
+  policy and a Strewn locus, and ORCA plans it natively through `BuildForeignScan`, which
+  calls the wrapper's planning callbacks with a minimal `PlannerInfo`. File-level
+  sharding: each executing segment expands the location with DuckDB's `glob()` and keeps
+  the files with `hash(path) % segments = its index`; the coordinator or a single
+  segment reads everything. `gg_duckdb.foreign_files(regclass)`, an `EXECUTE ON ALL
+  SEGMENTS` function, shows the assignment.
+- **File access.** DuckDB's external access stays off; `gg_duckdb.data_directories`
+  (SUSET, synchronised) lists the directories it may read, applied as DuckDB's
+  `allowed_directories` by SQL right after the instance opens (the configuration API
+  takes no list, and the list cannot change once external access is off), so a changed
+  setting takes effect by reopening the instance, which happens at the next connection
+  while no query holds one. The validator refuses locations outside the list at DDL
+  time, on the coordinator and on the segments it is dispatched to, and the scan checks
+  again at run time; DuckDB itself refuses everything else.
+- **One executor, two nodes.** The DuckDB query driver of the region (prepare, bind,
+  task loop, streaming chunks, conversion into a slot) moved to `query.c` as
+  `GGDuckQuery`, shared by the CustomScan region and the ForeignScan. A result column may
+  map to any slot attribute (`colmap`), so a scan fetches only the attributes the query
+  uses and leaves the rest NULL, as postgres_fdw does. Column types and counts are
+  checked on the executed result, not the prepared statement: DuckDB binds a statement
+  whose table function takes a parameter only when it executes.
+- **The file list is a parameter.** The scan's SQL is `SELECT * FROM (SELECT CAST("col"
+  AS T) AS c<attno>, ... FROM read_parquet($n, ...)) AS n0 [WHERE <pushed quals>]`; the
+  executing node binds its file list as a `LIST(VARCHAR)` value after the constant
+  parameters. An empty list is a DuckDB error, so a node with no files substitutes an
+  empty relation of the same columns instead (or, for a standalone scan, returns
+  nothing). The SQL is stored with a token in place of the reader call
+  (`__GG_NATIVE_<i>__`), and plan-time validation prepares it with the empty relation.
+- **Native leaves.** The region deparser treats a `gg_duckdb` ForeignScan without local
+  quals as a native leaf: instead of `gg_leaf(i)` it inlines the scan's query (the quals
+  it pushed re-deparsed with the region's parameter numbering, the target list projected
+  over the fetched columns), records the reader and the empty relation in the region's
+  private data (v4), and the region resolves the files at start on each segment. Such
+  rows are not converted on the way in, and the cost gate does not charge them
+  (`rows_native`). EXPLAIN shows `DuckDB readers: <table> (<format> <location>)` and the
+  label counts them.
+- **Statistics and import.** ANALYZE on an all-segments table dispatches
+  `gp_acquire_sample_rows` (the mechanism file_fdw uses), and each segment samples its
+  own files with DuckDB's reservoir sampling (`USING SAMPLE reservoir(n ROWS)`) and
+  counts its rows; the coordinator merges. Without statistics the planner's row estimate
+  comes from `parquet_file_metadata` when the coordinator can read the files, else a
+  default. `IMPORT FOREIGN SCHEMA "<directory>"` makes a table per file in the directory
+  and one per subdirectory (`<dir>/<name>/*.<format>`), with columns from DuckDB's
+  `DESCRIBE` mapped to PostgreSQL types (DuckDB `TIMESTAMP` variants to `timestamp`,
+  `HUGEINT` to `numeric(38,0)`, uncarried types skipped with a notice).
+- **Verified on the demo cluster** under both optimizers: six Parquet parts of one table
+  read by three segments, every file by exactly one; every carried type with NULLs equal
+  to a PostgreSQL-generated reference through the standalone scan and through regions;
+  pushed and local quals; the reader inlined into a partial aggregate region; correlated
+  rescans; ANALYZE statistics; IMPORT; refused locations and formats; a table over a
+  single file (two segments read nothing). Not in this milestone: remote object stores
+  (DuckDB's `httpfs` is not in the build, and it bundles its own OpenSSL while the
+  backend's libcrypto is loaded globally), row-group-level sharding of a single large
+  file, writes through DuckDB.
+- **Trap found on the way.** A query state on the stack with a memory-context reset
+  callback pointing at it crashes when the context is deleted after the function returned
+  (ANALYZE's sampler): such states are palloc'd in the parent context.
+
 ## M4 findings (2026-09-09)
 
 - **Hints.** `DuckDB(t1 t2 ...)` and `NoDuckDB(t1 t2 ...)` are a new hint type in

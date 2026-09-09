@@ -52,6 +52,7 @@ extern bool gg_duckdb_validate_at_plan_time;
 extern bool gg_duckdb_on_coordinator;
 extern bool gg_duckdb_reserve_memory;
 extern bool gg_duckdb_strict;
+extern char *gg_duckdb_data_directories;
 extern double gg_duckdb_cost_fixed;
 extern double gg_duckdb_cost_convert_row;
 extern double gg_duckdb_cost_convert_byte;
@@ -133,7 +134,7 @@ extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int widt
 #define GG_DUCKDB_REGION_NAME		"GGDuckDBRegion"
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
 #define GG_DUCKDB_LEAF_PLACEHOLDER "_gg_row"
-#define GG_DUCKDB_PRIVATE_VERSION	3
+#define GG_DUCKDB_PRIVATE_VERSION	4
 
 /*
  * Positions in CustomScan.custom_private, a flat List of Const (the only
@@ -187,33 +188,32 @@ typedef struct GGBindContext
 	GGLeafDesc **leaves;
 } GGBindContext;
 
-typedef struct GGRegionState
+/*
+ * A DuckDB query driven by a plan node on the backend thread: the region
+ * (node.c) and the native foreign scan (fdw.c) share it.  Rows of the
+ * streamed result are converted into the node's scan slot; `colmap` says
+ * which slot attribute a result column fills (NULL: column i fills
+ * attribute i, the rest of the slot is NULL).
+ */
+typedef struct GGDuckQuery
 {
-	CustomScanState css;		/* custom_ps holds the leaf PlanStates */
-
-	/* from custom_private */
-	int			version;
+	PlanState  *ps;				/* the node running the query: memory quota */
+	const char *what;			/* "region" or "foreign scan", for messages */
 	const char *sql;
-	int			flags;
-	int			nleaves;
-	const char *label;
-
-	GGLeaf	   *leaves;
 	List	   *params;			/* Consts bound as $1..$n */
+	List	   *file_lists;		/* List of List of char *, bound as $n+1.. */
 
-	/* output columns: PG side from the scan tuple descriptor, DuckDB side from custom_private */
-	int			ncols;
+	int			ncols;			/* result columns */
 	GGTypeInfo *outtypes;
+	int		   *colmap;			/* result column -> 0-based slot attribute, or NULL */
 	int64		memory_reserved;	/* bytes reserved with the vmem tracker */
-	GGTypeInfo **leaf_shapes;	/* DuckDB shape of every leaf column, from the plan */
-	int		   *leaf_ncols;
 	duckdb_vector *colvec;
 	void	  **coldata;		/* per column of the current chunk */
 	uint64_t  **colvalid;
 	int		   *colwidth;		/* DECIMAL width/scale seen in the chunk */
 	int		   *colscale;
 
-	MemoryContext region_cxt;	/* lives with the node */
+	MemoryContext query_cxt;	/* lives with the node */
 	MemoryContext chunk_cxt;	/* reset before every fetched chunk */
 	MemoryContext batch_cxt;	/* reset before every leaf batch */
 
@@ -233,13 +233,61 @@ typedef struct GGRegionState
 
 	int64		rows_out;
 	int64		chunks;
+} GGDuckQuery;
+
+/* query.c */
+extern void gg_duckdb_query_init(GGDuckQuery *q, PlanState *ps, MemoryContext parent,
+								 const char *what);
+extern void gg_duckdb_query_set_output(GGDuckQuery *q, TupleDesc desc,
+									   GGTypeInfo *outtypes, int ncols, int *colmap);
+extern void gg_duckdb_query_start(GGDuckQuery *q, GGBindContext *bctx);
+extern bool gg_duckdb_query_next(GGDuckQuery *q, TupleTableSlot *slot);
+extern void gg_duckdb_query_reset(GGDuckQuery *q);
+extern void gg_duckdb_query_release_query(GGDuckQuery *q);
+extern void gg_duckdb_query_release(GGDuckQuery *q);
+extern void gg_duckdb_query_raise(GGDuckQuery *q, const char *what, const char *msg) pg_attribute_noreturn();
+extern void gg_duckdb_query_explain_end(GGDuckQuery *q, StringInfo buf);
+
+/*
+ * A native leaf: a gg_duckdb foreign scan the region reads through DuckDB
+ * itself.  The region's SQL carries the token GG_NATIVE_TOKEN(i) where the
+ * reader call goes; the executing node replaces it with the reader over
+ * its share of the files, or with an empty relation when it has none.
+ */
+#define GG_NATIVE_TOKEN_FMT "__GG_NATIVE_%d__"
+
+typedef struct GGNativeLeaf
+{
+	Oid			relid;			/* the foreign table */
+	char	   *reader;			/* "read_parquet(%s, ...)" with %s for the file list parameter */
+	char	   *empty;			/* the empty relation of the same columns */
+} GGNativeLeaf;
+
+typedef struct GGRegionState
+{
+	CustomScanState css;		/* custom_ps holds the leaf PlanStates */
+	GGDuckQuery q;
+
+	/* from custom_private */
+	int			version;
+	int			flags;
+	int			nleaves;
+	const char *label;
+	const char *sql;			/* with native tokens; q.sql is the executable text */
+	List	   *natives;		/* of GGNativeLeaf */
+
+	GGLeaf	   *leaves;
+	GGTypeInfo **leaf_shapes;	/* DuckDB shape of every leaf column, from the plan */
+	int		   *leaf_ncols;
 } GGRegionState;
 
 extern CustomScanMethods gg_duckdb_scan_methods;
 
+extern char *gg_duckdb_region_sql(const char *sql, List *natives, int nconst_params,
+								  bool resolve, List **file_lists);
 extern List *gg_duckdb_make_private(const char *sql, int flags, List *leaves,
 									const char *label, List *params, int nout,
-									const GGTypeInfo *outtypes);
+									const GGTypeInfo *outtypes, List *natives);
 extern void gg_duckdb_register_leaf_function(duckdb_connection conn);
 extern duckdb_prepared_statement gg_duckdb_prepare_with(GGBindContext *bctx,
 														duckdb_connection conn,
@@ -274,7 +322,46 @@ typedef struct GGRegionSpec
 	int			njoins;
 	bool		ordered;		/* the query ends with the root's ORDER BY */
 	char	   *agg_order;		/* ORDER BY restoring a sorted Agg's output order, or NULL */
+	List	   *natives;		/* of GGNativeLeaf: foreign tables DuckDB reads itself */
+	double		rows_native;	/* of rows_in, the rows DuckDB reads natively */
+	List	   *rtable;			/* in: the statement's range table */
 } GGRegionSpec;
+
+/* A gg_duckdb foreign table as DuckDB reads it (fdw.c describes, deparse.c writes). */
+typedef struct GGNativeInfo
+{
+	int			natts;
+	char	  **colnames;		/* by attribute number - 1: quoted file column names */
+	GGTypeInfo *types;			/* by attribute number - 1; duck == 0 when not fetched */
+	char	   *reader;			/* "read_parquet(%s, ...)", %s for the file list parameter */
+	char	   *empty;			/* the empty relation with the fetched columns */
+} GGNativeInfo;
+
+typedef struct GGNativeScan
+{
+	Oid			relid;			/* in */
+	Index		scanrelid;		/* in: varno of the quals' Vars */
+	List	   *attnos;			/* in: fetched attributes, ascending */
+	List	   *quals;			/* in: quals DuckDB evaluates */
+	char	   *sql;			/* out: the scan query with the reader token */
+	char	   *reader;
+	char	   *empty;
+	GGTypeInfo *types;
+	int			natts;
+	const char *reject;
+} GGNativeScan;
+
+struct DeparseCtx;
+extern bool gg_duckdb_deparse_native_scan(struct DeparseCtx *ctx, GGNativeScan *ns, const char *token);
+extern bool gg_duckdb_native_scan_sql(GGNativeScan *ns, const char *token, List **params);
+extern bool gg_duckdb_native_qual_ok(Oid relid, Index scanrelid, List *attnos, Node *qual);
+
+/* fdw.c */
+extern List *gg_duckdb_native_files(Oid relid);
+extern bool gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *info, const char **reject);
+extern bool gg_duckdb_is_native_scan(ForeignScan *fs, List *rtable);
+extern bool gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals);
+extern char *gg_duckdb_native_location_text(Oid relid);
 
 extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);

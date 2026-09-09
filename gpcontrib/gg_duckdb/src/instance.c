@@ -31,6 +31,8 @@ static int	instance_threads = 0;
 /* settings applied to the instance so far, to notice GUC changes */
 static int	applied_max_memory_mb = -1;
 static char *applied_max_temp_size = NULL;
+static char *applied_data_directories = NULL;	/* TopMemoryContext; fixed at open */
+static int	active_connections = 0;
 
 /*
  * Set by every DuckDB error.  DuckDB invalidates the whole database after an
@@ -134,6 +136,8 @@ set_config(duckdb_config cfg, const char *name, const char *value)
 	}
 }
 
+static void run_setting(duckdb_connection conn, const char *sql);
+
 static void
 open_instance(void)
 {
@@ -162,8 +166,13 @@ open_instance(void)
 		gg_duckdb_max_temp_directory_size[0] != '\0')
 		set_config(cfg, "max_temp_directory_size",
 				   gg_duckdb_max_temp_directory_size);
-	/* the backend reads local data; DuckDB itself touches no files but spills */
-	set_config(cfg, "enable_external_access", "false");
+	/*
+	 * DuckDB itself touches no files but its spills, except under
+	 * gg_duckdb.data_directories, where the foreign data wrapper reads.
+	 * The list, and external access being off, are set by SQL right after
+	 * the open (the configuration API takes no list), before anything else
+	 * runs on the instance; the list is then fixed for its lifetime.
+	 */
 	set_config(cfg, "autoinstall_known_extensions", "false");
 	set_config(cfg, "autoload_known_extensions", "false");
 
@@ -190,6 +199,48 @@ open_instance(void)
 		}
 		PG_TRY();
 		{
+			const char *dirs = gg_duckdb_data_directories ? gg_duckdb_data_directories : "";
+
+			if (dirs[0] != '\0')
+			{
+				StringInfoData list;
+				char	   *copy = pstrdup(dirs);
+				char	   *tok;
+				char	   *save = NULL;
+				bool		first = true;
+
+				initStringInfo(&list);
+				appendStringInfoString(&list, "SET allowed_directories = [");
+				for (tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save))
+				{
+					char	   *d;
+					char	   *q;
+
+					while (*tok == ' ')
+						tok++;
+					d = pstrdup(tok);
+					while (strlen(d) > 0 && d[strlen(d) - 1] == ' ')
+						d[strlen(d) - 1] = '\0';
+					if (d[0] == '\0')
+						continue;
+					appendStringInfo(&list, "%s'", first ? "" : ", ");
+					for (q = d; *q; q++)
+					{
+						if (*q == '\'')
+							appendStringInfoChar(&list, '\'');
+						appendStringInfoChar(&list, *q);
+					}
+					appendStringInfo(&list, "%s'", d[strlen(d) - 1] == '/' ? "" : "/");
+					first = false;
+				}
+				appendStringInfoChar(&list, ']');
+				run_setting(conn, list.data);
+			}
+			run_setting(conn, "SET enable_external_access = false");
+			if (applied_data_directories)
+				pfree(applied_data_directories);
+			applied_data_directories = MemoryContextStrdup(TopMemoryContext, dirs);
+
 			gg_duckdb_register_leaf_function(conn);
 		}
 		PG_CATCH();
@@ -314,23 +365,36 @@ instance_is_valid(duckdb_connection conn)
 duckdb_connection
 gg_duckdb_connect(void)
 {
-	duckdb_database db = gg_duckdb_instance();
+	duckdb_database db;
 	duckdb_connection conn = NULL;
 
+	/*
+	 * The allowed directories are fixed at open: a changed
+	 * gg_duckdb.data_directories takes effect by reopening the instance,
+	 * which is possible while no query holds a connection.
+	 */
+	if (instance != NULL && active_connections == 0 &&
+		strcmp(applied_data_directories ? applied_data_directories : "",
+			   gg_duckdb_data_directories ? gg_duckdb_data_directories : "") != 0)
+		gg_duckdb_instance_close();
+
+	db = gg_duckdb_instance();
 	if (duckdb_connect(db, &conn) == DuckDBError)
 		duck_error("could not connect to the embedded DuckDB", NULL);
+	active_connections++;
 
 	if (instance_suspect)
 	{
 		instance_suspect = false;
 		if (!instance_is_valid(conn))
 		{
-			duckdb_disconnect(&conn);
+			gg_duckdb_disconnect(&conn);
 			gg_duckdb_instance_close();
 			gg_duckdb_stats.reopens++;
 			db = gg_duckdb_instance();
 			if (duckdb_connect(db, &conn) == DuckDBError)
 				duck_error("could not connect to the embedded DuckDB", NULL);
+			active_connections++;
 		}
 	}
 
@@ -340,7 +404,7 @@ gg_duckdb_connect(void)
 	}
 	PG_CATCH();
 	{
-		duckdb_disconnect(&conn);
+		gg_duckdb_disconnect(&conn);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -352,7 +416,11 @@ void
 gg_duckdb_disconnect(duckdb_connection *conn)
 {
 	if (*conn)
+	{
 		duckdb_disconnect(conn);
+		if (active_connections > 0)
+			active_connections--;
+	}
 	*conn = NULL;
 }
 

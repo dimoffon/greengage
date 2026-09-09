@@ -48,6 +48,7 @@
 #include "utils/syscache.h"
 
 #include "optimizer/optimizer.h"
+#include "parser/parsetree.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -67,6 +68,12 @@ typedef struct DeparseCtx
 	NodeCols   *inner;			/* columns of the inner child (joins), or NULL */
 	const char *inner_alias;
 	bool		in_agg;			/* Aggrefs are allowed (Agg tlist / HAVING) */
+
+	/* Vars of a natively read foreign table (varno = its range table index) */
+	Index		scan_relid;
+	const char *scan_alias;
+	GGTypeInfo *scan_types;		/* by attribute number; duck == 0 when not fetched */
+	int			scan_natts;
 } DeparseCtx;
 
 /* Record the reason and fail. */
@@ -233,6 +240,18 @@ deparse_var(DeparseCtx *ctx, Var *var, StringInfo out, GGTypeInfo *type)
 	NodeCols   *cols;
 	const char *alias;
 
+	if (ctx->scan_relid > 0 && var->varno == ctx->scan_relid)
+	{
+		/* a column of the foreign table DuckDB reads natively */
+		if (var->varlevelsup != 0)
+			REJECT(ctx, "outer-level Var");
+		if (var->varattno < 1 || var->varattno > ctx->scan_natts ||
+			ctx->scan_types[var->varattno - 1].duck == 0)
+			REJECT(ctx, "column %d of the foreign table is not read", (int) var->varattno);
+		*type = ctx->scan_types[var->varattno - 1];
+		appendStringInfo(out, "%s.c%d", ctx->scan_alias, (int) var->varattno);
+		return true;
+	}
 	if (var->varno == OUTER_VAR)
 	{
 		cols = ctx->child;
@@ -1128,9 +1147,221 @@ gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti)
 	return gg_duckdb_type_map(typid, exprTypmod((Node *) te->expr), ti);
 }
 
+/*
+ * The DuckDB query reading a gg_duckdb foreign table: the fetched columns
+ * cast to their declared types, named c<attno>, the pushed quals as WHERE.
+ * The reader call itself is the token the executing node replaces with the
+ * reader over its files (see GG_NATIVE_TOKEN_FMT).  Constants of the quals
+ * join ctx's parameters.
+ */
+bool
+gg_duckdb_deparse_native_scan(DeparseCtx *ctx, GGNativeScan *ns, const char *token)
+{
+	GGNativeInfo info;
+	StringInfoData inner;
+	StringInfoData sql;
+	ListCell   *lc;
+	int			k;
+	Index		saved_relid = ctx->scan_relid;
+	const char *saved_alias = ctx->scan_alias;
+	GGTypeInfo *saved_types = ctx->scan_types;
+	int			saved_natts = ctx->scan_natts;
+
+	if (!gg_duckdb_native_describe(ns->relid, ns->attnos, &info, &ns->reject))
+		REJECT(ctx, "%s", ns->reject);
+
+	initStringInfo(&inner);
+	appendStringInfoString(&inner, "SELECT ");
+	k = 0;
+	foreach(lc, ns->attnos)
+	{
+		int			attno = lfirst_int(lc);
+
+		appendStringInfo(&inner, "%sCAST(%s AS %s) AS c%d", k > 0 ? ", " : "",
+						 info.colnames[attno - 1], gg_duckdb_type_sql(&info.types[attno - 1]), attno);
+		k++;
+	}
+	if (k == 0)
+		appendStringInfoString(&inner, "1 AS c0");
+	appendStringInfo(&inner, " FROM %s", token);
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT * FROM (%s) AS n0", inner.data);
+	if (ns->quals != NIL)
+	{
+		bool		first = true;
+
+		ctx->scan_relid = ns->scanrelid;
+		ctx->scan_alias = "n0";
+		ctx->scan_types = info.types;
+		ctx->scan_natts = info.natts;
+		appendStringInfoString(&sql, " WHERE ");
+		foreach(lc, ns->quals)
+		{
+			GGTypeInfo	t;
+
+			if (!first)
+				appendStringInfoString(&sql, " AND ");
+			first = false;
+			if (!deparse_expr(ctx, (Node *) lfirst(lc), &sql, &t))
+			{
+				ctx->scan_relid = saved_relid;
+				ctx->scan_alias = saved_alias;
+				ctx->scan_types = saved_types;
+				ctx->scan_natts = saved_natts;
+				return false;
+			}
+		}
+		ctx->scan_relid = saved_relid;
+		ctx->scan_alias = saved_alias;
+		ctx->scan_types = saved_types;
+		ctx->scan_natts = saved_natts;
+	}
+	ns->sql = sql.data;
+	ns->reader = info.reader;
+	ns->empty = info.empty;
+	ns->types = info.types;
+	ns->natts = info.natts;
+	return true;
+}
+
+/*
+ * The same for the foreign scan on its own (fdw.c): a fresh context whose
+ * parameters are returned through `params`.
+ */
+bool
+gg_duckdb_native_scan_sql(GGNativeScan *ns, const char *token, List **params)
+{
+	DeparseCtx	ctx;
+	GGRegionSpec spec;
+
+	memset(&ctx, 0, sizeof(ctx));
+	memset(&spec, 0, sizeof(spec));
+	spec.params = *params;
+	ctx.spec = &spec;
+	ctx.next_alias = 1;
+	if (!gg_duckdb_deparse_native_scan(&ctx, ns, token))
+	{
+		if (ns->reject == NULL)
+			ns->reject = spec.reject ? spec.reject : "not deparsable";
+		return false;
+	}
+	*params = spec.params;
+	return true;
+}
+
+/* Can `qual` over the foreign table be evaluated by DuckDB? */
+bool
+gg_duckdb_native_qual_ok(Oid relid, Index scanrelid, List *attnos, Node *qual)
+{
+	GGNativeScan ns;
+	List	   *params = NIL;
+
+	memset(&ns, 0, sizeof(ns));
+	ns.relid = relid;
+	ns.scanrelid = scanrelid;
+	ns.attnos = attnos;
+	ns.quals = list_make1(qual);
+	return gg_duckdb_native_scan_sql(&ns, "__GG_NATIVE_0__", &params);
+}
+
+/*
+ * A gg_duckdb foreign scan without local quals as a native leaf: DuckDB
+ * reads the files itself, so no rows are converted on the way in.
+ */
+static bool
+deparse_native_leaf(DeparseCtx *ctx, ForeignScan *fs, StringInfo out, NodeCols *cols)
+{
+	GGNativeScan ns;
+	GGNativeLeaf *nl;
+	RangeTblEntry *rte = rt_fetch(fs->scan.scanrelid, ctx->spec->rtable);
+	char	   *token;
+	StringInfoData proj;
+	ListCell   *lc;
+	int			k = 0;
+	Index		saved_relid = ctx->scan_relid;
+	const char *saved_alias = ctx->scan_alias;
+	GGTypeInfo *saved_types = ctx->scan_types;
+	int			saved_natts = ctx->scan_natts;
+
+	memset(&ns, 0, sizeof(ns));
+	ns.relid = rte->relid;
+	ns.scanrelid = fs->scan.scanrelid;
+	if (!gg_duckdb_foreign_scan_private(fs, &ns.attnos, &ns.quals))
+		REJECT(ctx, "foreign scan carries no native reader");
+	token = psprintf(GG_NATIVE_TOKEN_FMT, list_length(ctx->spec->natives));
+	if (!gg_duckdb_deparse_native_scan(ctx, &ns, token))
+		return false;
+
+	/* the scan's target list over the native columns */
+	cols->ncols = list_length(fs->scan.plan.targetlist);
+	cols->types = palloc0(sizeof(GGTypeInfo) * Max(cols->ncols, 1));
+	ctx->scan_relid = ns.scanrelid;
+	ctx->scan_alias = "n0";
+	ctx->scan_types = ns.types;
+	ctx->scan_natts = ns.natts;
+	initStringInfo(&proj);
+	appendStringInfoString(&proj, "SELECT ");
+	foreach(lc, fs->scan.plan.targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (k > 0)
+			appendStringInfoString(&proj, ", ");
+		if (IsA(te->expr, Var) && ((Var *) te->expr)->varno == ns.scanrelid &&
+			((Var *) te->expr)->varattno >= 1 && ((Var *) te->expr)->varattno <= ns.natts &&
+			ns.types[((Var *) te->expr)->varattno - 1].duck == 0)
+		{
+			/*
+			 * A column of the planner's physical target list the query never
+			 * uses: not read, NULL in the leaf's output, as the standalone
+			 * scan leaves it in the slot.
+			 */
+			Var		   *var = (Var *) te->expr;
+
+			if (!gg_duckdb_type_map(var->vartype, var->vartypmod, &cols->types[k]))
+				REJECT(ctx, "type %s is not carried",
+					   format_type_with_typemod(var->vartype, var->vartypmod));
+			appendStringInfo(&proj, "CAST(NULL AS %s) AS c%d", gg_duckdb_type_sql(&cols->types[k]), k + 1);
+			k++;
+			continue;
+		}
+		if (!deparse_expr(ctx, (Node *) te->expr, &proj, &cols->types[k]))
+		{
+			ctx->scan_relid = saved_relid;
+			ctx->scan_alias = saved_alias;
+			ctx->scan_types = saved_types;
+			ctx->scan_natts = saved_natts;
+			return false;
+		}
+		appendStringInfo(&proj, " AS c%d", k + 1);
+		k++;
+	}
+	if (k == 0)
+		appendStringInfoString(&proj, "1 AS c1");
+	ctx->scan_relid = saved_relid;
+	ctx->scan_alias = saved_alias;
+	ctx->scan_types = saved_types;
+	ctx->scan_natts = saved_natts;
+
+	nl = palloc0(sizeof(GGNativeLeaf));
+	nl->relid = ns.relid;
+	nl->reader = ns.reader;
+	nl->empty = ns.empty;
+	ctx->spec->natives = lappend(ctx->spec->natives, nl);
+	ctx->spec->rows_in += fs->scan.plan.plan_rows;
+	ctx->spec->rows_native += fs->scan.plan.plan_rows;
+	appendStringInfo(out, "%s FROM (%s) AS n0", proj.data, ns.sql);
+	return true;
+}
+
 static bool
 deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
+	if (IsA(plan, ForeignScan) && plan->qual == NIL && plan->initPlan == NIL &&
+		gg_duckdb_is_native_scan((ForeignScan *) plan, ctx->spec->rtable))
+		return deparse_native_leaf(ctx, (ForeignScan *) plan, out, cols);
+
 	ListCell   *lc;
 	int			k = 0;
 	int			leafno = list_length(ctx->spec->leaves);
@@ -1932,8 +2163,11 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.spec = spec;
 	ctx.next_alias = 1;
+	spec->rtable = stmt->rtable;
 	spec->reject = NULL;
 	spec->leaves = NIL;
+	spec->natives = NIL;
+	spec->rows_native = 0;
 	spec->params = NIL;
 	spec->rows_in = 0;
 	spec->ninterior = 0;
@@ -2069,6 +2303,9 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		for (i = 0; i < spec->naggs; i++)
 			appendStringInfoString(&label, "Agg ");
 		appendStringInfo(&label, "over %d %s", spec->nleaves, spec->nleaves == 1 ? "leaf" : "leaves");
+		if (spec->natives != NIL)
+			appendStringInfo(&label, " and %d native %s", list_length(spec->natives),
+							 list_length(spec->natives) == 1 ? "reader" : "readers");
 		spec->label = label.data;
 	}
 	return true;

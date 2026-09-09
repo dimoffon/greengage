@@ -2,7 +2,7 @@
 
 `gg_duckdb` embeds [DuckDB](https://duckdb.org) in every Greengage backend as a
 second executor for segment-local, Motion-free parts of a plan. This directory
-is at **milestone M3**: the library builds into the tree, loads on the
+is at **milestone M5**: the library builds into the tree, loads on the
 coordinator and on every segment, opens a per-backend DuckDB instance lazily on
 the backend thread, and with `gg_duckdb.mode = auto|force` a planner pass turns
 eligible segment-local subtrees into DuckDB regions: hash, merge and nested-loop
@@ -21,8 +21,11 @@ DuckDB too: the region packs DuckDB's exact sum and count into the aggregate
 state the final phase expects. `DuckDB()`/`NoDuckDB()` hints through
 pg_hint_plan force or forbid regions, and under `mode = auto` a cost gate
 compares the standard executor's estimate for the interior operators with
-DuckDB's, conversion included. The design is in
-`doc/architecture/gg-duckdb-executor.md`.
+DuckDB's, conversion included. The `gg_duckdb` foreign data wrapper reads
+Parquet, CSV and JSON files through DuckDB on every segment, each file by
+exactly one segment, and the pass inlines such a scan into a region as a
+native reader, so joins and aggregates above it see no row conversion on the
+way in. The design is in `doc/architecture/gg-duckdb-executor.md`.
 
 ## Design in one paragraph
 
@@ -102,6 +105,42 @@ region honoured is reported as a NOTICE, or as an error under
 `gg_duckdb.strict`. Aliases of base relations are addressable; subqueries the
 optimizer flattens are not. ORCA does not fall back on these hints.
 
+## Reading files: the foreign data wrapper
+
+DuckDB may only touch files under `gg_duckdb.data_directories` (a
+superuser setting, synchronised to the segments, comma-separated absolute
+paths; empty allows none). Set it cluster-wide with `gpconfig`, or per
+session as a superuser. Then:
+
+```sql
+CREATE SERVER duck FOREIGN DATA WRAPPER gg_duckdb;
+CREATE FOREIGN TABLE lineitem (l_orderkey bigint, l_quantity numeric(10,2), l_shipdate date, ...)
+    SERVER duck OPTIONS (location '/data/tpch/lineitem/*.parquet');
+IMPORT FOREIGN SCHEMA "/data/tpch" FROM SERVER duck INTO tpch;   -- a table per file or subdirectory
+ANALYZE lineitem;
+SELECT * FROM gg_duckdb.foreign_files('lineitem');               -- which segment reads which file
+```
+
+Table options: `location` (a path, a glob, or a comma-separated list; every
+entry must lie under `gg_duckdb.data_directories`), `format` (`parquet`,
+the default, `csv` or `json`, also settable on the server or the wrapper),
+`union_by_name`, `hive_partitioning`, and for CSV and JSON the reader
+options `header`, `delim`, `quote`, `escape`, `nullstr`, `skip`,
+`dateformat`, `timestampformat`, `compression`, `sample_size`,
+`maximum_object_size`, passed to DuckDB's `read_csv`/`read_json`; a column
+option `column_name` maps a column to a differently named file column. The
+wrapper's default `mpp_execute` is `all segments`: every segment expands
+the location and reads the files whose path hash falls to it, so a table
+over N files is read by min(N, segments) segments in parallel; a table with
+`mpp_execute 'coordinator'` is read by the coordinator alone. Files must be
+visible under the same path on every node (a shared or network file
+system); `IMPORT FOREIGN SCHEMA` and, without statistics, the planner's
+row estimate read the files on the coordinator. Column types come from the
+table definition; DuckDB casts the file's values to them, so a mismatch is
+an error, not a silent conversion. Quals over carried types and operators
+are evaluated inside DuckDB (`EXPLAIN VERBOSE` shows the DuckDB query),
+the rest by the executor.
+
 ## Tests
 
 ```sh
@@ -126,7 +165,12 @@ two-phase aggregates across a Redistribute Motion (forced and as the
 optimizers choose them, numeric sums and averages included), a shared CTE,
 `NOT IN` and dynamic partition elimination (both stay leaves), and LIMIT early
 stop across slices. `hints` covers the `DuckDB()`/`NoDuckDB()` hints under
-both optimizers. `bench/` holds the TPC-H-shaped benchmark (see its README).
+both optimizers. `foreign` (an `input/*.source` test: it writes its Parquet,
+CSV and JSON files into `data/` with the coordinator's DuckDB) covers the
+foreign data wrapper: sharding, every carried type against a PostgreSQL
+reference, pushed and local quals, the reader inlined into regions,
+rescans, ANALYZE, IMPORT FOREIGN SCHEMA, and the refused locations.
+`bench/` holds the TPC-H-shaped benchmark (see its README).
 
 ## Measured on the development host (DuckDB 1.5.5, 2026-09-09)
 
