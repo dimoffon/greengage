@@ -100,6 +100,8 @@ PG_MODULE_MAGIC;
 #define HINT_LEADING			"Leading"
 #define HINT_SET				"Set"
 #define HINT_ROWS				"Rows"
+#define HINT_DUCKDB				"DuckDB"
+#define HINT_NODUCKDB			"NoDuckDB"
 
 #define HINT_ARRAY_DEFAULT_INITSIZE 8
 
@@ -167,6 +169,9 @@ typedef enum HintKeyword
 	HINT_KEYWORD_ROWS,
 	HINT_KEYWORD_PARALLEL,
 
+	HINT_KEYWORD_DUCKDB,
+	HINT_KEYWORD_NODUCKDB,
+
 	HINT_KEYWORD_UNRECOGNIZED
 } HintKeyword;
 
@@ -192,7 +197,7 @@ typedef const char *(*HintParseFunction) (Hint *hint, HintState *hstate,
 										  Query *parse, const char *str);
 
 /* hint types */
-#define NUM_HINT_TYPE	6
+#define NUM_HINT_TYPE	7
 typedef enum HintType
 {
 	HINT_TYPE_SCAN_METHOD,
@@ -200,7 +205,8 @@ typedef enum HintType
 	HINT_TYPE_LEADING,
 	HINT_TYPE_SET,
 	HINT_TYPE_ROWS,
-	HINT_TYPE_PARALLEL
+	HINT_TYPE_PARALLEL,
+	HINT_TYPE_DUCKDB
 } HintType;
 
 typedef enum HintTypeBitmap
@@ -215,7 +221,8 @@ static const char *HintTypeName[] = {
 	"leading",
 	"set",
 	"rows",
-	"parallel"
+	"parallel",
+	"duckdb"
 };
 
 /* hint status */
@@ -346,6 +353,19 @@ typedef struct ParallelHint
 } ParallelHint;
 
 /*
+ * DuckDB(t1 t2 ...) / NoDuckDB(t1 t2 ...) hints of the gg_duckdb executor.
+ * An empty list addresses the whole query.  They are only parsed here;
+ * gg_duckdb's planner pass applies them (see optimizer/hints.h).
+ */
+typedef struct DuckDBHint
+{
+	Hint			base;
+	int				nrels;
+	char		  **relnames;
+	bool			negative;		/* NoDuckDB */
+} DuckDBHint;
+
+/*
  * Describes a context of hint processing.
  */
 struct HintState
@@ -387,6 +407,7 @@ struct HintState
 	GucContext		context;			/* which GUC parameters can we set? */
 	RowsHint	  **rows_hints;			/* parsed Rows hints */
 	ParallelHint  **parallel_hints;		/* parsed Parallel hints */
+	DuckDBHint	  **duckdb_hints;		/* parsed DuckDB/NoDuckDB hints */
 };
 
 /*
@@ -472,6 +493,13 @@ static void ParallelHintDesc(ParallelHint *hint, StringInfo buf, bool nolf);
 static int ParallelHintCmp(const ParallelHint *a, const ParallelHint *b);
 static const char *ParallelHintParse(ParallelHint *hint, HintState *hstate,
 									 Query *parse, const char *str);
+static Hint *DuckDBHintCreate(const char *hint_str, const char *keyword,
+							  HintKeyword hint_keyword);
+static void DuckDBHintDelete(DuckDBHint *hint);
+static void DuckDBHintDesc(DuckDBHint *hint, StringInfo buf, bool nolf);
+static int DuckDBHintCmp(const DuckDBHint *a, const DuckDBHint *b);
+static const char *DuckDBHintParse(DuckDBHint *hint, HintState *hstate,
+								   Query *parse, const char *str);
 
 static void quote_value(StringInfo buf, const char *value);
 
@@ -613,6 +641,8 @@ static const HintParser parsers[] = {
 	{HINT_SET, SetHintCreate, HINT_KEYWORD_SET},
 	{HINT_ROWS, RowsHintCreate, HINT_KEYWORD_ROWS},
 	{HINT_PARALLEL, ParallelHintCreate, HINT_KEYWORD_PARALLEL},
+	{HINT_DUCKDB, DuckDBHintCreate, HINT_KEYWORD_DUCKDB},
+	{HINT_NODUCKDB, DuckDBHintCreate, HINT_KEYWORD_NODUCKDB},
 
 	{NULL, NULL, HINT_KEYWORD_UNRECOGNIZED}
 };
@@ -1002,6 +1032,46 @@ ParallelHintDelete(ParallelHint *hint)
 	pfree(hint);
 }
 
+static Hint *
+DuckDBHintCreate(const char *hint_str, const char *keyword,
+				 HintKeyword hint_keyword)
+{
+	DuckDBHint *hint;
+
+	hint = palloc(sizeof(DuckDBHint));
+	hint->base.hint_str = hint_str;
+	hint->base.keyword = keyword;
+	hint->base.hint_keyword = hint_keyword;
+	hint->base.type = HINT_TYPE_DUCKDB;
+	hint->base.state = HINT_STATE_NOTUSED;
+	hint->base.delete_func = (HintDeleteFunction) DuckDBHintDelete;
+	hint->base.desc_func = (HintDescFunction) DuckDBHintDesc;
+	hint->base.cmp_func = (HintCmpFunction) DuckDBHintCmp;
+	hint->base.parse_func = (HintParseFunction) DuckDBHintParse;
+	hint->nrels = 0;
+	hint->relnames = NULL;
+	hint->negative = (hint_keyword == HINT_KEYWORD_NODUCKDB);
+
+	return (Hint *) hint;
+}
+
+static void
+DuckDBHintDelete(DuckDBHint *hint)
+{
+	if (!hint)
+		return;
+
+	if (hint->relnames)
+	{
+		int	i;
+
+		for (i = 0; i < hint->nrels; i++)
+			pfree(hint->relnames[i]);
+		pfree(hint->relnames);
+	}
+	pfree(hint);
+}
+
 
 static HintState *
 HintStateCreate(void)
@@ -1034,6 +1104,7 @@ HintStateCreate(void)
 	hstate->set_hints = NULL;
 	hstate->rows_hints = NULL;
 	hstate->parallel_hints = NULL;
+	hstate->duckdb_hints = NULL;
 
 	return hstate;
 }
@@ -1254,6 +1325,23 @@ ParallelHintDesc(ParallelHint *hint, StringInfo buf, bool nolf)
 		appendStringInfoChar(buf, '\n');
 }
 
+static void
+DuckDBHintDesc(DuckDBHint *hint, StringInfo buf, bool nolf)
+{
+	int	i;
+
+	appendStringInfo(buf, "%s(", hint->base.keyword);
+	for (i = 0; i < hint->nrels; i++)
+	{
+		if (i > 0)
+			appendStringInfoCharMacro(buf, ' ');
+		quote_value(buf, hint->relnames[i]);
+	}
+	appendStringInfoString(buf, ")");
+	if (!nolf)
+		appendStringInfoChar(buf, '\n');
+}
+
 /*
  * Append string which represents all hints in a given state to buf, with
  * preceding title with them.
@@ -1409,6 +1497,26 @@ static int
 ParallelHintCmp(const ParallelHint *a, const ParallelHint *b)
 {
 	return RelnameCmp(&a->relname, &b->relname);
+}
+
+static int
+DuckDBHintCmp(const DuckDBHint *a, const DuckDBHint *b)
+{
+	int	i;
+
+	/* DuckDB(x) and NoDuckDB(x) are different hints, not duplicates */
+	if (a->negative != b->negative)
+		return a->negative ? 1 : -1;
+	if (a->nrels != b->nrels)
+		return a->nrels - b->nrels;
+	for (i = 0; i < a->nrels; i++)
+	{
+		int	result;
+
+		if ((result = RelnameCmp(&a->relnames[i], &b->relnames[i])) != 0)
+			return result;
+	}
+	return 0;
 }
 
 static int
@@ -2129,6 +2237,8 @@ create_hintstate(Query *parse, const char *hints)
 		hstate->num_hints[HINT_TYPE_SET]);
 	hstate->parallel_hints = (ParallelHint **) (hstate->rows_hints +
 		hstate->num_hints[HINT_TYPE_ROWS]);
+	hstate->duckdb_hints = (DuckDBHint **) (hstate->parallel_hints +
+		hstate->num_hints[HINT_TYPE_PARALLEL]);
 
 	return hstate;
 }
@@ -2582,6 +2692,36 @@ ParallelHintParse(ParallelHint *hint, HintState *hstate, Query *parse,
 	if (hint->base.state != HINT_STATE_ERROR &&
 		nworkers > max_hint_nworkers)
 		max_hint_nworkers = nworkers;
+
+	return str;
+}
+
+/*
+ * DuckDB(t1 t2 ...) / NoDuckDB(t1 t2 ...): any number of relation names,
+ * none meaning the whole query.  Only parsed here; applied by gg_duckdb.
+ */
+static const char *
+DuckDBHintParse(DuckDBHint *hint, HintState *hstate, Query *parse,
+				const char *str)
+{
+	List	   *name_list = NIL;
+
+	if ((str = parse_parentheses(str, &name_list, hint->base.hint_keyword)) == NULL)
+		return NULL;
+
+	hint->nrels = list_length(name_list);
+	if (hint->nrels > 0)
+	{
+		ListCell   *l;
+		int			i = 0;
+
+		hint->relnames = palloc(sizeof(char *) * hint->nrels);
+		foreach (l, name_list)
+			hint->relnames[i++] = lfirst(l);
+		/* sorted, so that the same set spelled differently compares equal */
+		qsort(hint->relnames, hint->nrels, sizeof(char *), RelnameCmp);
+	}
+	list_free(name_list);
 
 	return str;
 }

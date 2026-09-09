@@ -31,7 +31,9 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
 #include "optimizer/walkers.h"
+#include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -45,6 +47,7 @@ typedef struct PassContext
 	Plan	   *parent;			/* parent of the node being visited */
 	int			next_plan_node_id;
 	int			wrapped;
+	GGHints    *hints;			/* DuckDB()/NoDuckDB() hints of the query */
 } PassContext;
 
 static Node *pass_mutator(Node *node, PassContext *ctx);
@@ -145,6 +148,110 @@ parent_needs_order(Plan *parent)
 }
 
 /*
+ * EXPLAIN VERBOSE resolves a Var through the plan tree down to the
+ * expression it stands for, and a final-phase Aggref insists that its
+ * argument resolves to the partial Aggref it combines.  A region's outputs
+ * are therefore described, in custom_scan_tlist, by the aggregate they
+ * carry when they carry one: a copy of the Aggref whose input Vars point
+ * at extra, display-only columns of the synthetic range table entry.
+ */
+typedef struct DisplayCtx
+{
+	Plan	   *child;			/* the plan the Aggref's Vars refer to */
+	List	   *rtable;
+	int			rteidx;
+	List	  **colnames;
+	List	  **coltypes;
+	List	  **coltypmods;
+	List	  **colcollations;
+} DisplayCtx;
+
+static Node *
+display_var_mutator(Node *node, DisplayCtx *dctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		Var		   *nv;
+		char	   *name = NULL;
+		int			attno;
+
+		if (var->varno == OUTER_VAR && dctx->child != NULL &&
+			var->varattno >= 1 && var->varattno <= list_length(dctx->child->targetlist))
+		{
+			TargetEntry *te = list_nth(dctx->child->targetlist, var->varattno - 1);
+
+			if (te->resname)
+				name = pstrdup(te->resname);
+			else if (IsA(te->expr, Var))
+			{
+				/* the planner leaves a scan's physical target list unnamed */
+				Var		   *cv = (Var *) te->expr;
+
+				if (cv->varno > 0 && cv->varno <= list_length(dctx->rtable) &&
+					cv->varattno > 0)
+				{
+					RangeTblEntry *rte = rt_fetch(cv->varno, dctx->rtable);
+
+					if (rte->rtekind == RTE_RELATION)
+						name = get_attname(rte->relid, cv->varattno, true);
+					else if (rte->eref && cv->varattno <= list_length(rte->eref->colnames))
+						name = pstrdup(strVal(list_nth(rte->eref->colnames, cv->varattno - 1)));
+				}
+			}
+		}
+		if (name == NULL)
+			name = psprintf("in%d", var->varattno);
+		*dctx->colnames = lappend(*dctx->colnames, makeString(name));
+		*dctx->coltypes = lappend_oid(*dctx->coltypes, var->vartype);
+		*dctx->coltypmods = lappend_int(*dctx->coltypmods, var->vartypmod);
+		*dctx->colcollations = lappend_oid(*dctx->colcollations, var->varcollid);
+		attno = list_length(*dctx->colnames);
+		nv = makeVar(dctx->rteidx, attno, var->vartype, var->vartypmod, var->varcollid, 0);
+		return (Node *) nv;
+	}
+	return expression_tree_mutator(node, display_var_mutator, dctx);
+}
+
+/*
+ * The aggregate output column `attno` of `plan` stands for, following
+ * pass-through Vars down the wrapped subtree; NULL when it is not a
+ * partial or simple aggregate.
+ */
+static Aggref *
+find_output_aggref(Plan *plan, int attno, Plan **child)
+{
+	int			depth;
+
+	for (depth = 0; plan != NULL && depth < 8; depth++)
+	{
+		TargetEntry *te;
+		Node	   *expr;
+
+		if (attno < 1 || attno > list_length(plan->targetlist))
+			return NULL;
+		te = (TargetEntry *) list_nth(plan->targetlist, attno - 1);
+		expr = (Node *) te->expr;
+		if (IsA(expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) expr;
+
+			if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL || !IsA(plan, Agg))
+				return NULL;
+			*child = plan->lefttree;
+			return agg;
+		}
+		if (!IsA(expr, Var) || ((Var *) expr)->varno != OUTER_VAR)
+			return NULL;
+		attno = ((Var *) expr)->varattno;
+		plan = plan->lefttree;
+	}
+	return NULL;
+}
+
+/*
  * Build the CustomScan that replaces `root` with region `spec`.
  */
 static Plan *
@@ -152,6 +259,9 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 {
 	List	   *tlist = root->targetlist;
 	List	   *colnames = NIL;
+	List	   *coltypes = NIL;
+	List	   *coltypmods = NIL;
+	List	   *colcollations = NIL;
 	List	   *scan_tlist = NIL;
 	List	   *out_tlist = NIL;
 	RangeTblEntry *rte;
@@ -178,8 +288,35 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 									 exprCollation(expr), 0);
 
 		colnames = lappend(colnames, makeString(name));
+		coltypes = lappend_oid(coltypes, exprType(expr));
+		coltypmods = lappend_int(coltypmods, exprTypmod(expr));
+		colcollations = lappend_oid(colcollations, exprCollation(expr));
 		scan_tlist = lappend(scan_tlist, makeTargetEntry((Expr *) scanvar, k, name, te->resjunk));
 		out_tlist = lappend(out_tlist, makeTargetEntry((Expr *) outvar, k, name, te->resjunk));
+		k++;
+	}
+
+	/* the aggregates behind the outputs, for EXPLAIN VERBOSE (extra columns follow) */
+	k = 1;
+	foreach(lc, tlist)
+	{
+		Plan	   *child = NULL;
+		Aggref	   *agg = find_output_aggref(root, k, &child);
+
+		if (agg != NULL)
+		{
+			DisplayCtx	dctx;
+			TargetEntry *ste = (TargetEntry *) list_nth(scan_tlist, k - 1);
+
+			dctx.child = child;
+			dctx.rtable = ctx->stmt->rtable;
+			dctx.rteidx = rteidx;
+			dctx.colnames = &colnames;
+			dctx.coltypes = &coltypes;
+			dctx.coltypmods = &coltypmods;
+			dctx.colcollations = &colcollations;
+			ste->expr = (Expr *) display_var_mutator((Node *) copyObject(agg), &dctx);
+		}
 		k++;
 	}
 
@@ -188,14 +325,9 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 	rte->enrname = "gg_duckdb_region";
 	rte->enrtuples = root->plan_rows;
 	rte->eref = makeAlias("gg_duckdb_region", colnames);
-	foreach(lc, tlist)
-	{
-		Node	   *expr = (Node *) ((TargetEntry *) lfirst(lc))->expr;
-
-		rte->coltypes = lappend_oid(rte->coltypes, exprType(expr));
-		rte->coltypmods = lappend_int(rte->coltypmods, exprTypmod(expr));
-		rte->colcollations = lappend_oid(rte->colcollations, exprCollation(expr));
-	}
+	rte->coltypes = coltypes;
+	rte->coltypmods = coltypmods;
+	rte->colcollations = colcollations;
 	rte->inFromCl = false;
 	rte->lateral = false;
 	rte->inh = false;
@@ -206,7 +338,7 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 	cs->flags = spec->flags;
 	cs->custom_plans = spec->leaves;
 	cs->custom_exprs = NIL;
-	cs->custom_private = gg_duckdb_make_private(spec->sql, spec->flags, spec->nleaves,
+	cs->custom_private = gg_duckdb_make_private(spec->sql, spec->flags, spec->leaves,
 												spec->label, spec->params,
 												spec->ncols, spec->outtypes);
 	cs->custom_scan_tlist = scan_tlist;
@@ -319,6 +451,7 @@ try_region(PassContext *ctx, Plan *plan)
 	GGRegionSpec spec;
 	char	   *why = NULL;
 	ListCell   *lc;
+	GGHintVerdict verdict;
 
 	memset(&spec, 0, sizeof(spec));
 	if (!gg_duckdb_deparse_region(ctx->stmt, plan, &spec))
@@ -347,19 +480,43 @@ try_region(PassContext *ctx, Plan *plan)
 			return NULL;
 		}
 	}
-	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO && spec.rows_in < (double) gg_duckdb_min_rows)
+	verdict = gg_duckdb_hints_verdict(ctx->hints,
+									  gg_duckdb_region_aliases(ctx->stmt, spec.leaves));
+	if (verdict == GG_HINT_FORBID)
 	{
-		decision(ctx, plan, "estimated input rows below gg_duckdb.min_rows");
-		elog(DEBUG1, "gg_duckdb: plan node %d: %.0f estimated input rows, below gg_duckdb.min_rows = %d",
-			 plan->plan_node_id, spec.rows_in, gg_duckdb_min_rows);
+		decision(ctx, plan, "forbidden by a NoDuckDB hint");
 		return NULL;
+	}
+	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO && verdict != GG_HINT_FORCE)
+	{
+		double		pg_cost = spec.op_cost;
+		double		duck_cost = gg_duckdb_cost_fixed +
+			spec.op_cost * gg_duckdb_cost_op_factor +
+			(spec.rows_in + spec.rows_out) * gg_duckdb_cost_convert_row +
+			(spec.bytes_in + spec.bytes_out) * gg_duckdb_cost_convert_byte;
+
+		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in, %.0f rows out, "
+			 "standard executor %.1f, DuckDB %.1f (margin %.2f)",
+			 plan->plan_node_id, spec.label, spec.rows_in, spec.rows_out,
+			 pg_cost, duck_cost, gg_duckdb_cost_margin);
+		if (spec.rows_in < (double) gg_duckdb_min_rows)
+		{
+			decision(ctx, plan, "estimated input rows below gg_duckdb.min_rows");
+			return NULL;
+		}
+		if (duck_cost * (1.0 + gg_duckdb_cost_margin) >= pg_cost)
+		{
+			decision(ctx, plan, "the cost gate prefers the standard executor");
+			return NULL;
+		}
 	}
 	if (gg_duckdb_validate_at_plan_time && !validate_region(&spec, &why))
 	{
 		decision(ctx, plan, "%s", why);
 		return NULL;
 	}
-	decision(ctx, plan, "region [%s]: %s", spec.label, spec.sql);
+	decision(ctx, plan, "region [%s]%s: %s", spec.label,
+			 verdict == GG_HINT_FORCE ? " forced by a DuckDB hint" : "", spec.sql);
 	elog(DEBUG1, "gg_duckdb: plan node %d: region [%s], %.0f estimated input rows",
 		 plan->plan_node_id, spec.label, spec.rows_in);
 	return make_region(ctx, plan, &spec);
@@ -553,7 +710,11 @@ gg_duckdb_post_planner(PlannedStmt *stmt, Query *parse, int cursorOptions,
 	if (gg_duckdb_debug_wrap == GG_DUCKDB_WRAP_SCANS)
 		stmt->planTree = (Plan *) wrap_mutator((Node *) stmt->planTree, &ctx);
 	else
+	{
+		ctx.hints = gg_duckdb_hints_collect(parse, stmt);
 		stmt->planTree = (Plan *) pass_mutator((Node *) stmt->planTree, &ctx);
+		gg_duckdb_hints_report(ctx.hints);
+	}
 
 	if (ctx.wrapped > 0)
 		elog(DEBUG1, "gg_duckdb: %d region(s) planned", ctx.wrapped);

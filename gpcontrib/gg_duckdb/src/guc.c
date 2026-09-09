@@ -31,6 +31,12 @@ bool		gg_duckdb_explain_decisions = false;
 bool		gg_duckdb_validate_at_plan_time = true;
 bool		gg_duckdb_on_coordinator = false;
 bool		gg_duckdb_reserve_memory = true;
+bool		gg_duckdb_strict = false;
+double		gg_duckdb_cost_fixed = 100.0;
+double		gg_duckdb_cost_convert_row = 0.005;
+double		gg_duckdb_cost_convert_byte = 0.00005;
+double		gg_duckdb_cost_op_factor = 0.25;
+double		gg_duckdb_cost_margin = 0.25;
 
 static const struct config_enum_entry gg_duckdb_debug_wrap_options[] =
 {
@@ -167,6 +173,60 @@ gg_duckdb_define_gucs(void)
 							 true,
 							 PGC_USERSET,
 							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.strict",
+							 "Raise an error instead of a notice when a DuckDB() hint cannot be honoured.",
+							 NULL,
+							 &gg_duckdb_strict,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("gg_duckdb.cost_fixed",
+							 "Cost gate: fixed cost of a region (preparing and starting a DuckDB query), in planner cost units.",
+							 NULL,
+							 &gg_duckdb_cost_fixed,
+							 100.0, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("gg_duckdb.cost_convert_row",
+							 "Cost gate: cost of converting one row into or out of DuckDB, in planner cost units.",
+							 NULL,
+							 &gg_duckdb_cost_convert_row,
+							 0.005, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("gg_duckdb.cost_convert_byte",
+							 "Cost gate: cost of converting one byte into or out of DuckDB, in planner cost units.",
+							 NULL,
+							 &gg_duckdb_cost_convert_byte,
+							 0.00005, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("gg_duckdb.cost_op_factor",
+							 "Cost gate: DuckDB's cost of an interior operator relative to the standard executor's.",
+							 NULL,
+							 &gg_duckdb_cost_op_factor,
+							 0.25, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("gg_duckdb.cost_margin",
+							 "Cost gate: DuckDB's estimate must beat the standard executor's by this fraction.",
+							 NULL,
+							 &gg_duckdb_cost_margin,
+							 0.25, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
 							 NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("gg_duckdb");

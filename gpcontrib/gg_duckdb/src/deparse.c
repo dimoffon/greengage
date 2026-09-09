@@ -28,6 +28,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include <locale.h>
 
 #include "access/htup_details.h"
@@ -44,6 +46,8 @@
 #include "optimizer/walkers.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+
+#include "optimizer/optimizer.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -81,6 +85,8 @@ static bool deparse_expr(DeparseCtx *ctx, Node *node, StringInfo out, GGTypeInfo
 const char *
 gg_duckdb_type_sql(const GGTypeInfo *ti)
 {
+	if (gg_duckdb_is_numeric_state(ti))
+		return psprintf("STRUCT(s DECIMAL(38,%d), n BIGINT)", ti->scale);
 	switch (ti->duck)
 	{
 		case DUCKDB_TYPE_BOOLEAN: return "BOOLEAN";
@@ -255,6 +261,36 @@ deparse_var(DeparseCtx *ctx, Var *var, StringInfo out, GGTypeInfo *type)
  * Binary operators whose DuckDB semantics equal PostgreSQL's on the
  * whitelisted types.  `a` and `b` are already deparsed.
  */
+/*
+ * The DECIMAL shape of an operand of numeric arithmetic: its own for a
+ * DECIMAL, the digits of its type for an integer.
+ */
+static bool
+decimal_shape(const GGTypeInfo *t, int *width, int *scale)
+{
+	if (t->duck == DUCKDB_TYPE_DECIMAL)
+	{
+		*width = t->width;
+		*scale = t->scale;
+		return true;
+	}
+	*scale = 0;
+	switch (t->duck)
+	{
+		case DUCKDB_TYPE_SMALLINT:
+			*width = 5;
+			return true;
+		case DUCKDB_TYPE_INTEGER:
+			*width = 10;
+			return true;
+		case DUCKDB_TYPE_BIGINT:
+			*width = 19;
+			return true;
+		default:
+			return false;
+	}
+}
+
 static bool
 deparse_opexpr(DeparseCtx *ctx, OpExpr *op, StringInfo out, GGTypeInfo *type)
 {
@@ -271,7 +307,8 @@ deparse_opexpr(DeparseCtx *ctx, OpExpr *op, StringInfo out, GGTypeInfo *type)
 
 	if (list_length(op->args) != 2 && list_length(op->args) != 1)
 		REJECT(ctx, "operator with %d arguments", list_length(op->args));
-	if (!map_type(ctx, op->opresulttype, -1, type))
+	/* numeric arithmetic has no typmod: its DECIMAL shape follows from the operands */
+	if (op->opresulttype != NUMERICOID && !map_type(ctx, op->opresulttype, -1, type))
 		return false;
 
 	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(op->opno));
@@ -335,6 +372,46 @@ deparse_opexpr(DeparseCtx *ctx, OpExpr *op, StringInfo out, GGTypeInfo *type)
 		  (ltype == INTERVALOID && rtype == INTERVALOID) ||
 		  (strcmp(name, "-") == 0 && ltype == TIMESTAMPOID && rtype == TIMESTAMPOID)));
 
+		if (op->opresulttype == NUMERICOID)
+		{
+			/*
+			 * Exact decimal arithmetic in both engines, so only the shape of
+			 * the result must be derived: DuckDB's rules for DECIMAL
+			 * addition and multiplication, an integer operand counted as a
+			 * DECIMAL of its digits.  A product wider than 38 digits is not
+			 * representable and is declined.
+			 */
+			int			w1,
+						s1,
+						w2,
+						s2,
+						w,
+						sc;
+
+			if (!decimal_shape(&ta, &w1, &s1) || !decimal_shape(&tb, &w2, &s2))
+				REJECT(ctx, "operator %s on %s and %s", name, format_type_be(ltype), format_type_be(rtype));
+			if (strcmp(name, "*") == 0)
+			{
+				w = w1 + w2;
+				sc = s1 + s2;
+			}
+			else
+			{
+				sc = Max(s1, s2);
+				w = Max(w1 - s1, w2 - s2) + sc + 1;
+			}
+			if (w > 38 || sc > 38)
+				REJECT(ctx, "numeric %s needs more than 38 digits", name);
+			memset(type, 0, sizeof(*type));
+			type->typid = NUMERICOID;
+			type->typmod = -1;
+			type->duck = DUCKDB_TYPE_DECIMAL;
+			type->width = (uint8) w;
+			type->scale = (uint8) sc;
+			appendStringInfo(out, "CAST(CAST(%s AS DECIMAL(%d,%d)) %s CAST(%s AS DECIMAL(%d,%d)) AS %s)",
+							 a.data, w1, s1, name, b.data, w2, s2, gg_duckdb_type_sql(type));
+			return true;
+		}
 		if (!numeric_ok && !datetime_ok)
 			REJECT(ctx, "operator %s on %s and %s", name, format_type_be(ltype), format_type_be(rtype));
 		appendStringInfo(out, "CAST((%s) %s (%s) AS %s)", a.data, name, b.data,
@@ -437,6 +514,38 @@ deparse_funcexpr(DeparseCtx *ctx, FuncExpr *f, StringInfo out, GGTypeInfo *type)
 	REJECT(ctx, "function %s(%d args)", name, nargs);
 }
 
+/*
+ * The partial phase of sum(numeric) or avg(numeric): PostgreSQL hands its
+ * final phase a serialised aggregate state (a bytea).  DuckDB computes the
+ * exact sum and the count, and the region packs them into that state on
+ * output (types.c); the final phase either runs on the standard executor
+ * or in a region that adds the packed sums up.
+ */
+static bool
+deparse_numeric_state(DeparseCtx *ctx, Aggref *agg, const char *arg, int scale,
+					  StringInfo out, GGTypeInfo *type)
+{
+	StringInfoData f;
+
+	initStringInfo(&f);
+	if (agg->aggfilter)
+	{
+		GGTypeInfo	tf;
+		StringInfoData fe;
+
+		initStringInfo(&fe);
+		if (!deparse_expr(ctx, (Node *) agg->aggfilter, &fe, &tf))
+			return false;
+		appendStringInfo(&f, " FILTER (WHERE %s)", fe.data);
+	}
+	if (agg->aggtype != BYTEAOID)
+		REJECT(ctx, "partial numeric aggregate declares %s", format_type_be(agg->aggtype));
+	gg_duckdb_numeric_state_type(type, scale);
+	appendStringInfo(out, "struct_pack(s := CAST(sum(%s)%s AS DECIMAL(38,%d)), n := count(%s)%s)",
+					 arg, f.data, scale, arg, f.data);
+	return true;
+}
+
 static bool
 deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 {
@@ -509,6 +618,20 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	{
 		bool		ok = false;
 
+		if (strcmp(name, "sum") == 0 && argtype == BYTEAOID &&
+			gg_duckdb_is_numeric_state(&ta) && agg->aggtype == NUMERICOID)
+		{
+			/* the partial sums packed in the states, added up */
+			memset(type, 0, sizeof(*type));
+			type->typid = NUMERICOID;
+			type->typmod = -1;
+			type->duck = DUCKDB_TYPE_DECIMAL;
+			type->width = 38;
+			type->scale = ta.scale;
+			appendStringInfo(out, "CAST(sum(struct_extract(%s, 's')) AS DECIMAL(38,%d))",
+							 a.data, ta.scale);
+			return true;
+		}
 		if (strcmp(name, "count") == 0 || strcmp(name, "sum") == 0)
 		{
 			ok = argtype == INT8OID && agg->aggtype == INT8OID;
@@ -544,6 +667,8 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 			gg_duckdb_type_map(INT8OID, -1, type);
 			cast = "BIGINT";
 		}
+		else if (partial && argtype == NUMERICOID && ta.duck == DUCKDB_TYPE_DECIMAL)
+			return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
 		else if (partial)
 			REJECT(ctx, "partial sum(%s) serialises an internal state", format_type_be(argtype));
 		else if (argtype == INT8OID)
@@ -587,6 +712,9 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 		gg_duckdb_type_map(BOOLOID, -1, type);
 		cast = "BOOLEAN";
 	}
+	else if (strcmp(name, "avg") == 0 && partial && argtype == NUMERICOID &&
+			 ta.duck == DUCKDB_TYPE_DECIMAL)
+		return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
 	else
 		REJECT(ctx, "aggregate %s", name);
 
@@ -838,6 +966,168 @@ deparse_expr(DeparseCtx *ctx, Node *node, StringInfo out, GGTypeInfo *type)
  * A leaf: an ordinary plan node pulled through gg_leaf(i).  Its output
  * columns are its targetlist's types.
  */
+/*
+ * The DECIMAL shape of a numeric expression over the columns of `child`,
+ * by the rules deparse_opexpr applies: Vars and Consts by their type,
+ * + and - and * by DuckDB's width and scale rules.
+ */
+static bool
+expr_decimal_shape(Node *expr, Plan *child, int *width, int *scale)
+{
+	GGTypeInfo	ti;
+
+	if (expr == NULL)
+		return false;
+	switch (nodeTag(expr))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) expr;
+				TargetEntry *te;
+
+				if (var->varno != OUTER_VAR || child == NULL ||
+					var->varattno < 1 || var->varattno > list_length(child->targetlist))
+					return false;
+				te = (TargetEntry *) list_nth(child->targetlist, var->varattno - 1);
+				if (!gg_duckdb_type_map(exprType((Node *) te->expr), exprTypmod((Node *) te->expr), &ti))
+					return false;
+				return decimal_shape(&ti, width, scale);
+			}
+		case T_Const:
+			{
+				Const	   *c = (Const *) expr;
+
+				if (c->consttype == NUMERICOID)
+				{
+					uint8		w,
+								sc;
+					char	   *text;
+
+					if (c->constisnull)
+						return false;
+					text = DatumGetCString(DirectFunctionCall1(numeric_out, c->constvalue));
+					if (strcmp(text, "NaN") == 0)
+						return false;
+					numeric_const_shape(text, &w, &sc);
+					*width = w;
+					*scale = sc;
+					return true;
+				}
+				if (!gg_duckdb_type_map(c->consttype, c->consttypmod, &ti))
+					return false;
+				return decimal_shape(&ti, width, scale);
+			}
+		case T_RelabelType:
+			return expr_decimal_shape((Node *) ((RelabelType *) expr)->arg, child, width, scale);
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) expr;
+				char	   *name;
+				int			w1,
+							s1,
+							w2,
+							s2;
+				bool		ok;
+
+				if (op->opresulttype != NUMERICOID || list_length(op->args) != 2)
+					return false;
+				name = get_opname(op->opno);
+				if (name == NULL)
+					return false;
+				ok = expr_decimal_shape((Node *) linitial(op->args), child, &w1, &s1) &&
+					expr_decimal_shape((Node *) lsecond(op->args), child, &w2, &s2);
+				if (!ok)
+					return false;
+				if (strcmp(name, "*") == 0)
+				{
+					*width = w1 + w2;
+					*scale = s1 + s2;
+				}
+				else if (strcmp(name, "+") == 0 || strcmp(name, "-") == 0)
+				{
+					*scale = Max(s1, s2);
+					*width = Max(w1 - s1, w2 - s2) + *scale + 1;
+				}
+				else
+					return false;
+				return *width <= 38 && *scale <= 38;
+			}
+		default:
+			return false;
+	}
+}
+
+/*
+ * Is column `col` of leaf `plan` the serialised state of a partial
+ * sum(numeric) or avg(numeric) computed below it, and at what scale?  The
+ * leaf is typically a Motion above the partial Agg, possibly through nodes
+ * that pass the column through.
+ */
+static bool
+numeric_state_scale(Plan *plan, int col, int *scale)
+{
+	int			depth;
+
+	for (depth = 0; plan != NULL && depth < 8; depth++)
+	{
+		TargetEntry *te;
+		Node	   *expr;
+
+		if (col < 0 || col >= list_length(plan->targetlist))
+			return false;
+		te = (TargetEntry *) list_nth(plan->targetlist, col);
+		expr = (Node *) te->expr;
+		if (IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+
+		if (IsA(plan, Agg) && IsA(expr, Aggref))
+		{
+			Aggref	   *agg = (Aggref *) expr;
+			char	   *name;
+			int			width;
+
+			if (agg->aggsplit != AGGSPLIT_INITIAL_SERIAL || agg->aggtype != BYTEAOID ||
+				list_length(agg->args) != 1 || agg->aggdistinct != NIL ||
+				agg->aggorder != NIL || agg->aggdirectargs != NIL)
+				return false;
+			name = get_func_name(agg->aggfnoid);
+			if (name == NULL || (strcmp(name, "sum") != 0 && strcmp(name, "avg") != 0) ||
+				exprType((Node *) ((TargetEntry *) linitial(agg->args))->expr) != NUMERICOID)
+				return false;
+			return expr_decimal_shape((Node *) ((TargetEntry *) linitial(agg->args))->expr,
+									  plan->lefttree, &width, scale);
+		}
+		if (!IsA(expr, Var) || ((Var *) expr)->varno != OUTER_VAR)
+			return false;
+		col = ((Var *) expr)->varattno - 1;
+		plan = plan->lefttree;
+	}
+	return false;
+}
+
+/*
+ * The DuckDB shape of column `col` of a leaf.  The coordinator (deparser)
+ * and the segments (gg_leaf's bind) must agree, so both come here.
+ */
+bool
+gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti)
+{
+	TargetEntry *te;
+	Oid			typid;
+	int			scale;
+
+	if (col < 0 || col >= list_length(plan->targetlist))
+		return false;
+	te = (TargetEntry *) list_nth(plan->targetlist, col);
+	typid = exprType((Node *) te->expr);
+	if (typid == BYTEAOID && numeric_state_scale(plan, col, &scale))
+	{
+		gg_duckdb_numeric_state_type(ti, scale);
+		return true;
+	}
+	return gg_duckdb_type_map(typid, exprTypmod((Node *) te->expr), ti);
+}
+
 static bool
 deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
@@ -851,13 +1141,15 @@ deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 	{
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 
-		if (!map_type(ctx, exprType((Node *) te->expr), exprTypmod((Node *) te->expr),
-					  &cols->types[k]))
-			return false;
+		if (!gg_duckdb_leaf_column_type(plan, k, &cols->types[k]))
+			REJECT(ctx, "type %s is not carried",
+				   format_type_with_typemod(exprType((Node *) te->expr),
+											exprTypmod((Node *) te->expr)));
 		k++;
 	}
 	ctx->spec->leaves = lappend(ctx->spec->leaves, plan);
 	ctx->spec->rows_in += plan->plan_rows;
+	ctx->spec->bytes_in += plan->plan_rows * Max(plan->plan_width, 1);
 	appendStringInfo(out, "SELECT * FROM %s(%d)", GG_DUCKDB_LEAF_FUNCTION, leafno);
 	return true;
 }
@@ -966,6 +1258,29 @@ subquery_from(DeparseCtx *ctx, const char *sql, char **alias)
 {
 	*alias = psprintf("n%d", ctx->next_alias++);
 	return psprintf("(%s) AS %s", sql, *alias);
+}
+
+/*
+ * PostgreSQL-unit cost of an interior operator, from its input and output
+ * rows the way costsize.c charges it; the gate compares it with DuckDB's.
+ */
+static void
+add_op_cost(DeparseCtx *ctx, double cost)
+{
+	ctx->spec->op_cost += cost;
+}
+
+static double
+rows_of(Plan *plan)
+{
+	return Max(plan->plan_rows, 1.0);
+}
+
+static double
+sort_cost(double rows)
+{
+	rows = Max(rows, 2.0);
+	return 2.0 * cpu_operator_cost * rows * log(rows) / log(2.0);
 }
 
 static bool partition_selector_hazard(Plan *outer, Plan *inner);
@@ -1295,9 +1610,11 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 				ok = deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 				plan->qual = saved_qual;
 				ctx->spec->ninterior++;
+				add_op_cost(ctx, cpu_tuple_cost * rows_of(child));
 				return ok;
 			}
 			ctx->spec->ninterior++;
+			add_op_cost(ctx, cpu_tuple_cost * rows_of(child));
 			from = subquery_from(ctx, child_sql.data, &alias);
 			return deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 		}
@@ -1325,6 +1642,12 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			}
 			ctx->spec->ninterior++;
 			ctx->spec->naggs++;
+			/* as cost_agg: one operator per input row per aggregate and group key */
+			add_op_cost(ctx, cpu_operator_cost * rows_of(child) *
+						(list_length(plan->targetlist) + agg->numCols) +
+						cpu_tuple_cost * rows_of(plan) +
+						(agg->aggstrategy == AGG_SORTED && agg->numCols > 0 ?
+						 sort_cost(rows_of(child)) : 0.0));
 			if (!deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL,
 									agg->numCols > 0 ? gb.data : NULL, true, out, cols))
 				return false;
@@ -1428,6 +1751,22 @@ deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 
 	ctx->spec->ninterior++;
 	ctx->spec->njoins++;
+	{
+		double		orows = rows_of(outerp);
+		double		irows = rows_of(innerp);
+		double		nclauses = Max(list_length(clauses), 1);
+
+		if (IsA(plan, NestLoop))
+			add_op_cost(ctx, cpu_operator_cost * orows * irows * nclauses);
+		else if (IsA(plan, MergeJoin))
+			add_op_cost(ctx, cpu_operator_cost * (orows + irows) * nclauses +
+						(IsA(plan->lefttree, Sort) ? sort_cost(orows) : 0.0) +
+						(IsA(plan->righttree, Sort) ? sort_cost(irows) : 0.0));
+		else
+			add_op_cost(ctx, cpu_operator_cost * (orows + irows) * nclauses +
+						cpu_tuple_cost * irows);
+		add_op_cost(ctx, cpu_tuple_cost * rows_of(plan));
+	}
 	return deparse_projection(ctx, plan, from.data, &ocols, oalias, &icols, ialias,
 							  NULL, false, out, cols);
 }
@@ -1477,6 +1816,7 @@ deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols)
 		appendStringInfo(&u, "(%s)", csql.data);
 	}
 	ctx->spec->ninterior++;
+	add_op_cost(ctx, cpu_tuple_cost * 0.5 * rows_of((Plan *) ap));
 	from = subquery_from(ctx, u.data, &alias);
 	return deparse_projection(ctx, (Plan *) ap, from, &first, alias, NULL, NULL,
 							  NULL, false, out, cols);
@@ -1633,6 +1973,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		spec->nsorts++;
 		spec->ninterior++;
 		spec->ordered = true;
+		add_op_cost(&ctx, sort_cost(rows_of(node)));
 	}
 	else if (spec->agg_order != NULL && node_is_interior_base(node) && IsA(node, Agg))
 	{
@@ -1640,7 +1981,10 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		spec->ordered = true;
 	}
 	if (uniq)
+	{
 		spec->ninterior++;
+		add_op_cost(&ctx, cpu_operator_cost * rows_of(node) * Max(uniq->numCols, 1));
+	}
 	if (limit)
 	{
 		int64		count = 0,
@@ -1659,6 +2003,8 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	}
 
 	spec->sql = sql.data;
+	spec->rows_out = rows_of(root);
+	spec->bytes_out = spec->rows_out * Max(root->plan_width, 1);
 	spec->nleaves = list_length(spec->leaves);
 	spec->ncols = cols.ncols;
 	spec->outtypes = cols.types;

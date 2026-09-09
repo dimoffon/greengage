@@ -15,6 +15,7 @@
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "libpq/pqformat.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
@@ -109,13 +110,103 @@ gg_duckdb_type_map(Oid typid, int32 typmod, GGTypeInfo *ti)
 	return true;
 }
 
+static int128 numeric_text_to_scaled(const char *s, int scale, int width);
+static char *scaled_to_numeric_text(int128 v, int scale);
+
+/*
+ * The shape of a numeric aggregate state (the bytea a partial sum(numeric)
+ * or avg(numeric) hands to its final phase) as DuckDB carries it: a STRUCT
+ * of the sum, a DECIMAL(38,scale), and the count of non-null inputs.
+ */
+void
+gg_duckdb_numeric_state_type(GGTypeInfo *ti, int scale)
+{
+	memset(ti, 0, sizeof(*ti));
+	ti->typid = BYTEAOID;
+	ti->typmod = -1;
+	ti->duck = DUCKDB_TYPE_STRUCT;
+	ti->width = 38;
+	ti->scale = (uint8) scale;
+}
+
+bool
+gg_duckdb_is_numeric_state(const GGTypeInfo *ti)
+{
+	return ti->duck == DUCKDB_TYPE_STRUCT && ti->typid == BYTEAOID;
+}
+
 /* The DuckDB logical type for a mapped PG type; caller destroys it. */
 duckdb_logical_type
 gg_duckdb_logical_type(const GGTypeInfo *ti)
 {
 	if (ti->duck == DUCKDB_TYPE_DECIMAL)
 		return duckdb_create_decimal_type(ti->width, ti->scale);
+	if (gg_duckdb_is_numeric_state(ti))
+	{
+		duckdb_logical_type members[2];
+		const char *names[2] = {"s", "n"};
+		duckdb_logical_type lt;
+
+		members[0] = duckdb_create_decimal_type(38, ti->scale);
+		members[1] = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+		lt = duckdb_create_struct_type(members, names, 2);
+		duckdb_destroy_logical_type(&members[0]);
+		duckdb_destroy_logical_type(&members[1]);
+		return lt;
+	}
 	return duckdb_create_logical_type(ti->duck);
+}
+
+/*
+ * Numeric aggregate states in numeric_avg_serialize()'s layout: N, sumX as
+ * numeric_send() writes it, maxScale, maxScaleCount, NaNcount.
+ */
+static void
+numeric_state_unpack(Datum d, int scale, bool *sum_null, int128 *sum, int64 *n)
+{
+	bytea	   *state = DatumGetByteaPP(d);
+	StringInfoData buf;
+	Datum		sumx;
+	int64		nancount;
+	char	   *text;
+
+	initStringInfo(&buf);
+	appendBinaryStringInfo(&buf, VARDATA_ANY(state), VARSIZE_ANY_EXHDR(state));
+	*n = pq_getmsgint64(&buf);
+	sumx = DirectFunctionCall3(numeric_recv, PointerGetDatum(&buf),
+							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	(void) pq_getmsgint(&buf, 4);	/* maxScale */
+	(void) pq_getmsgint64(&buf);	/* maxScaleCount */
+	nancount = pq_getmsgint64(&buf);
+	if (nancount > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("gg_duckdb: a numeric aggregate state holding NaN cannot be handed to DuckDB")));
+	*sum_null = (*n == 0);
+	text = DatumGetCString(DirectFunctionCall1(numeric_out, sumx));
+	*sum = *sum_null ? 0 : numeric_text_to_scaled(text, scale, 38);
+	pfree(buf.data);
+}
+
+static Datum
+numeric_state_pack(bool sum_null, int128 sum, int64 n, int scale)
+{
+	StringInfoData buf;
+	Datum		sumx;
+	bytea	   *sent;
+
+	if (sum_null)
+		n = 0;
+	sumx = DirectFunctionCall3(numeric_in, CStringGetDatum(scaled_to_numeric_text(sum_null ? 0 : sum, scale)),
+							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	sent = DatumGetByteaPP(DirectFunctionCall1(numeric_send, sumx));
+	pq_begintypsend(&buf);
+	pq_sendint64(&buf, n);
+	pq_sendbytes(&buf, VARDATA_ANY(sent), VARSIZE_ANY_EXHDR(sent));
+	pq_sendint32(&buf, scale);		/* maxScale */
+	pq_sendint64(&buf, n);			/* maxScaleCount */
+	pq_sendint64(&buf, 0);			/* NaNcount */
+	return PointerGetDatum(pq_endtypsend(&buf));
 }
 
 const char *
@@ -132,6 +223,7 @@ gg_duckdb_type_name(duckdb_type t)
 		case DUCKDB_TYPE_DECIMAL: return "DECIMAL";
 		case DUCKDB_TYPE_VARCHAR: return "VARCHAR";
 		case DUCKDB_TYPE_BLOB: return "BLOB";
+		case DUCKDB_TYPE_STRUCT: return "STRUCT";
 		case DUCKDB_TYPE_DATE: return "DATE";
 		case DUCKDB_TYPE_TIMESTAMP: return "TIMESTAMP";
 		case DUCKDB_TYPE_TIMESTAMP_TZ: return "TIMESTAMP WITH TIME ZONE";
@@ -293,6 +385,29 @@ gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
 				}
 				break;
 			}
+		case DUCKDB_TYPE_STRUCT:
+			{
+				/* a numeric aggregate state: sum and count children */
+				duckdb_vector sv = duckdb_struct_vector_get_child(vec, 0);
+				duckdb_vector nv = duckdb_struct_vector_get_child(vec, 1);
+				duckdb_hugeint *h = &((duckdb_hugeint *) duckdb_vector_get_data(sv))[row];
+				bool		sum_null;
+				int128		sum;
+				int64		n;
+
+				numeric_state_unpack(d, ti->scale, &sum_null, &sum, &n);
+				duckdb_vector_ensure_validity_writable(sv);
+				if (sum_null)
+					duckdb_validity_set_row_invalid(duckdb_vector_get_validity(sv), row);
+				else
+				{
+					duckdb_validity_set_row_valid(duckdb_vector_get_validity(sv), row);
+					h->lower = (uint64) (sum & 0xffffffffffffffffULL);
+					h->upper = (int64) (sum >> 64);
+				}
+				((int64 *) duckdb_vector_get_data(nv))[row] = n;
+				break;
+			}
 		case DUCKDB_TYPE_VARCHAR:
 		case DUCKDB_TYPE_BLOB:
 			{
@@ -376,7 +491,8 @@ gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
  */
 Datum
 gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
-					 void *data, uint64_t *validity, idx_t row, bool *isnull)
+					 duckdb_vector vec, void *data, uint64_t *validity, idx_t row,
+					 bool *isnull)
 {
 	if (validity && !duckdb_validity_row_is_valid(validity, row))
 	{
@@ -384,6 +500,24 @@ gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
 		return (Datum) 0;
 	}
 	*isnull = false;
+
+	if (vt == DUCKDB_TYPE_STRUCT && gg_duckdb_is_numeric_state(ti))
+	{
+		duckdb_vector sv = duckdb_struct_vector_get_child(vec, 0);
+		duckdb_vector nv = duckdb_struct_vector_get_child(vec, 1);
+		uint64_t   *sval = duckdb_vector_get_validity(sv);
+		bool		sum_null = sval && !duckdb_validity_row_is_valid(sval, row);
+		int128		sum = 0;
+		int64		n = ((int64 *) duckdb_vector_get_data(nv))[row];
+
+		if (!sum_null)
+		{
+			duckdb_hugeint *h = &((duckdb_hugeint *) duckdb_vector_get_data(sv))[row];
+
+			sum = ((int128) h->upper << 64) | (int128) h->lower;
+		}
+		return numeric_state_pack(sum_null, sum, n, ti->scale);
+	}
 
 	switch (ti->typid)
 	{

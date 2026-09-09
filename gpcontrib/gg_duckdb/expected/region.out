@@ -41,8 +41,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM region_types;
 (5 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE) SELECT id, t FROM region_types WHERE id > 1;
-                       QUERY PLAN                        
----------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Output: gg_duckdb_region.id, gg_duckdb_region.t
    ->  Custom Scan (GGDuckDBRegion)
@@ -53,7 +53,7 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT id, t FROM region_types WHERE id > 1;
                Output: region_types.id, region_types.t
                Filter: (region_types.id > 1)
  Optimizer: Postgres-based planner
- Settings: optimizer = 'off'
+ Settings: effective_cache_size = '512MB', optimizer = 'off'
 (11 rows)
 
 -- identity: every value round-trips (the 5000-byte text is shown by its length: it is toasted)
@@ -156,7 +156,7 @@ SELECT count(*) FROM (SELECT DISTINCT grp FROM region_big) g JOIN region_types t
 RESET enable_hashjoin; RESET enable_mergejoin; RESET optimizer_enable_hashjoin;
 -- a PostgreSQL error raised inside the leaf surfaces unchanged
 SELECT id FROM region_types WHERE 1 / (id - 3) > 0 ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1522396)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1768599)
 -- and the session is still usable afterwards
 SELECT count(*) FROM region_big;
  count  
@@ -167,10 +167,10 @@ SELECT count(*) FROM region_big;
 -- a DuckDB-side error inside the region is an error, never a short result
 SET gg_duckdb.debug_region_sql = 'SELECT c1 + 2147483647 AS c1, c2 FROM gg_leaf(0)';
 SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Out of Range Error: Overflow in addition of INT32 (2 + 2147483647)!  (seg0 slice1 127.0.1.1:9002 pid=1522396)
+ERROR:  gg_duckdb: region query failed: Out of Range Error: Overflow in addition of INT32 (2 + 2147483647)!  (seg0 slice1 127.0.1.1:9002 pid=1768599)
 SET gg_duckdb.debug_region_sql = 'SELECT c1::VARCHAR AS c1, c2 FROM gg_leaf(0)';
 SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;
-ERROR:  gg_duckdb: region column 1 is VARCHAR, INTEGER expected  (seg0 slice1 127.0.1.1:9002 pid=1522396)
+ERROR:  gg_duckdb: region column 1 is VARCHAR, INTEGER expected  (seg2 slice1 127.0.1.1:9004 pid=1768601)
 SET gg_duckdb.debug_region_sql = 'SELECT c1, c2 FROM gg_leaf(0) WHERE c2 = 3';
 SELECT id, grp FROM region_big WHERE id < 20 ORDER BY id;
  id | grp 

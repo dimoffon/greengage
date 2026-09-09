@@ -59,7 +59,7 @@ NOTICE:  gg_duckdb: HashJoin (plan node 1): region [Join over 2 leaves]: SELECT 
                Output: b.id, b.k
                Filter: (b.id < 100)
  Optimizer: Postgres-based planner
- Settings: optimizer = 'off'
+ Settings: effective_cache_size = '512MB', optimizer = 'off'
 (14 rows)
 
 -- two-phase aggregate: the partial Agg on the segments and the final Agg above the Redistribute
@@ -112,6 +112,32 @@ NOTICE:  gg_duckdb: Agg (plan node 3): not eligible: partial sum(bigint) seriali
                      ->  Seq Scan on j_b
  Optimizer: Postgres-based planner
 (9 rows)
+
+-- sum(numeric) and avg(numeric) too, but DuckDB packs their state: the partial
+-- phase sums exactly and counts, the final phase adds the packed sums up
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT id % 7 AS g, sum(n), sum(n * 2 - 1), avg(n) FROM j_a GROUP BY id % 7;
+NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: final avg over a bytea partial
+NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+                                                                                                                                                                                                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: gg_duckdb_region.c1, (sum(gg_duckdb_region.n)), (sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric))), (avg(gg_duckdb_region.n_2))
+   ->  Finalize HashAggregate
+         Output: gg_duckdb_region.c1, sum(gg_duckdb_region.n), sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric)), avg(gg_duckdb_region.n_2)
+         Group Key: gg_duckdb_region.c1
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Output: gg_duckdb_region.c1, (PARTIAL sum(gg_duckdb_region.n)), (PARTIAL sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric))), (PARTIAL avg(gg_duckdb_region.n_2))
+               Hash Key: gg_duckdb_region.c1
+               ->  Custom Scan (GGDuckDBRegion)
+                     Output: gg_duckdb_region.c1, (PARTIAL sum(gg_duckdb_region.n)), (PARTIAL sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric))), (PARTIAL avg(gg_duckdb_region.n_2))
+                     DuckDB: Agg over 1 leaf
+                     DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+                     ->  Seq Scan on public.j_a
+                           Output: (j_a.id % 7), j_a.n
+ Optimizer: Postgres-based planner
+ Settings: effective_cache_size = '512MB', gp_eager_two_phase_agg = 'on', optimizer = 'off', optimizer_force_multistage_agg = 'on'
+(16 rows)
 
 RESET optimizer_force_multistage_agg; RESET gp_eager_two_phase_agg;
 SET gg_duckdb.explain_decisions = off;
@@ -246,6 +272,58 @@ SELECT j_check($q$ SELECT a.v, count(*) AS n, sum(b.w) AS sw FROM j_a a JOIN j_b
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'v' as the Greengage Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'v' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ j_check 
+---------
+ 0 | 0
+(1 row)
+
+-- numeric sums and averages across the phases, with NULLs, a FILTER, an
+-- all-NULL group, an empty input and exact arithmetic on the way in
+SELECT j_check($q$ SELECT id % 7 AS g, sum(n) AS sn, sum(n * (2 - n)) AS sx, avg(n) AS an, count(n) AS cn FROM j_a GROUP BY id % 7 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ j_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT j_check($q$ SELECT id % 5 AS g, sum(n) FILTER (WHERE flag) AS sf, sum(n + 0.5) AS sh, min(n) AS mn FROM j_a GROUP BY id % 5 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ j_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT j_check($q$ SELECT sum(n) AS sn, avg(n) AS an, sum(n * 3) AS s3 FROM j_a $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'sn' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'sn' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ j_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT j_check($q$ SELECT sum(n) AS sn FROM j_a WHERE id < 0 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'sn' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'sn' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ j_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT j_check($q$ SELECT id % 3 AS g, sum(n) AS sn FROM j_a WHERE id % 11 = 0 GROUP BY id % 3 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
  j_check 
 ---------

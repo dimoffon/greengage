@@ -122,6 +122,60 @@ per-allocation accounting, DuckDB 2.0). Out of scope: DuckDB tables, DDL or writ
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
 
+## M4 findings (2026-09-09)
+
+- **Hints.** `DuckDB(t1 t2 ...)` and `NoDuckDB(t1 t2 ...)` are a new hint type in
+  pg_hint_plan (`HINT_TYPE_DUCKDB`, keywords `HINT_KEYWORD_DUCKDB`/`NODUCKDB` before
+  `HINT_KEYWORD_UNRECOGNIZED`, `NUM_HINT_TYPE 7`, `DuckDBHint {base, nrels, relnames,
+  negative}`, `hstate->duckdb_hints`), mirrored in `src/include/optimizer/hints.h`, which
+  now compiles as C (`extern "C"` under `__cplusplus`) so the extension can include it.
+  ORCA reads the per-type arrays it knows and never sees the new type: with
+  `optimizer_trace_fallback = on` no fallback appears. The pass obtains the parsed hints by
+  calling `plan_hint_hook(parse)` exactly as ORCA does. A region is addressed by the
+  aliases of its scan leaves (`rte->eref->aliasname` through `scanrelid`); `DuckDB(S)`
+  forces every eligible region covering S, which in a top-down pass is the maximal one,
+  `NoDuckDB(S)` forbids every region touching S and wins, an empty list means the whole
+  query. Hints beat the cost gate, never make an ineligible subtree eligible, and do
+  nothing under `mode = off`; an unhonoured `DuckDB` hint is a NOTICE, or an ERROR under
+  `gg_duckdb.strict`. The core `planhints`/`rowhints`/`joinhints` tests pass unchanged
+  under both optimizers. pg_hint_plan's own suite does not pass in this tree on this host
+  before or after the change (`UNIQUE index must contain all columns in the distribution
+  key` in its `init` test), and its copied `make_join_rel.c` errors on `NOT IN` joins
+  (`unrecognized join type: 6`) whenever a hint is present under the Postgres planner: a
+  pre-existing limitation, so the hint tests avoid `NOT IN`.
+- **Cost gate.** Under `mode = auto` the deparser accumulates a PostgreSQL-unit estimate
+  of the interior operators the way costsize.c charges them (`cpu_operator_cost` per input
+  row per aggregate or hash clause, `cpu_tuple_cost` per output row, `2·cpu_operator_cost·
+  n·log2 n` for a sort) and the pass compares it with `cost_fixed + op_cost·cost_op_factor
+  + (rows in + out)·cost_convert_row + (bytes in + out)·cost_convert_byte`; DuckDB wins
+  when its estimate times `1 + cost_margin` is below the executor's. `min_rows` stays as a
+  floor. The estimates are logged at DEBUG1 per candidate; `bench/run.sh -c` prints them.
+- **Exact numeric arithmetic.** `+`, `-` and `*` on numeric operands are deparsed with the
+  DECIMAL shape DuckDB derives (`w1+w2, s1+s2` for a product, `max(w1-s1, w2-s2)+max(s1,s2)+1`
+  for a sum; an integer operand counts as DECIMAL of its digits) and an explicit CAST; a
+  product wider than 38 digits is declined. Both engines compute these exactly, so only the
+  shape had to be derived; the display scale of PostgreSQL's result equals the derived one.
+- **Packed numeric aggregate states.** `sum(numeric)` and `avg(numeric)` serialise an
+  `internal` state (`numeric_avg_serialize`: N, sumX as `numeric_send`, maxScale,
+  maxScaleCount, NaNcount) between the phases. The partial phase in a region computes
+  `struct_pack(s := CAST(sum(x) AS DECIMAL(38,scale)), n := count(x))`; the region packs
+  the struct into that state on output (maxScale = the derived scale, maxScaleCount = N,
+  NaNcount = 0; the sum NULL when N = 0), so PostgreSQL's final phase combines it as if
+  PostgreSQL had produced it. A final `sum` in a region unpacks the states of its Motion
+  leaf into the same struct and adds the sums; a final `avg` stays on the executor (its
+  division has PostgreSQL's scale rules). The scale of a state column is derived from the
+  partial Aggref's argument through the plan below the leaf, which a segment cannot
+  repeat once that subtree has itself become a region: the region's `custom_private` (v3)
+  therefore records every leaf column's DuckDB shape, and the segment only cross-checks
+  them against the tuple descriptors. A NaN in a state is refused with an error.
+- **EXPLAIN VERBOSE above a partial region.** ruleutils resolves a final-phase Aggref's
+  argument down the plan and insists on finding the partial Aggref
+  (`get_agg_combine_expr`). A region's `custom_scan_tlist` therefore describes an output
+  that carries a simple or partial aggregate by a copy of that Aggref whose input Vars
+  point at extra, display-only columns of the synthetic range table entry (named after
+  the scanned attributes). EXPLAIN VERBOSE shows `Output: (PARTIAL sum(gg_duckdb_region.price
+  ...))` for such regions.
+
 ## M3 findings (2026-09-09)
 
 - The region grammar grows to `base := Join(base, base) | Append(base...) |

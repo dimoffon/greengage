@@ -72,8 +72,15 @@ make_text_const(const char *s)
 	return makeConst(TEXTOID, -1, InvalidOid, -1, PointerGetDatum(cstring_to_text(s)), false, false);
 }
 
+/*
+ * Layout (a List of Const): version, sql, flags, nleaves, label, nparams,
+ * params..., nout, output descriptors..., then per leaf its column count
+ * and column descriptors.  The leaf shapes are what the coordinator's
+ * deparser assumed; a segment cannot re-derive them once the subtree below
+ * a leaf has itself become a region.
+ */
 List *
-gg_duckdb_make_private(const char *sql, int flags, int nleaves, const char *label,
+gg_duckdb_make_private(const char *sql, int flags, List *leaves, const char *label,
 					   List *params, int nout, const GGTypeInfo *outtypes)
 {
 	List	   *priv = NIL;
@@ -83,7 +90,7 @@ gg_duckdb_make_private(const char *sql, int flags, int nleaves, const char *labe
 	priv = lappend(priv, make_int_const(GG_DUCKDB_PRIVATE_VERSION));
 	priv = lappend(priv, make_text_const(sql));
 	priv = lappend(priv, make_int_const(flags));
-	priv = lappend(priv, make_int_const(nleaves));
+	priv = lappend(priv, make_int_const(list_length(leaves)));
 	priv = lappend(priv, make_text_const(label));
 	priv = lappend(priv, make_int_const(list_length(params)));
 	foreach(lc, params)
@@ -91,6 +98,15 @@ gg_duckdb_make_private(const char *sql, int flags, int nleaves, const char *labe
 	priv = lappend(priv, make_int_const(nout));
 	for (i = 0; i < nout; i++)
 		priv = lappend(priv, make_int_const(GG_OUTDESC(&outtypes[i])));
+	foreach(lc, leaves)
+	{
+		GGLeafDesc	desc;
+
+		gg_duckdb_describe_leaf_plan(&desc, (Plan *) lfirst(lc));
+		priv = lappend(priv, make_int_const(desc.ncols));
+		for (i = 0; i < desc.ncols; i++)
+			priv = lappend(priv, make_int_const(GG_OUTDESC(&desc.cols[i].type)));
+	}
 	return priv;
 }
 
@@ -155,6 +171,32 @@ region_create_state(CustomScan *cscan)
 			st->outtypes[i].width = (uint8) ((d >> 8) & 0xff);
 			st->outtypes[i].scale = (uint8) (d & 0xff);
 		}
+		pos += nout;
+		st->leaf_shapes = palloc0(sizeof(GGTypeInfo *) * Max(st->nleaves, 1));
+		st->leaf_ncols = palloc0(sizeof(int) * Max(st->nleaves, 1));
+		for (i = 0; i < st->nleaves; i++)
+		{
+			int			ncols,
+						k;
+
+			if (list_length(priv) < pos + 1)
+				elog(ERROR, "gg_duckdb: malformed region node");
+			ncols = private_int(priv, pos);
+			pos++;
+			if (list_length(priv) < pos + ncols)
+				elog(ERROR, "gg_duckdb: malformed region node");
+			st->leaf_ncols[i] = ncols;
+			st->leaf_shapes[i] = palloc0(sizeof(GGTypeInfo) * Max(ncols, 1));
+			for (k = 0; k < ncols; k++)
+			{
+				int			d = private_int(priv, pos + k);
+
+				st->leaf_shapes[i][k].duck = (duckdb_type) (d >> 16);
+				st->leaf_shapes[i][k].width = (uint8) ((d >> 8) & 0xff);
+				st->leaf_shapes[i][k].scale = (uint8) (d & 0xff);
+			}
+			pos += ncols;
+		}
 	}
 
 	return (Node *) st;
@@ -213,16 +255,34 @@ describe_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 	lf->desc.ncols = desc->natts;
 	lf->desc.cols = MemoryContextAllocZero(st->region_cxt, sizeof(GGLeafCol) * Max(desc->natts, 1));
 	lf->desc.plan_rows = ps->plan->plan_rows;
+	if (desc->natts != st->leaf_ncols[leafno])
+		elog(ERROR, "gg_duckdb: leaf %d returns %d columns, the planner recorded %d",
+			 leafno, desc->natts, st->leaf_ncols[leafno]);
 	for (k = 0; k < desc->natts; k++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, k);
+		GGTypeInfo *ti = &lf->desc.cols[k].type;
+		GGTypeInfo	pgside;
 
 		snprintf(lf->desc.cols[k].name, sizeof(lf->desc.cols[k].name), "c%d", k + 1);
-		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &lf->desc.cols[k].type))
+		/* the shape the coordinator's deparser assumed, checked against the type */
+		*ti = st->leaf_shapes[leafno][k];
+		ti->typid = att->atttypid;
+		ti->typmod = att->atttypmod;
+		if (gg_duckdb_is_numeric_state(ti))
+			continue;
+		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &pgside))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("gg_duckdb: leaf %d column %d has type %s, which DuckDB regions do not carry",
 							leafno, k + 1, format_type_with_typemod(att->atttypid, att->atttypmod))));
+		if (pgside.duck != ti->duck ||
+			(pgside.duck == DUCKDB_TYPE_DECIMAL &&
+			 (pgside.width != ti->width || pgside.scale != ti->scale)))
+			elog(ERROR, "gg_duckdb: leaf %d column %d: planner recorded %s, type %s maps to %s",
+				 leafno, k + 1, gg_duckdb_type_name(ti->duck),
+				 format_type_with_typemod(att->atttypid, att->atttypmod),
+				 gg_duckdb_type_name(pgside.duck));
 	}
 }
 
@@ -287,6 +347,7 @@ region_begin(CustomScanState *node, EState *estate, int eflags)
 	if (desc->natts != st->ncols)
 		elog(ERROR, "gg_duckdb: region has %d output descriptors for %d columns",
 			 st->ncols, desc->natts);
+	st->colvec = MemoryContextAllocZero(st->region_cxt, sizeof(duckdb_vector) * Max(desc->natts, 1));
 	st->coldata = MemoryContextAllocZero(st->region_cxt, sizeof(void *) * Max(desc->natts, 1));
 	st->colvalid = MemoryContextAllocZero(st->region_cxt, sizeof(uint64_t *) * Max(desc->natts, 1));
 	st->colwidth = MemoryContextAllocZero(st->region_cxt, sizeof(int) * Max(desc->natts, 1));
@@ -298,6 +359,8 @@ region_begin(CustomScanState *node, EState *estate, int eflags)
 
 		st->outtypes[i].typid = att->atttypid;
 		st->outtypes[i].typmod = att->atttypmod;
+		if (att->atttypid == BYTEAOID && st->outtypes[i].duck == DUCKDB_TYPE_STRUCT)
+			continue;			/* a numeric aggregate state, packed by DuckDB */
 		if (att->atttypid == NUMERICOID && att->atttypmod < (int32) VARHDRSZ)
 		{
 			/* unconstrained numeric: the DuckDB shape is whatever the planner emitted */
@@ -646,6 +709,7 @@ region_next_chunk(GGRegionState *st)
 							i + 1, gg_duckdb_type_name(t), st->colwidth[i], st->colscale[i],
 							gg_duckdb_type_name(st->outtypes[i].duck),
 							st->outtypes[i].width, st->outtypes[i].scale)));
+		st->colvec[i] = vec;
 		st->coldata[i] = duckdb_vector_get_data(vec);
 		st->colvalid[i] = duckdb_vector_get_validity(vec);
 	}
@@ -674,6 +738,7 @@ region_exec(CustomScanState *node)
 				slot->tts_values[i] = gg_duckdb_read_datum(&st->outtypes[i],
 														   st->outtypes[i].duck,
 														   st->colwidth[i], st->colscale[i],
+														   st->colvec[i],
 														   st->coldata[i], st->colvalid[i],
 														   st->chunk_row, &slot->tts_isnull[i]);
 			MemoryContextSwitchTo(oldcxt);

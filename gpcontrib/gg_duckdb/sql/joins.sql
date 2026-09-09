@@ -46,6 +46,10 @@ SELECT count(*), max(k) FROM j_a;
 -- sum(int8) serialises an internal state between the phases: neither phase is a region
 EXPLAIN (COSTS OFF)
 SELECT id % 7 AS g, sum(w) FROM j_b GROUP BY id % 7;
+-- sum(numeric) and avg(numeric) too, but DuckDB packs their state: the partial
+-- phase sums exactly and counts, the final phase adds the packed sums up
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT id % 7 AS g, sum(n), sum(n * 2 - 1), avg(n) FROM j_a GROUP BY id % 7;
 RESET optimizer_force_multistage_agg; RESET gp_eager_two_phase_agg;
 SET gg_duckdb.explain_decisions = off;
 
@@ -71,6 +75,13 @@ SET optimizer_force_multistage_agg = on; SET gp_eager_two_phase_agg = on;
 SELECT j_check($q$ SELECT id % 7 AS g, count(*) AS n, sum(k) AS sk, min(id) AS mi, max(n) AS mn, bool_and(flag) AS bf FROM j_a GROUP BY id % 7 $q$);
 SELECT j_check($q$ SELECT id % 7 AS g, count(k) AS n, sum(w) AS sw, min(ts) AS mt FROM j_b GROUP BY id % 7 $q$);
 SELECT j_check($q$ SELECT a.v, count(*) AS n, sum(b.w) AS sw FROM j_a a JOIN j_b b ON a.k = b.k GROUP BY a.v $q$);
+-- numeric sums and averages across the phases, with NULLs, a FILTER, an
+-- all-NULL group, an empty input and exact arithmetic on the way in
+SELECT j_check($q$ SELECT id % 7 AS g, sum(n) AS sn, sum(n * (2 - n)) AS sx, avg(n) AS an, count(n) AS cn FROM j_a GROUP BY id % 7 $q$);
+SELECT j_check($q$ SELECT id % 5 AS g, sum(n) FILTER (WHERE flag) AS sf, sum(n + 0.5) AS sh, min(n) AS mn FROM j_a GROUP BY id % 5 $q$);
+SELECT j_check($q$ SELECT sum(n) AS sn, avg(n) AS an, sum(n * 3) AS s3 FROM j_a $q$);
+SELECT j_check($q$ SELECT sum(n) AS sn FROM j_a WHERE id < 0 $q$);
+SELECT j_check($q$ SELECT id % 3 AS g, sum(n) AS sn FROM j_a WHERE id % 11 = 0 GROUP BY id % 3 $q$);
 RESET optimizer_force_multistage_agg; RESET gp_eager_two_phase_agg;
 SELECT j_check($q$ SELECT id % 7 AS g, count(*) AS n, sum(k) AS sk, min(v COLLATE "C") AS mv, max(n) AS mn, bool_and(flag) AS bf FROM j_a GROUP BY id % 7 $q$);
 SELECT j_check($q$ SELECT count(*) AS n, max(k) AS mk, min(id) AS mi FROM j_a $q$);

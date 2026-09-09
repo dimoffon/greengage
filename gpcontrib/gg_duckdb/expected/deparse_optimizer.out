@@ -38,16 +38,16 @@ NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (
                                                                                   QUERY PLAN                                                                                  
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   Output: gg_duckdb_region.id, gg_duckdb_region.n
+   Output: gg_duckdb_region.id, (count())
    ->  Custom Scan (GGDuckDBRegion)
-         Output: gg_duckdb_region.id, gg_duckdb_region.n
+         Output: gg_duckdb_region.id, (count())
          DuckDB: Agg over 1 leaf
          DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
          ->  Seq Scan on public.d_orders
                Output: d_orders.id
                Filter: (d_orders.id < 30)
  Optimizer: GPORCA
- Settings: gp_enable_multiphase_agg = 'off'
+ Settings: effective_cache_size = '512MB', gp_enable_multiphase_agg = 'off'
 (11 rows)
 
 -- ORDER BY + LIMIT pushed to the segments
@@ -198,10 +198,10 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1697711)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1765761)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1697711)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1765761)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -216,17 +216,33 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 (5 rows)
 
 SET gg_duckdb.min_rows = 0;
+-- ... and the cost gate must favour DuckDB; the fixed cost alone decides for a tiny input
+EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  GroupAggregate
+         Group Key: id
+         ->  Sort
+               Sort Key: id
+               ->  Seq Scan on d_orders
+                     Filter: (id < 30)
+ Optimizer: GPORCA
+(8 rows)
+
+SET gg_duckdb.cost_fixed = 0;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Custom Scan (GGDuckDBRegion)
-         DuckDB: Agg over 1 leaf
+   ->  HashAggregate
+         Group Key: id
          ->  Seq Scan on d_orders
  Optimizer: GPORCA
 (5 rows)
 
 RESET gg_duckdb.min_rows;
+RESET gg_duckdb.cost_fixed;
 -- a bad query never leaves the planner: plan-time validation declines it
 SET gg_duckdb.mode = force;
 SET gg_duckdb.explain_decisions = on;

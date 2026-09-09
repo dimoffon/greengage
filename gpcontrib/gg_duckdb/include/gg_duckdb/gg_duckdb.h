@@ -51,8 +51,28 @@ extern bool gg_duckdb_explain_decisions;
 extern bool gg_duckdb_validate_at_plan_time;
 extern bool gg_duckdb_on_coordinator;
 extern bool gg_duckdb_reserve_memory;
+extern bool gg_duckdb_strict;
+extern double gg_duckdb_cost_fixed;
+extern double gg_duckdb_cost_convert_row;
+extern double gg_duckdb_cost_convert_byte;
+extern double gg_duckdb_cost_op_factor;
+extern double gg_duckdb_cost_margin;
 
 extern void gg_duckdb_define_gucs(void);
+
+/* Plan hints (hints.c) */
+typedef struct GGHints GGHints;
+typedef enum GGHintVerdict
+{
+	GG_HINT_NONE,
+	GG_HINT_FORCE,
+	GG_HINT_FORBID
+} GGHintVerdict;
+
+extern GGHints *gg_duckdb_hints_collect(Query *parse, PlannedStmt *stmt);
+extern List *gg_duckdb_region_aliases(PlannedStmt *stmt, List *leaves);
+extern GGHintVerdict gg_duckdb_hints_verdict(GGHints *hints, List *aliases);
+extern void gg_duckdb_hints_report(GGHints *hints);
 
 /* Whether _PG_init ran from shared_preload_libraries (gg_duckdb.c). */
 extern bool gg_duckdb_preloaded;
@@ -105,14 +125,15 @@ extern const char *gg_duckdb_type_name(duckdb_type t);
 extern void gg_duckdb_write_datum(const GGTypeInfo *ti, duckdb_vector vec, void *data,
 								  uint64_t *validity, idx_t row, Datum d, bool isnull);
 extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
-								  void *data, uint64_t *validity, idx_t row, bool *isnull);
+								  duckdb_vector vec, void *data, uint64_t *validity, idx_t row,
+								  bool *isnull);
 
 /* ---------- the region node (node.c) and its leaves (leaf.c) ---------- */
 
 #define GG_DUCKDB_REGION_NAME		"GGDuckDBRegion"
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
 #define GG_DUCKDB_LEAF_PLACEHOLDER "_gg_row"
-#define GG_DUCKDB_PRIVATE_VERSION	2
+#define GG_DUCKDB_PRIVATE_VERSION	3
 
 /*
  * Positions in CustomScan.custom_private, a flat List of Const (the only
@@ -184,6 +205,9 @@ typedef struct GGRegionState
 	int			ncols;
 	GGTypeInfo *outtypes;
 	int64		memory_reserved;	/* bytes reserved with the vmem tracker */
+	GGTypeInfo **leaf_shapes;	/* DuckDB shape of every leaf column, from the plan */
+	int		   *leaf_ncols;
+	duckdb_vector *colvec;
 	void	  **coldata;		/* per column of the current chunk */
 	uint64_t  **colvalid;
 	int		   *colwidth;		/* DECIMAL width/scale seen in the chunk */
@@ -213,9 +237,9 @@ typedef struct GGRegionState
 
 extern CustomScanMethods gg_duckdb_scan_methods;
 
-extern List *gg_duckdb_make_private(const char *sql, int flags, int nleaves,
-									const char *label, List *params,
-									int nout, const GGTypeInfo *outtypes);
+extern List *gg_duckdb_make_private(const char *sql, int flags, List *leaves,
+									const char *label, List *params, int nout,
+									const GGTypeInfo *outtypes);
 extern void gg_duckdb_register_leaf_function(duckdb_connection conn);
 extern duckdb_prepared_statement gg_duckdb_prepare_with(GGBindContext *bctx,
 														duckdb_connection conn,
@@ -239,6 +263,10 @@ typedef struct GGRegionSpec
 	char	   *label;
 	const char *reject;			/* why the subtree is ineligible, or NULL */
 	double		rows_in;		/* estimated rows entering DuckDB */
+	double		bytes_in;		/* estimated bytes entering DuckDB */
+	double		op_cost;		/* PostgreSQL-unit cost of the interior operators */
+	double		rows_out;		/* estimated rows the region returns */
+	double		bytes_out;
 	int			ninterior;
 	int			naggs;
 	int			nsorts;
@@ -249,6 +277,9 @@ typedef struct GGRegionSpec
 
 extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);
+extern bool gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti);
+extern void gg_duckdb_numeric_state_type(GGTypeInfo *ti, int scale);
+extern bool gg_duckdb_is_numeric_state(const GGTypeInfo *ti);
 
 /* ---------- the planner pass (pass.c) ---------- */
 

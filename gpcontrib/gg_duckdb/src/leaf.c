@@ -283,9 +283,9 @@ gg_duckdb_describe_leaf_plan(GGLeafDesc *desc, Plan *plan)
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 
 		snprintf(desc->cols[k].name, sizeof(desc->cols[k].name), "c%d", k + 1);
-		if (!gg_duckdb_type_map(exprType((Node *) te->expr), exprTypmod((Node *) te->expr),
-								&desc->cols[k].type))
+		if (!gg_duckdb_leaf_column_type(plan, k, &desc->cols[k].type))
 			elog(ERROR, "gg_duckdb: leaf column %d has an unsupported type", k + 1);
+		(void) te;
 		k++;
 	}
 }
