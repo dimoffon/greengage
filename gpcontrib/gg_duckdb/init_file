@@ -1,0 +1,12 @@
+-- gpcontrib/gg_duckdb/init_file: masks for gg_duckdb regression output,
+-- applied on top of src/test/regress/init_file.
+-- start_matchsubs
+-- DuckDB library versions and paths change with the pin
+m/v\d+\.\d+\.\d+(-dev\d*)?/
+s/v\d+\.\d+\.\d+(-dev\d*)?/vX.Y.Z/
+m/pgsql_tmp_gg_duckdb_\d+/
+s/pgsql_tmp_gg_duckdb_\d+/pgsql_tmp_gg_duckdb_PID/
+-- which segment reports an error first is not deterministic
+m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+-- end_matchsubs

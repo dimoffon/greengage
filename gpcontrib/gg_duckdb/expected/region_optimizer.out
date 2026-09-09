@@ -1,0 +1,208 @@
+-- M1: identity regions.  With gg_duckdb.debug_wrap = scans every SeqScan of a
+-- segment slice is wrapped into a DuckDB region whose query is the identity
+-- (SELECT c1..cN FROM gg_leaf(0)); the leaf is still the SeqScan, executed by
+-- the standard executor and pulled on the backend thread.  Results must be
+-- identical to the plain plan; the comparisons below print 0 | 0 regardless
+-- of plan shape.
+CREATE EXTENSION IF NOT EXISTS gg_duckdb;
+SET gg_duckdb.mode = force;
+CREATE TABLE region_types (
+    id int4,
+    b bool, i2 int2, i8 int8, f4 float4, f8 float8,
+    n numeric(12,3), n38 numeric(38,10),
+    t text, v varchar(20), c char(6),
+    d date, ts timestamp, tstz timestamptz, iv interval,
+    by bytea, u uuid
+) DISTRIBUTED BY (id);
+INSERT INTO region_types VALUES
+  (1, true,  -32768, -9223372036854775808, -1.5, 2.25, -123456789.125, -1234567890123456789012345678.0123456789,
+   'text', 'varchar', 'ab', '2000-01-01', '2000-01-01 00:00:00', '2000-01-01 00:00:00+00', '1 month 2 days 3 seconds',
+   '\x00ff10', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'),
+  (2, false, 32767, 9223372036854775807, 3.4028235e38, 1.7976931348623157e308, 999999999.999, 9999999999999999999999999999.9999999999,
+   '', '', '', '1969-12-31', '1969-12-31 23:59:59.999999', '1969-12-31 23:59:59.999999+00', '-1 year -2 days -00:00:00.000001',
+   '', '00000000-0000-0000-0000-000000000000'),
+  (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+  (4, true, 0, 0, 'NaN', '-0', 0.000, 0, repeat('x', 5000), 'trailing  ', 'pad', 'infinity', 'infinity', '-infinity', '0',
+   '\xdeadbeef', 'ffffffff-ffff-ffff-ffff-ffffffffffff'),
+  (5, false, 1, -1, 'Infinity', '-Infinity', -0.001, -0.0000000001, E'é中\U0001F600', 'uni', 'x', '-infinity', '-infinity', 'infinity', '178000000 years',
+   '\x', '12345678-1234-5678-1234-567812345678');
+ANALYZE region_types;
+-- the plan has a region under the Gather Motion
+SET gg_duckdb.debug_wrap = scans;
+EXPLAIN (COSTS OFF) SELECT * FROM region_types;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: identity over SeqScan
+         ->  Seq Scan on region_types
+ Optimizer: GPORCA
+(5 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE) SELECT id, t FROM region_types WHERE id > 1;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: gg_duckdb_region.id, gg_duckdb_region.t
+   ->  Custom Scan (GGDuckDBRegion)
+         Output: gg_duckdb_region.id, gg_duckdb_region.t
+         DuckDB: identity over SeqScan
+         DuckDB SQL: SELECT c1, c2 FROM gg_leaf(0)
+         ->  Seq Scan on public.region_types
+               Output: region_types.id, region_types.t
+               Filter: (region_types.id > 1)
+ Optimizer: GPORCA
+(10 rows)
+
+-- identity: every value round-trips (the 5000-byte text is shown by its length: it is toasted)
+SELECT id, b, i2, i8, f4, f8, n, n38, left(t, 12) AS t12, length(t) AS t_len, v, c, d, ts, tstz, iv, by, u
+  FROM region_types ORDER BY id;
+ id | b |   i2   |          i8          |      f4       |           f8            |       n        |                   n38                    |     t12      | t_len |     v      |   c    |     d      |               ts                |                tstz                 |                iv                 |     by     |                  u                   
+----+---+--------+----------------------+---------------+-------------------------+----------------+------------------------------------------+--------------+-------+------------+--------+------------+---------------------------------+-------------------------------------+-----------------------------------+------------+--------------------------------------
+  1 | t | -32768 | -9223372036854775808 |          -1.5 |                    2.25 | -123456789.125 | -1234567890123456789012345678.0123456789 | text         |     4 | varchar    | ab     | 01-01-2000 | Sat Jan 01 00:00:00 2000        | Fri Dec 31 16:00:00 1999 PST        | @ 1 mon 2 days 3 secs             | \x00ff10   | a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+  2 | f |  32767 |  9223372036854775807 | 3.4028235e+38 | 1.7976931348623157e+308 |  999999999.999 |  9999999999999999999999999999.9999999999 |              |     0 |            |        | 12-31-1969 | Wed Dec 31 23:59:59.999999 1969 | Wed Dec 31 15:59:59.999999 1969 PST | @ 1 year 2 days 0.000001 secs ago | \x         | 00000000-0000-0000-0000-000000000000
+  3 |   |        |                      |               |                         |                |                                          |              |       |            |        |            |                                 |                                     |                                   |            | 
+  4 | t |      0 |                    0 |           NaN |                      -0 |          0.000 |                             0.0000000000 | xxxxxxxxxxxx |  5000 | trailing   | pad    | infinity   | infinity                        | -infinity                           | @ 0                               | \xdeadbeef | ffffffff-ffff-ffff-ffff-ffffffffffff
+  5 | f |      1 |                   -1 |      Infinity |               -Infinity |         -0.001 |                            -0.0000000001 | é中😀         |     3 | uni        | x      | -infinity  | -infinity                       | infinity                            | @ 178000000 years                 | \x         | 12345678-1234-5678-1234-567812345678
+(5 rows)
+
+SELECT id, length(c) AS c_len, c = 'pad' AS c_eq, octet_length(c) AS c_bytes FROM region_types ORDER BY id;
+ id | c_len | c_eq | c_bytes 
+----+-------+------+---------
+  1 |     2 | f    |       6
+  2 |     0 | f    |       6
+  3 |       |      |        
+  4 |     3 | t    |       6
+  5 |     1 | f    |       6
+(5 rows)
+
+-- same rows with and without regions, compared both ways
+CREATE TEMP TABLE plain AS SELECT * FROM region_types;   -- temp tables live on the coordinator's slice too
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+SET gg_duckdb.debug_wrap = off;
+CREATE TEMP TABLE base AS SELECT * FROM region_types;
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+SET gg_duckdb.debug_wrap = scans;
+SELECT (SELECT count(*) FROM (TABLE base EXCEPT ALL TABLE plain) x) AS missing,
+       (SELECT count(*) FROM (TABLE plain EXCEPT ALL TABLE base) x) AS extra;
+ missing | extra 
+---------+-------
+       0 |     0
+(1 row)
+
+SELECT (SELECT count(*) FROM (SELECT * FROM base EXCEPT ALL SELECT * FROM region_types) x) AS missing,
+       (SELECT count(*) FROM (SELECT * FROM region_types EXCEPT ALL SELECT * FROM base) x) AS extra;
+ missing | extra 
+---------+-------
+       0 |     0
+(1 row)
+
+-- projection and quals stay on the leaf; the region carries what the leaf projects
+SELECT id, i2 + 1 AS i2p, left(upper(t), 12) AS ut FROM region_types WHERE b ORDER BY id;
+ id |  i2p   |      ut      
+----+--------+--------------
+  1 | -32767 | TEXT
+  4 |      1 | XXXXXXXXXXXX
+(2 rows)
+
+-- a bigger table: many chunks, aggregates above the region, LIMIT early stop
+CREATE TABLE region_big AS SELECT i AS id, i % 7 AS grp, i::numeric(10,2) / 4 AS amount, 'row ' || i AS label
+  FROM generate_series(1, 100000) i DISTRIBUTED BY (id);
+ANALYZE region_big;
+SELECT count(*), sum(id), min(amount), max(label) FROM region_big;
+ count  |    sum     |          min           |    max    
+--------+------------+------------------------+-----------
+ 100000 | 5000050000 | 0.25000000000000000000 | row 99999
+(1 row)
+
+SELECT grp, count(*), sum(amount) FROM region_big GROUP BY grp ORDER BY grp;
+ grp | count |              sum               
+-----+-------+--------------------------------
+   0 | 14285 |     178566071.2500000000000000
+   1 | 14286 | 178569642.75000000000000000000
+   2 | 14286 | 178573214.25000000000000000000
+   3 | 14286 | 178576785.75000000000000000000
+   4 | 14286 | 178580357.25000000000000000000
+   5 | 14286 |     178583928.7500000000000000
+   6 | 14285 |     178562500.0000000000000000
+(7 rows)
+
+SELECT id FROM region_big ORDER BY id LIMIT 3;
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+
+SELECT count(*) FROM (SELECT * FROM region_big LIMIT 10) x;
+ count 
+-------
+    10
+(1 row)
+
+-- rescan: the region is the inner side of a nested loop
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET optimizer_enable_hashjoin = off;
+SELECT count(*) FROM (SELECT DISTINCT grp FROM region_big) g JOIN region_types t ON t.id = g.grp;
+ count 
+-------
+     5
+(1 row)
+
+RESET enable_hashjoin; RESET enable_mergejoin; RESET optimizer_enable_hashjoin;
+-- a PostgreSQL error raised inside the leaf surfaces unchanged
+SELECT id FROM region_types WHERE 1 / (id - 3) > 0 ORDER BY id;
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1518636)
+-- and the session is still usable afterwards
+SELECT count(*) FROM region_big;
+ count  
+--------
+ 100000
+(1 row)
+
+-- a DuckDB-side error inside the region is an error, never a short result
+SET gg_duckdb.debug_region_sql = 'SELECT c1 + 2147483647 AS c1, c2 FROM gg_leaf(0)';
+SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;
+ERROR:  gg_duckdb: region query failed: Out of Range Error: Overflow in addition of INT32 (2 + 2147483647)!  (seg0 slice1 127.0.1.1:9002 pid=1518636)
+SET gg_duckdb.debug_region_sql = 'SELECT c1::VARCHAR AS c1, c2 FROM gg_leaf(0)';
+SELECT id, grp FROM region_big WHERE id < 5 ORDER BY id;
+ERROR:  gg_duckdb: region column 1 is VARCHAR, INTEGER expected  (seg0 slice1 127.0.1.1:9002 pid=1518636)
+SET gg_duckdb.debug_region_sql = 'SELECT c1, c2 FROM gg_leaf(0) WHERE c2 = 3';
+SELECT id, grp FROM region_big WHERE id < 20 ORDER BY id;
+ id | grp 
+----+-----
+  3 |   3
+ 10 |   3
+ 17 |   3
+(3 rows)
+
+RESET gg_duckdb.debug_region_sql;
+-- cancel: a slow leaf is interrupted by statement_timeout
+CREATE FUNCTION region_slow(int) RETURNS bool LANGUAGE sql VOLATILE
+  AS 'SELECT pg_sleep(0.01) IS NOT NULL';
+SET statement_timeout = '500ms';
+SELECT count(*) FROM region_big WHERE region_slow(id);
+ERROR:  canceling statement due to statement timeout
+RESET statement_timeout;
+DROP FUNCTION region_slow(int);
+SELECT count(*) FROM region_big;
+ count  
+--------
+ 100000
+(1 row)
+
+-- mode off: no regions
+SET gg_duckdb.mode = off;
+EXPLAIN (COSTS OFF) SELECT * FROM region_types;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on region_types
+ Optimizer: GPORCA
+(3 rows)
+
+RESET gg_duckdb.debug_wrap;
+RESET gg_duckdb.mode;
+DROP TABLE region_types;
+DROP TABLE region_big;
