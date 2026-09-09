@@ -5,7 +5,7 @@ default: all
 top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
-.PHONY: all install clean distclean gpcloud
+.PHONY: all install clean distclean gpcloud orafce gg_duckdb
 
 #
 # targets built via top_builddir/GNUmakefile
@@ -42,7 +42,7 @@ ifeq "$(with_zstd)" "yes"
 endif
 $(call recurse,all install clean distclean, $(recurse_targets))
 
-all: gpcloud orafce
+all: gpcloud orafce gg_duckdb
 
 gpcloud:
 	@if [ "$(enable_gpcloud)" = "yes" ]; then \
@@ -55,6 +55,11 @@ orafce:
 		$(MAKE) -C orafce NO_PGXS=true; \
 	fi
 
+gg_duckdb:
+	@if [ -n "$(with_duckdb)" ]; then \
+		$(MAKE) -C gg_duckdb; \
+	fi
+
 install:
 	@if [ "$(enable_gpcloud)" = "yes" ]; then \
 		$(MAKE) -C gpcloud install && \
@@ -63,15 +68,20 @@ install:
 	@if [ "$(enable_orafce)" = "yes" ]; then \
 		$(MAKE) -C orafce NO_PGXS=true install; \
 	fi
+	@if [ -n "$(with_duckdb)" ]; then \
+		$(MAKE) -C gg_duckdb install; \
+	fi
 
 clean:
 	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud cleanall; fi
 	if [ "${enable_orafce}" = "yes" ]; then $(MAKE) -C orafce NO_PGXS=true clean; fi
+	if [ -n "$(with_duckdb)" ]; then $(MAKE) -C gg_duckdb clean; fi
 
 
 distclean:
 	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud distclean; fi
 	if [ "${enable_orafce}" = "yes" ]; then $(MAKE) -C orafce NO_PGXS=true distclean; fi
+	if [ -n "$(with_duckdb)" ]; then $(MAKE) -C gg_duckdb distclean; fi
 
 installcheck:
 	$(MAKE) -C gp_internal_tools installcheck
@@ -84,6 +94,7 @@ installcheck:
 	$(MAKE) -C gg_tables_tracking/isolation2 installcheck
 	$(MAKE) -C gg_wait_sampling installcheck
 	$(MAKE) -C gg_wait_sampling/isolation2 installcheck
+	if [ -n "$(with_duckdb)" ]; then $(MAKE) -C gg_duckdb installcheck; fi
 
 installcheck-resgroup:
 	$(MAKE) -C gg_wait_sampling/isolation2 installcheck-resgroup
