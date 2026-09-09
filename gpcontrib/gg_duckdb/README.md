@@ -2,14 +2,18 @@
 
 `gg_duckdb` embeds [DuckDB](https://duckdb.org) in every Greengage backend as a
 second executor for segment-local, Motion-free parts of a plan. This directory
-is at **milestone M1**: the library builds into the tree, loads on the
+is at **milestone M2**: the library builds into the tree, loads on the
 coordinator and on every segment, opens a per-backend DuckDB instance lazily on
-the backend thread, exposes `gg_duckdb.query()`, `gg_duckdb.status()` and
-`gg_duckdb.version()`, and ships the region node end to end: with
-`gg_duckdb.mode = force` and `gg_duckdb.debug_wrap = scans` every SeqScan of a
-segment slice becomes an identity region (`SELECT c1..cN FROM gg_leaf(0)`)
-whose leaf is still the SeqScan, pulled by DuckDB on the backend thread. The
-deparser and the real planner pass come with M2; the design is in
+the backend thread, and with `gg_duckdb.mode = auto|force` a planner pass turns
+eligible segment-local subtrees into DuckDB regions: plain, hashed and sorted
+aggregates (`count`, `sum`, `min`, `max`, `bool_and`, `bool_or`, with DISTINCT
+and FILTER), projections, and top chains of `ORDER BY`, `DISTINCT` and
+`LIMIT/OFFSET` over a whitelist of types, operators and functions whose DuckDB
+semantics equal PostgreSQL's. Leaves (scans, Motion receivers, anything else)
+stay ordinary plan nodes pulled by DuckDB on the backend thread. Every region
+query is prepared on the coordinator before it is used, so an ineligible or
+unbindable subtree simply stays on the standard executor. Joins, Append and
+two-phase aggregates come with M3; the design is in
 `doc/architecture/gg-duckdb-executor.md`.
 
 ## Design in one paragraph
@@ -52,10 +56,17 @@ psql -c "SELECT gp_segment_id, gg_duckdb.query('select 42') FROM gp_dist_random(
 psql -c "SELECT gp_segment_id, (gg_duckdb.status()).* FROM gp_dist_random('gp_id')"
 ```
 
-GUCs (all `gg_duckdb.*`): `mode` (off/auto/force; off by default), `max_memory`
-(per-backend cap of DuckDB's memory limit, 512MB), `temp_directory` (default
-`base/pgsql_tmp/pgsql_tmp_gg_duckdb_<pid>` under each node's data directory),
-`max_temp_directory_size`, `release_instance_at_end`. The core GUC
+GUCs (all `gg_duckdb.*`): `mode` (off/auto/force; off by default: auto applies
+the gate, force takes every eligible region), `min_rows` (estimated input rows
+a region needs under auto, 100000), `explain_decisions` (NOTICE per candidate
+subtree with the reason it was declined, or its DuckDB query), `on_coordinator`
+(regions in coordinator slices, off), `validate_at_plan_time` (prepare every
+region query on the coordinator first, on), `max_memory` and `min_memory`
+(bounds of a region's DuckDB memory limit, 512MB and 64MB), `reserve_memory`
+(reserve the region's budget with the vmem tracker, on), `temp_directory`
+(default `base/pgsql_tmp/pgsql_tmp_gg_duckdb_<pid>` under each node's data
+directory), `max_temp_directory_size`, `release_instance_at_end`, and the
+development aids `debug_wrap` and `debug_region_sql`. The core GUC
 `optimizer_enable_duckdb` gates plans produced by GPORCA.
 
 ## Tests
@@ -69,7 +80,12 @@ PGOPTIONS='-c optimizer=off' make -C gpcontrib/gg_duckdb installcheck  # planner
 with NULLs and extremes, both differential comparisons (`0 | 0`), aggregates
 above a region, LIMIT early stop, a nested-loop rescan, a PostgreSQL error
 raised inside the leaf, DuckDB-side errors (overflow, type mismatch), and
-cancellation by `statement_timeout`.
+cancellation by `statement_timeout`. `deparse` covers the pass and the
+deparser: EXPLAIN shapes and decision notices, nine differential comparisons
+(grouped aggregates with expressions, FILTER, DISTINCT, collated min, int8 and
+numeric sums; sort-limit chains with NULLS FIRST/LAST and OFFSET; DISTINCT;
+regions above Redistribute Motion leaves), division by zero, the auto-mode
+gate, and the collation and float-sum rejections.
 
 ## Measured on the development host (DuckDB 1.5.5, 2026-09-09)
 

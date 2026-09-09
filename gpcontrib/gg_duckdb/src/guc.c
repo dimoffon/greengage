@@ -20,11 +20,17 @@
 
 int			gg_duckdb_mode = GG_DUCKDB_MODE_OFF;
 int			gg_duckdb_max_memory_mb = 512;
+int			gg_duckdb_min_memory_mb = 64;
 char	   *gg_duckdb_temp_directory = NULL;
 char	   *gg_duckdb_max_temp_directory_size = NULL;
 bool		gg_duckdb_release_instance_at_end = false;
 int			gg_duckdb_debug_wrap = GG_DUCKDB_WRAP_OFF;
 char	   *gg_duckdb_debug_region_sql = NULL;
+int			gg_duckdb_min_rows = 100000;
+bool		gg_duckdb_explain_decisions = false;
+bool		gg_duckdb_validate_at_plan_time = true;
+bool		gg_duckdb_on_coordinator = false;
+bool		gg_duckdb_reserve_memory = true;
 
 static const struct config_enum_entry gg_duckdb_debug_wrap_options[] =
 {
@@ -60,6 +66,15 @@ gg_duckdb_define_gucs(void)
 							&gg_duckdb_max_memory_mb,
 							512, 16, INT_MAX / 1024,
 							PGC_SUSET,
+							GUC_UNIT_MB | GUC_GPDB_NEED_SYNC,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("gg_duckdb.min_memory",
+							"Lower bound of a region's DuckDB memory limit.",
+							"A region's share of the query memory is raised to this: DuckDB needs room for its buffers even when memquota grants a node next to nothing.",
+							&gg_duckdb_min_memory_mb,
+							64, 8, INT_MAX / 1024,
+							PGC_USERSET,
 							GUC_UNIT_MB | GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);
 
@@ -108,6 +123,51 @@ gg_duckdb_define_gucs(void)
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("gg_duckdb.min_rows",
+							"Estimated rows a region must take in before mode=auto uses DuckDB for it.",
+							NULL,
+							&gg_duckdb_min_rows,
+							100000, 0, INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.explain_decisions",
+							 "Report, as NOTICEs at plan time, every subtree considered for DuckDB and why it was rejected.",
+							 NULL,
+							 &gg_duckdb_explain_decisions,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.validate_at_plan_time",
+							 "Prepare every region query on the coordinator's DuckDB before using it; a subtree whose query does not bind stays on the standard executor.",
+							 NULL,
+							 &gg_duckdb_validate_at_plan_time,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.on_coordinator",
+							 "Allow regions in slices that run on the coordinator.",
+							 NULL,
+							 &gg_duckdb_on_coordinator,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.reserve_memory",
+							 "Reserve a region's memory budget with the vmem tracker while it runs.",
+							 NULL,
+							 &gg_duckdb_reserve_memory,
+							 true,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
 
 	EmitWarningsOnPlaceholders("gg_duckdb");
 }

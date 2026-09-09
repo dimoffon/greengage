@@ -40,11 +40,17 @@ typedef enum GGDuckDebugWrap
 /* GUCs (guc.c) */
 extern int	gg_duckdb_mode;
 extern int	gg_duckdb_max_memory_mb;
+extern int	gg_duckdb_min_memory_mb;
 extern char *gg_duckdb_temp_directory;
 extern char *gg_duckdb_max_temp_directory_size;
 extern bool gg_duckdb_release_instance_at_end;
 extern int	gg_duckdb_debug_wrap;
 extern char *gg_duckdb_debug_region_sql;
+extern int	gg_duckdb_min_rows;
+extern bool gg_duckdb_explain_decisions;
+extern bool gg_duckdb_validate_at_plan_time;
+extern bool gg_duckdb_on_coordinator;
+extern bool gg_duckdb_reserve_memory;
 
 extern void gg_duckdb_define_gucs(void);
 
@@ -104,9 +110,15 @@ extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int widt
 
 #define GG_DUCKDB_REGION_NAME		"GGDuckDBRegion"
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
-#define GG_DUCKDB_PRIVATE_VERSION	1
+#define GG_DUCKDB_PRIVATE_VERSION	2
 
-/* positions in CustomScan.custom_private, a flat List of Const */
+/*
+ * Positions in CustomScan.custom_private, a flat List of Const (the only
+ * node kinds every plan walker accepts there):
+ *   version, sql, flags, nleaves, label, nparams, <nparams Consts bound as
+ *   $1..$n>, nout, <nout int4 output descriptors: duck type << 16 | width
+ *   << 8 | scale>.
+ */
 enum
 {
 	GGP_VERSION = 0,			/* int4 */
@@ -118,21 +130,39 @@ enum
 	GGP_NFIELDS
 };
 
+#define GG_OUTDESC(ti)	(((int) (ti)->duck << 16) | ((int) (ti)->width << 8) | (int) (ti)->scale)
+
 typedef struct GGLeafCol
 {
 	char		name[16];		/* "c<k>" as DuckDB sees it */
 	GGTypeInfo	type;
 } GGLeafCol;
 
-typedef struct GGLeaf
+/* what gg_leaf's bind needs: shared by the QE (from PlanStates) and the QD (from Plans) */
+typedef struct GGLeafDesc
 {
-	PlanState  *ps;
 	int			ncols;
 	GGLeafCol  *cols;			/* one per result column of the leaf */
 	double		plan_rows;
+} GGLeafDesc;
+
+typedef struct GGLeaf
+{
+	GGLeafDesc	desc;
+	PlanState  *ps;
 	bool		eof;
 	int64		rows;			/* pulled so far */
 } GGLeaf;
+
+struct GGRegionState;
+
+/* what is visible to gg_leaf while a region query is prepared */
+typedef struct GGBindContext
+{
+	struct GGRegionState *region;	/* NULL when only validating on the QD */
+	int			nleaves;
+	GGLeafDesc **leaves;
+} GGBindContext;
 
 typedef struct GGRegionState
 {
@@ -146,10 +176,12 @@ typedef struct GGRegionState
 	const char *label;
 
 	GGLeaf	   *leaves;
+	List	   *params;			/* Consts bound as $1..$n */
 
-	/* output columns, from the scan tuple descriptor */
+	/* output columns: PG side from the scan tuple descriptor, DuckDB side from custom_private */
 	int			ncols;
 	GGTypeInfo *outtypes;
+	int64		memory_reserved;	/* bytes reserved with the vmem tracker */
 	void	  **coldata;		/* per column of the current chunk */
 	uint64_t  **colvalid;
 	int		   *colwidth;		/* DECIMAL width/scale seen in the chunk */
@@ -180,12 +212,40 @@ typedef struct GGRegionState
 extern CustomScanMethods gg_duckdb_scan_methods;
 
 extern List *gg_duckdb_make_private(const char *sql, int flags, int nleaves,
-									const char *label);
+									const char *label, List *params,
+									int nout, const GGTypeInfo *outtypes);
 extern void gg_duckdb_register_leaf_function(duckdb_connection conn);
-extern duckdb_prepared_statement gg_duckdb_prepare_region(GGRegionState *region,
-														  duckdb_connection conn,
-														  const char *sql,
-														  char **errmsg);
+extern duckdb_prepared_statement gg_duckdb_prepare_with(GGBindContext *bctx,
+														duckdb_connection conn,
+														const char *sql,
+														char **errmsg);
+extern void gg_duckdb_describe_leaf_plan(GGLeafDesc *desc, Plan *plan);
+extern GGBindContext *gg_duckdb_bind_context_push(GGBindContext *bctx);
+extern void gg_duckdb_bind_context_pop(GGBindContext *saved);
+
+/* ---------- the deparser (deparse.c) ---------- */
+
+typedef struct GGRegionSpec
+{
+	char	   *sql;
+	List	   *leaves;			/* Plan nodes, in gg_leaf index order */
+	int			nleaves;
+	List	   *params;			/* Consts bound as $1..$n */
+	int			ncols;
+	GGTypeInfo *outtypes;		/* DuckDB shape of every output column */
+	int			flags;
+	char	   *label;
+	const char *reject;			/* why the subtree is ineligible, or NULL */
+	double		rows_in;		/* estimated rows entering DuckDB */
+	int			ninterior;
+	int			naggs;
+	int			nsorts;
+	bool		ordered;		/* the query ends with the root's ORDER BY */
+	char	   *agg_order;		/* ORDER BY restoring a sorted Agg's output order, or NULL */
+} GGRegionSpec;
+
+extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
+extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);
 
 /* ---------- the planner pass (pass.c) ---------- */
 

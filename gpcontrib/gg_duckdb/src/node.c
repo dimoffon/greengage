@@ -19,7 +19,11 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
+#include "utils/vmem_tracker.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -31,6 +35,7 @@ static void region_rescan(CustomScanState *node);
 static void region_shutdown(CustomScanState *node);
 static void region_explain(CustomScanState *node, List *ancestors, ExplainState *es);
 static void region_explain_end(PlanState *planstate, struct StringInfoData *buf);
+static void region_raise(GGRegionState *st, const char *what, const char *msg) pg_attribute_noreturn();
 
 CustomScanMethods gg_duckdb_scan_methods = {
 	GG_DUCKDB_REGION_NAME,
@@ -68,16 +73,24 @@ make_text_const(const char *s)
 }
 
 List *
-gg_duckdb_make_private(const char *sql, int flags, int nleaves, const char *label)
+gg_duckdb_make_private(const char *sql, int flags, int nleaves, const char *label,
+					   List *params, int nout, const GGTypeInfo *outtypes)
 {
 	List	   *priv = NIL;
+	ListCell   *lc;
+	int			i;
 
 	priv = lappend(priv, make_int_const(GG_DUCKDB_PRIVATE_VERSION));
 	priv = lappend(priv, make_text_const(sql));
 	priv = lappend(priv, make_int_const(flags));
 	priv = lappend(priv, make_int_const(nleaves));
 	priv = lappend(priv, make_text_const(label));
-	priv = lappend(priv, make_int_const(0));	/* params: none yet */
+	priv = lappend(priv, make_int_const(list_length(params)));
+	foreach(lc, params)
+		priv = lappend(priv, copyObject(lfirst(lc)));
+	priv = lappend(priv, make_int_const(nout));
+	for (i = 0; i < nout; i++)
+		priv = lappend(priv, make_int_const(GG_OUTDESC(&outtypes[i])));
 	return priv;
 }
 
@@ -117,6 +130,32 @@ region_create_state(CustomScan *cscan)
 	st->flags = private_int(priv, GGP_FLAGS);
 	st->nleaves = private_int(priv, GGP_NLEAVES);
 	st->label = private_text(priv, GGP_LABEL);
+	{
+		int			nparams = private_int(priv, GGP_NPARAMS);
+		int			pos = GGP_NPARAMS + 1;
+		int			nout,
+					i;
+
+		if (list_length(priv) < pos + nparams + 1)
+			elog(ERROR, "gg_duckdb: malformed region node");
+		for (i = 0; i < nparams; i++)
+			st->params = lappend(st->params, list_nth(priv, pos + i));
+		pos += nparams;
+		nout = private_int(priv, pos);
+		pos++;
+		if (list_length(priv) < pos + nout)
+			elog(ERROR, "gg_duckdb: malformed region node");
+		st->ncols = nout;
+		st->outtypes = palloc0(sizeof(GGTypeInfo) * Max(nout, 1));
+		for (i = 0; i < nout; i++)
+		{
+			int			d = private_int(priv, pos + i);
+
+			st->outtypes[i].duck = (duckdb_type) (d >> 16);
+			st->outtypes[i].width = (uint8) ((d >> 8) & 0xff);
+			st->outtypes[i].scale = (uint8) (d & 0xff);
+		}
+	}
 
 	return (Node *) st;
 }
@@ -150,6 +189,11 @@ region_release(GGRegionState *st)
 {
 	region_release_query(st);
 	gg_duckdb_disconnect(&st->conn);
+	if (st->memory_reserved > 0)
+	{
+		VmemTracker_ReleaseVmem(st->memory_reserved);
+		st->memory_reserved = 0;
+	}
 }
 
 /* Reset callback of region_cxt: an error path never leaks DuckDB objects. */
@@ -166,15 +210,15 @@ describe_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 	int			k;
 
 	lf->ps = ps;
-	lf->ncols = desc->natts;
-	lf->cols = MemoryContextAllocZero(st->region_cxt, sizeof(GGLeafCol) * Max(desc->natts, 1));
-	lf->plan_rows = ps->plan->plan_rows;
+	lf->desc.ncols = desc->natts;
+	lf->desc.cols = MemoryContextAllocZero(st->region_cxt, sizeof(GGLeafCol) * Max(desc->natts, 1));
+	lf->desc.plan_rows = ps->plan->plan_rows;
 	for (k = 0; k < desc->natts; k++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, k);
 
-		snprintf(lf->cols[k].name, sizeof(lf->cols[k].name), "c%d", k + 1);
-		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &lf->cols[k].type))
+		snprintf(lf->desc.cols[k].name, sizeof(lf->desc.cols[k].name), "c%d", k + 1);
+		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &lf->desc.cols[k].type))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("gg_duckdb: leaf %d column %d has type %s, which DuckDB regions do not carry",
@@ -234,9 +278,15 @@ region_begin(CustomScanState *node, EState *estate, int eflags)
 		node->ss.ps.cdbexplainfun = region_explain_end;
 	}
 
+	/*
+	 * Output columns: the PostgreSQL side comes from the scan tuple
+	 * descriptor, the DuckDB side (type, DECIMAL width and scale) from the
+	 * descriptors the planner recorded; the two must agree.
+	 */
 	desc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
-	st->ncols = desc->natts;
-	st->outtypes = MemoryContextAllocZero(st->region_cxt, sizeof(GGTypeInfo) * Max(desc->natts, 1));
+	if (desc->natts != st->ncols)
+		elog(ERROR, "gg_duckdb: region has %d output descriptors for %d columns",
+			 st->ncols, desc->natts);
 	st->coldata = MemoryContextAllocZero(st->region_cxt, sizeof(void *) * Max(desc->natts, 1));
 	st->colvalid = MemoryContextAllocZero(st->region_cxt, sizeof(uint64_t *) * Max(desc->natts, 1));
 	st->colwidth = MemoryContextAllocZero(st->region_cxt, sizeof(int) * Max(desc->natts, 1));
@@ -244,13 +294,156 @@ region_begin(CustomScanState *node, EState *estate, int eflags)
 	for (i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
+		GGTypeInfo	pgside;
 
-		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &st->outtypes[i]))
+		st->outtypes[i].typid = att->atttypid;
+		st->outtypes[i].typmod = att->atttypmod;
+		if (att->atttypid == NUMERICOID && att->atttypmod < (int32) VARHDRSZ)
+		{
+			/* unconstrained numeric: the DuckDB shape is whatever the planner emitted */
+			if (st->outtypes[i].duck != DUCKDB_TYPE_DECIMAL)
+				elog(ERROR, "gg_duckdb: region output column %d is numeric but DuckDB returns %s",
+					 i + 1, gg_duckdb_type_name(st->outtypes[i].duck));
+			continue;
+		}
+		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &pgside))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("gg_duckdb: region output column %d has type %s, which DuckDB regions do not carry",
 							i + 1, format_type_with_typemod(att->atttypid, att->atttypmod))));
+		if (pgside.duck != st->outtypes[i].duck ||
+			(pgside.duck == DUCKDB_TYPE_DECIMAL &&
+			 (pgside.width != st->outtypes[i].width || pgside.scale != st->outtypes[i].scale)))
+			elog(ERROR, "gg_duckdb: region output column %d: planner recorded %s, type %s maps to %s",
+				 i + 1, gg_duckdb_type_name(st->outtypes[i].duck),
+				 format_type_with_typemod(att->atttypid, att->atttypmod),
+				 gg_duckdb_type_name(pgside.duck));
 	}
+}
+
+/* Bind the region's constants as $1..$n. */
+static void
+bind_params(GGRegionState *st)
+{
+	ListCell   *lc;
+	idx_t		idx = 1;
+
+	foreach(lc, st->params)
+	{
+		Const	   *c = (Const *) lfirst(lc);
+		duckdb_state rc;
+
+		if (c->constisnull)
+			rc = duckdb_bind_null(st->stmt, idx);
+		else
+		{
+			switch (c->consttype)
+			{
+				case BOOLOID:
+					rc = duckdb_bind_boolean(st->stmt, idx, DatumGetBool(c->constvalue));
+					break;
+				case INT2OID:
+					rc = duckdb_bind_int16(st->stmt, idx, DatumGetInt16(c->constvalue));
+					break;
+				case INT4OID:
+					rc = duckdb_bind_int32(st->stmt, idx, DatumGetInt32(c->constvalue));
+					break;
+				case INT8OID:
+					rc = duckdb_bind_int64(st->stmt, idx, DatumGetInt64(c->constvalue));
+					break;
+				case FLOAT4OID:
+					rc = duckdb_bind_float(st->stmt, idx, DatumGetFloat4(c->constvalue));
+					break;
+				case FLOAT8OID:
+					rc = duckdb_bind_double(st->stmt, idx, DatumGetFloat8(c->constvalue));
+					break;
+				case BYTEAOID:
+					{
+						struct varlena *v = PG_DETOAST_DATUM_PACKED(c->constvalue);
+
+						rc = duckdb_bind_blob(st->stmt, idx, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+						break;
+					}
+				case INTERVALOID:
+					{
+						Interval   *iv = DatumGetIntervalP(c->constvalue);
+						duckdb_interval d;
+
+						d.months = iv->month;
+						d.days = iv->day;
+						d.micros = iv->time;
+						rc = duckdb_bind_interval(st->stmt, idx, d);
+						break;
+					}
+				default:
+					{
+						/* everything else through its text form and the query's CAST */
+						Oid			typoutput;
+						bool		isvarlena;
+						char	   *text;
+						int			len;
+
+						getTypeOutputInfo(c->consttype, &typoutput, &isvarlena);
+						text = OidOutputFunctionCall(typoutput, c->constvalue);
+						len = strlen(text);
+						if (c->consttype == BPCHAROID)
+							len = bpchartruelen(text, len);
+						rc = duckdb_bind_varchar_length(st->stmt, idx, text, len);
+						break;
+					}
+			}
+		}
+		if (rc == DuckDBError)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+					 errmsg("gg_duckdb: could not bind parameter %d", (int) idx)));
+		idx++;
+	}
+}
+
+/*
+ * The region's memory: its share of the query's memory (memquota treats a
+ * region like a Sort when the planner flagged it so), capped by
+ * gg_duckdb.max_memory.  Reserved with the vmem tracker up front, since the
+ * tracker sees nothing of DuckDB's own allocations.
+ */
+static void
+region_memory(GGRegionState *st)
+{
+	int64		kb = (int64) PlanStateOperatorMemKB(&st->css.ss.ps);
+	int64		cap_kb = (int64) gg_duckdb_max_memory_mb * 1024;
+	int64		floor_kb = (int64) gg_duckdb_min_memory_mb * 1024;
+	char	   *sql;
+	duckdb_result res;
+
+	if (kb <= 0)
+		kb = work_mem;
+	kb = Max(kb, floor_kb);
+	kb = Min(kb, cap_kb);
+
+	if (gg_duckdb_reserve_memory && st->memory_reserved == 0)
+	{
+		MemoryAllocationStatus status = VmemTracker_ReserveVmem(kb * 1024);
+
+		if (status != MemoryAllocation_Success)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("gg_duckdb: could not reserve " INT64_FORMAT " kB for a DuckDB region (status %d)",
+							kb, (int) status)));
+		st->memory_reserved = kb * 1024;
+	}
+
+	sql = psprintf("SET memory_limit = '" INT64_FORMAT "KB'", kb);
+	if (duckdb_query(st->conn, sql, &res) == DuckDBError)
+	{
+		const char *msg = duckdb_result_error(&res);
+		char	   *copy = pstrdup(msg ? msg : "unknown error");
+
+		duckdb_destroy_result(&res);
+		region_raise(st, "could not set the memory limit", copy);
+	}
+	duckdb_destroy_result(&res);
+	pfree(sql);
 }
 
 /*
@@ -314,13 +507,27 @@ region_start(GGRegionState *st)
 	idx_t		n,
 				i;
 
+	GGBindContext bctx;
+	GGBindContext *saved_bctx;
+	GGLeafDesc **descs = palloc(sizeof(GGLeafDesc *) * Max(st->nleaves, 1));
+
+	for (i = 0; i < (idx_t) st->nleaves; i++)
+		descs[i] = &st->leaves[i].desc;
+	bctx.region = st;
+	bctx.nleaves = st->nleaves;
+	bctx.leaves = descs;
+
 	st->conn = gg_duckdb_connect();
+	saved_bctx = gg_duckdb_bind_context_push(&bctx);
 
 	PG_TRY();
 	{
-		st->stmt = gg_duckdb_prepare_region(st, st->conn, st->sql, &err);
+		region_memory(st);
+
+		st->stmt = gg_duckdb_prepare_with(&bctx, st->conn, st->sql, &err);
 		if (st->stmt == NULL)
 			region_raise(st, "could not prepare the region query", err);
+		bind_params(st);
 
 		n = duckdb_prepared_statement_column_count(st->stmt);
 		if ((int) n != st->ncols)
@@ -359,10 +566,12 @@ region_start(GGRegionState *st)
 	}
 	PG_CATCH();
 	{
+		gg_duckdb_bind_context_pop(saved_bctx);
 		region_release(st);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	gg_duckdb_bind_context_pop(saved_bctx);
 
 	st->started = true;
 	gg_duckdb_stats.queries_executed++;

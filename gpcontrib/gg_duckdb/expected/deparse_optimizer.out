@@ -1,0 +1,252 @@
+-- M2: the deparser and the real pass.  Segment-local Result/Agg subtrees and
+-- top chains of Limit/Unique/Sort become DuckDB regions; every case is
+-- compared against the plain plan and prints 0 | 0 regardless of shape.
+CREATE EXTENSION IF NOT EXISTS gg_duckdb;
+NOTICE:  extension "gg_duckdb" already exists, skipping
+CREATE TABLE d_orders (
+    id int, cust int, qty int, amount numeric(12,2), ts timestamp, d date,
+    note text, flag bool, f8 float8, big int8
+) DISTRIBUTED BY (id);
+INSERT INTO d_orders
+SELECT i, i % 97, (i * 7) % 13, (i % 1000) / 4.0, timestamp '2024-01-01' + (i % 500) * interval '1 hour',
+       date '2024-01-01' + (i % 365), 'note ' || (i % 50), (i % 3) = 0, i / 3.0, i::int8 * 1000000000
+FROM generate_series(1, 60000) i;
+INSERT INTO d_orders VALUES (60001, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+ANALYZE d_orders;
+-- what the pass considers, and why it declines
+SET gg_duckdb.mode = force;
+SET gg_duckdb.explain_decisions = on;
+SET gp_enable_multiphase_agg = off;
+-- grouped aggregate on the distribution key: a single-phase HashAgg on the segments
+EXPLAIN (COSTS OFF)
+SELECT id, count(*), sum(qty), min(amount), max(ts), bool_and(flag)
+  FROM d_orders WHERE id < 3000 GROUP BY id;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(c2) AS BIGINT) AS c3, CAST(min(c3) AS DECIMAL(12,2)) AS c4, CAST(max(c4) AS TIMESTAMP) AS c5, CAST(bool_and(c5) AS BOOLEAN) AS c6 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Seq Scan on d_orders
+               Filter: (id < 3000)
+ Optimizer: GPORCA
+(6 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT id, count(*) AS n FROM d_orders WHERE id < 30 GROUP BY id;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2 ORDER BY c1 ASC NULLS LAST
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: gg_duckdb_region.id, gg_duckdb_region.n
+   ->  Custom Scan (GGDuckDBRegion)
+         Output: gg_duckdb_region.id, gg_duckdb_region.n
+         DuckDB: Agg over 1 leaf
+         DuckDB SQL: SELECT * FROM (SELECT c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY c1) AS n2 ORDER BY c1 ASC NULLS LAST
+         ->  Seq Scan on public.d_orders
+               Output: d_orders.id
+               Filter: (d_orders.id < 30)
+ Optimizer: GPORCA
+ Settings: gp_enable_multiphase_agg = 'off'
+(11 rows)
+
+-- ORDER BY + LIMIT pushed to the segments
+EXPLAIN (COSTS OFF)
+SELECT id, amount FROM d_orders ORDER BY amount DESC, id LIMIT 5;
+NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT * FROM gg_leaf(0)) AS n1 ORDER BY c2 DESC NULLS FIRST, c1 ASC NULLS LAST LIMIT 5 OFFSET 0
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_duckdb_region.amount, gg_duckdb_region.id
+         ->  Custom Scan (GGDuckDBRegion)
+               DuckDB: Limit Sort over 1 leaf
+               ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(7 rows)
+
+-- text ordering is refused under the database collation, accepted under "C"
+EXPLAIN (COSTS OFF)
+SELECT note, id FROM d_orders ORDER BY note, id LIMIT 3;
+NOTICE:  gg_duckdb: Limit (plan node 2): not eligible: sorting text under a non-C collation
+NOTICE:  gg_duckdb: Sort (plan node 3): not eligible: sorting text under a non-C collation
+NOTICE:  gg_duckdb: SeqScan (plan node 4): not eligible: nothing for DuckDB to do
+                   QUERY PLAN                   
+------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: note, id
+         ->  Limit
+               ->  Sort
+                     Sort Key: note, id
+                     ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(8 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT note, id FROM d_orders ORDER BY note COLLATE "C", id LIMIT 3;
+NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT * FROM gg_leaf(0)) AS n1 ORDER BY c1 ASC NULLS LAST, c2 ASC NULLS LAST LIMIT 3
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: gg_duckdb_region.note, gg_duckdb_region.id
+         ->  Custom Scan (GGDuckDBRegion)
+               DuckDB: Limit Sort over 1 leaf
+               ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(7 rows)
+
+SET gg_duckdb.explain_decisions = off;
+-- results equal the plain plan: materialise both and compare both ways
+CREATE OR REPLACE FUNCTION d_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE missing bigint; extra bigint;
+BEGIN
+  SET LOCAL gg_duckdb.mode = off;
+  EXECUTE 'CREATE TEMP TABLE d_base AS ' || q;
+  SET LOCAL gg_duckdb.mode = force;
+  EXECUTE 'CREATE TEMP TABLE d_duck AS ' || q;
+  SET LOCAL gg_duckdb.mode = off;
+  EXECUTE 'SELECT count(*) FROM (TABLE d_base EXCEPT ALL TABLE d_duck) x' INTO missing;
+  EXECUTE 'SELECT count(*) FROM (TABLE d_duck EXCEPT ALL TABLE d_base) x' INTO extra;
+  DROP TABLE d_base; DROP TABLE d_duck;
+  RETURN missing || ' | ' || extra;
+END $$;
+SELECT d_check($q$ SELECT id, count(*) AS n, sum(qty) AS sq, min(amount) AS mina, max(ts) AS maxts, max(d) AS maxd,
+                          bool_and(flag) AS ba, count(note) AS cn
+                   FROM d_orders GROUP BY id $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT id, sum(qty * 2 + 1) AS s1, max(CASE WHEN flag THEN amount ELSE -amount END) AS m1,
+                          count(*) FILTER (WHERE note LIKE 'note 1%') AS c1, sum(big) AS s2, sum(amount) AS s3,
+                          min(note COLLATE "C") AS m2, count(DISTINCT qty) AS c2
+                   FROM d_orders GROUP BY id HAVING count(*) > 0 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'id' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT id, qty FROM d_orders WHERE qty IN (1, 2, 3) AND coalesce(flag, false)
+                   ORDER BY id LIMIT 100 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT id, amount FROM d_orders ORDER BY amount DESC NULLS FIRST, id LIMIT 7 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT id, amount FROM d_orders ORDER BY amount ASC NULLS LAST, id LIMIT 7 OFFSET 3 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT DISTINCT qty FROM d_orders $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT id, length(note) AS e1, note || '!' AS e2, qty % 4 AS e3, -qty AS e4, qty / 3 AS e5,
+                          f8 / 2.0 AS e6, abs(qty - 6) AS e7, qty::int8 + big AS e8, d + 1 AS e9,
+                          ts - interval '1 day' AS e10, nullif(qty, 0) AS e11, qty IS NULL AS e12
+                   FROM d_orders WHERE id < 500 AND (qty > 3 OR flag IS NOT TRUE) ORDER BY id LIMIT 200 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+-- a Motion leaf: the aggregate above a Redistribute Motion, single phase
+SELECT d_check($q$ SELECT cust, count(*), sum(amount), max(id) FROM d_orders GROUP BY cust $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT cust, count(*) FROM d_orders GROUP BY cust ORDER BY cust LIMIT 10 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+-- division by zero is an error in both executors
+SET gg_duckdb.mode = force;
+SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1652060)
+SET gg_duckdb.mode = off;
+SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1652060)
+-- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
+SET gg_duckdb.mode = auto;
+SET gg_duckdb.min_rows = 1000000;
+EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: id
+         ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(5 rows)
+
+SET gg_duckdb.min_rows = 0;
+EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(5 rows)
+
+RESET gg_duckdb.min_rows;
+-- a bad query never leaves the planner: plan-time validation declines it
+SET gg_duckdb.mode = force;
+SET gg_duckdb.explain_decisions = on;
+SET gg_duckdb.validate_at_plan_time = on;
+EXPLAIN (COSTS OFF) SELECT id, sum(f8) FROM d_orders GROUP BY id;   -- float sum: not eligible
+NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: sum(double precision)
+NOTICE:  gg_duckdb: SeqScan (plan node 2): not eligible: nothing for DuckDB to do
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: id
+         ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(5 rows)
+
+RESET gg_duckdb.explain_decisions;
+RESET gg_duckdb.validate_at_plan_time;
+RESET gp_enable_multiphase_agg;
+RESET gg_duckdb.mode;
+DROP FUNCTION d_check(text);
+DROP TABLE d_orders;

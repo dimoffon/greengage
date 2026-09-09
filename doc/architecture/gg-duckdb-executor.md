@@ -1,6 +1,6 @@
 # DuckDB as an auxiliary executor for Greengage (`gg_duckdb`)
 
-Status: milestones M0 (foundation) and M1 (identity region end to end) on branch `7.x-duck`. This document is the design
+Status: milestones M0 (foundation), M1 (identity region) and M2 (deparser and planner pass) on branch `7.x-duck`. This document is the design
 record; the milestone plan and the verified facts behind each decision live with it.
 
 ## What it is
@@ -121,6 +121,28 @@ Motion/ShareInputScan leaves — M4 hints, cost calibration, benchmarks — M5 n
 per-allocation accounting, DuckDB 2.0). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
+
+## M2 findings (2026-09-09)
+
+- The region grammar that ships: `[Limit] [Unique] [Sort] base`, hoisted into one
+  `SELECT [DISTINCT] * FROM (base) ORDER BY ... LIMIT ... OFFSET ...`, with `base :=
+  Result(base) | Agg(base) | Material(base) | leaf`. A sorted Agg is absorbed as a hash
+  `GROUP BY` and its output order restored by an outer `ORDER BY` when every sort key is
+  projected; otherwise the region is unordered and a parent that needs order declines it.
+- ORCA represents `count(*)` as an aggregate with an empty argument list and `aggstar`
+  unset; both optimizers deliver interior Vars in setrefs form, which the deparser relies on.
+- DuckDB binds a statement with parameters when it is first executed, not when it is
+  prepared, so the leaf table function's bind context must stay in place from prepare
+  through the start of execution.
+- memquota grants a node that is not memory intensive about 100 KB; DuckDB cannot run
+  under such a limit, hence `gg_duckdb.min_memory` (64 MB) as the floor of a region's
+  memory limit, which is reserved with the vmem tracker while the region runs.
+- gpdiff's `matchsubs` do not apply to NOTICE lines, so decision notices carry no row
+  estimates (they go to the DEBUG1 log instead).
+- Aggregate outputs of unconstrained `numeric` can be region outputs (DuckDB's DECIMAL
+  shape is recorded in the plan) but not leaf columns: a subtree whose leaf yields such a
+  column is declined. Numeric arithmetic, `avg`, float sums and `AGG_SORTED` without a
+  covering Sort are declined in this milestone.
 
 ## M1 findings (2026-09-09)
 

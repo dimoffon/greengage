@@ -3,6 +3,6 @@
 -- on the QE that receives the plan, so LOAD in one session is not enough.
 --start_ignore
 \! gpconfig -c shared_preload_libraries -v "$(psql -At -c "SELECT array_to_string(array_append(array_remove(string_to_array(current_setting('shared_preload_libraries'), ','), 'gg_duckdb'), 'gg_duckdb'), ',')" postgres)"
-20260909:12:23:44:1528110 gpconfig:dvoronkov-nb:dvoronkov-[INFO]:-completed successfully with parameters '-c shared_preload_libraries -v gg_duckdb'
+20260909:13:28:08:1661508 gpconfig:dvoronkov-nb:dvoronkov-[INFO]:-completed successfully with parameters '-c shared_preload_libraries -v gg_duckdb'
 \! gpstop -raq -M fast
 --end_ignore
