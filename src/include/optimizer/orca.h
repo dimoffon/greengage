@@ -24,10 +24,14 @@
 extern PlannedStmt * optimize_query(Query *parse, int cursorOptions, ParamListInfo boundParams);
 extern Node *transformGroupedWindows(Node *node, void *context);
 
-// plan_hint_hook generates HintState by parsing a Query.
+#endif
+
+/*
+ * plan_hint_hook generates a HintState by parsing a Query.  It is installed
+ * by pg_hint_plan and consumed by ORCA and by post-planner passes, so it is
+ * defined in planner.c and available with or without ORCA.
+ */
 typedef void *(*plan_hint_hook_type) (Query *parse);
 extern PGDLLIMPORT plan_hint_hook_type plan_hint_hook;
-
-#endif
 
 #endif /* ORCA_H */

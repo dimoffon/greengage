@@ -315,6 +315,7 @@ bool		optimizer_enable_dml;
 bool		optimizer_enable_dml_constraints;
 bool		optimizer_enable_coordinator_only_queries;
 bool		optimizer_enable_hashjoin;
+bool		optimizer_enable_duckdb;
 bool		optimizer_enable_dynamictablescan;
 bool		optimizer_enable_dynamicindexscan;
 bool		optimizer_enable_dynamicindexonlyscan;
@@ -2220,6 +2221,17 @@ struct config_bool ConfigureNamesBool_gp[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&optimizer_enable_hashjoin,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"optimizer_enable_duckdb", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Allows plans produced by the optimizer to hand local subtrees to the DuckDB executor (gg_duckdb)."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&optimizer_enable_duckdb,
 		true,
 		NULL, NULL, NULL
 	},

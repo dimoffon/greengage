@@ -98,6 +98,16 @@ planner_hook_type planner_hook = NULL;
 /* Hook for plugins to get control when grouping_planner() plans upper rels */
 create_upper_paths_hook_type create_upper_paths_hook = NULL;
 
+/* Hook for plugins to post-process the finished plan of standard_planner() */
+post_planner_hook_type post_planner_hook = NULL;
+
+/*
+ * Hook through which pg_hint_plan hands parsed hints to the optimizers;
+ * declared in optimizer/orca.h, defined here so that it exists with or
+ * without ORCA.
+ */
+plan_hint_hook_type plan_hint_hook = NULL;
+
 
 /* Expression kind codes for preprocess_expression */
 #define EXPRKIND_QUAL				0
@@ -402,7 +412,12 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		}
 
 		if (result)
+		{
+			if (post_planner_hook)
+				result = (*post_planner_hook) (result, parse, cursorOptions,
+											   boundParams);
 			return result;
+		}
 	}
 
 	/*
@@ -778,6 +793,9 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		INSTR_TIME_SUBTRACT(endtime, starttime);
 		elog(LOG, "Planner Time: %.3f ms", INSTR_TIME_GET_MILLISEC(endtime));
 	}
+
+	if (post_planner_hook)
+		result = (*post_planner_hook) (result, parse, cursorOptions, boundParams);
 
 	return result;
 }

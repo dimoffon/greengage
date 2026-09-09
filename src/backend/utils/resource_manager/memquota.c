@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "cdb/memquota.h"
+#include "nodes/extensible.h"
 #include "cdb/cdbllize.h"
 #include "storage/lwlock.h"
 #include "utils/relcache.h"
@@ -203,6 +204,9 @@ IsBlockingOperator(Node *node)
 		case T_Material:
 			return IsMaterialBlockingOperator((Material *)node);
 
+		case T_CustomScan:
+			return (((CustomScan *) node)->flags & CUSTOMSCAN_GP_BLOCKING) != 0;
+
 		case T_Agg:
 			return IsAggBlockingOperator((Agg *)node);
 
@@ -254,6 +258,8 @@ IsMemoryIntensiveOperator(Node *node, PlannedStmt *stmt)
 		case T_TableFunctionScan:
 		case T_FunctionScan:
 			return true;
+		case T_CustomScan:
+			return (((CustomScan *) node)->flags & CUSTOMSCAN_GP_MEMORY_INTENSIVE) != 0;
 		case T_Agg:
 			{
 				Agg *agg = (Agg *) node;

@@ -355,6 +355,7 @@
 		"optimizer_enable_direct_dispatch",
 		"optimizer_enable_dml",
 		"optimizer_enable_dml_constraints",
+		"optimizer_enable_duckdb",
 		"optimizer_enable_dynamictablescan",
 		"optimizer_enable_dynamicindexscan",
 		"optimizer_enable_dynamicindexonlyscan",

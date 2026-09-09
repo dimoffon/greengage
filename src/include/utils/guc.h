@@ -468,6 +468,7 @@ extern bool	optimizer_enable_dml_constraints;
 extern bool optimizer_enable_direct_dispatch;
 extern bool optimizer_enable_coordinator_only_queries;
 extern bool optimizer_enable_hashjoin;
+extern bool optimizer_enable_duckdb;
 extern bool optimizer_enable_dynamictablescan;
 extern bool optimizer_enable_dynamicindexscan;
 extern bool optimizer_enable_dynamicindexonlyscan;

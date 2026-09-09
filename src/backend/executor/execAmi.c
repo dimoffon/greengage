@@ -812,6 +812,22 @@ ExecSquelchNode(PlanState *node)
 			 */
 			ExecShutdownForeignScan((ForeignScanState *) node);
 			break;
+		case T_CustomScanState:
+			{
+				/*
+				 * Likewise for custom scans: the provider's shutdown
+				 * callback releases whatever it holds.  The children a
+				 * provider keeps in custom_ps are squelched like any other
+				 * child (a DuckDB region's leaves live there).
+				 */
+				CustomScanState *css = (CustomScanState *) node;
+				ListCell   *cell;
+
+				ExecShutdownCustomScan(css);
+				foreach(cell, css->custom_ps)
+					ExecSquelchNode((PlanState *) lfirst(cell));
+				break;
+			}
 		case T_DynamicForeignScanState:
 			/* TODO: Add logic to shutdown the dynamic foreign scan for cases of parallel
 			 * execution (currently unsupported in Orca)
