@@ -952,13 +952,25 @@ fdw_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	foreach(lc, scan_clauses)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		ListCell   *lc2;
 
 		if (rinfo->pseudoconstant)
 			continue;
-		if (gg_duckdb_native_qual_ok(foreigntableid, scan_relid, attnos, (Node *) rinfo->clause))
-			pushed = lappend(pushed, rinfo->clause);
-		else
-			local = lappend(local, rinfo->clause);
+
+		/*
+		 * ORCA hands the scan its quals as one conjunction; each conjunct
+		 * is pushed or kept on its own, as the planner's separate clauses
+		 * are.
+		 */
+		foreach(lc2, make_ands_implicit((Expr *) rinfo->clause))
+		{
+			Node	   *clause = (Node *) lfirst(lc2);
+
+			if (gg_duckdb_native_qual_ok(foreigntableid, scan_relid, attnos, clause))
+				pushed = lappend(pushed, clause);
+			else
+				local = lappend(local, clause);
+		}
 	}
 
 	fdw_private = list_make3(make_int_const(GG_FDW_PRIVATE_VERSION), attno_consts, pushed);

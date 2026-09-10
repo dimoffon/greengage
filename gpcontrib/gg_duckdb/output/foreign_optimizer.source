@@ -180,9 +180,9 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT id FROM parts WHERE k = 3 AND upper(v) = 'V3
    Output: id
    ->  Foreign Scan on public.parts
          Output: id
-         Filter: ((parts.k = 3) AND (upper(parts.v) = 'V3'::text))
+         Filter: (upper(parts.v) = 'V3'::text)
          DuckDB reader: parquet @abs_srcdir@/data/parts_*.parquet
-         DuckDB SQL: SELECT * FROM (SELECT CAST("id" AS BIGINT) AS c1, CAST("k" AS BIGINT) AS c2, CAST("v" AS VARCHAR) AS c3 FROM __GG_NATIVE_0__) AS n0
+         DuckDB SQL: SELECT * FROM (SELECT CAST("id" AS BIGINT) AS c1, CAST("k" AS BIGINT) AS c2, CAST("v" AS VARCHAR) AS c3 FROM __GG_NATIVE_0__) AS n0 WHERE ((n0.c2) = (CAST($1 AS INTEGER)))
  Optimizer: GPORCA
  Settings: effective_cache_size = '512MB'
 (9 rows)

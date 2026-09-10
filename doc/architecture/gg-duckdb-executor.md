@@ -193,6 +193,15 @@ page reading.
   DuckDB does the aggregate or join above it. Under ORCA `upper(v), count(*), sum(id)
   ... GROUP BY 1` is now two regions, one per aggregate phase, with the `Result` as the
   lower one's leaf.
+- **ORCA hands a foreign scan one conjunction.** The wrapper pushed a clause only when
+  all of it deparsed, and ORCA gives the scan its quals as a single `AND`, so one
+  function outside the whitelist kept every qual local under ORCA while the planner,
+  whose clauses arrive one by one, pushed the rest. Each conjunct is now pushed or kept
+  on its own. Found while verifying pushdown against MinIO: DuckDB pushes the pushed
+  quals into the Parquet reader (row groups skipped by their statistics, only their
+  byte ranges fetched: two range requests instead of eleven for a filter selecting one
+  of ten row groups) and into the Iceberg scan (data files pruned by the manifests'
+  bounds); CSV and JSON readers have nothing to push into and read whole files.
 - **A walker that crashed on SubPlans.** The PartitionSelector-hazard walkers ran
   `plan_tree_walker` with a context that carried no plan base; the first SubPlan node
   in a join's inner side (ORCA attaches an InitPlan there) dereferenced it. They skip
