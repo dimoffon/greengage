@@ -247,7 +247,9 @@ Iceberg commits do not detect each other, three concurrent inserts from
 separate processes left one snapshot and no error, so the wrapper never runs
 two. A writer from outside the cluster is still that risk. The coordinator's
 DuckDB budget for such a write starts at 256 MB, since DuckDB's Iceberg
-writer allocates its Parquet row groups at their default size.
+writer sizes its Parquet row groups itself. Writers to S3 upload in parts of
+8 MB (`s3_uploader_max_filesize` 80 GB, two uploader threads) instead of
+DuckDB's default 80 MB parts, which would not fit a 64 MB budget.
 
 What a commit cannot undo: a segment writes its file when its part of the
 distributed transaction prepares, and does not see the coordinator's decision
@@ -294,7 +296,10 @@ rollback, savepoints, a failing insert, `COPY FROM`, the refused statements,
 and a buffer larger than the memory budget. `test/external/run.sh` covers the
 Iceberg catalog: reads by name, a coordinator-side insert against a
 reference, rollback, the refusal from the segments, and the namespace
-import. `bench/` holds the TPC-H-shaped benchmark (see its README).
+import. `bench/` holds the TPC-H-shaped benchmark (see its README), and
+`samples/` two scripts for a lake partitioned by date and by region: Parquet
+on S3 as a Greengage partition tree of foreign tables, and an Iceberg table
+with a partition spec (see `samples/README.md`).
 
 ```sh
 make -C gpcontrib/gg_duckdb/isolation2 installcheck

@@ -189,15 +189,32 @@ page reading.
   update. So a catalog table is written by the coordinator only (`mpp_execute
   'coordinator'`; the segments refuse with that hint), with the foreign table locked for
   the transaction so that two sessions of the cluster never commit at once; a writer
-  outside the cluster remains that risk. DuckDB's Iceberg writer allocates its Parquet
-  row groups at the default size and nothing tunes it from outside (a 76.5 MB block
-  under a 62.5 MB limit), so the coordinator's budget for such a write starts at 256 MB.
+  outside the cluster remains that risk. DuckDB's Iceberg writer sizes its Parquet row
+  groups itself, so the coordinator's budget for such a write starts at 256 MB.
+- **S3 uploads come in 80 MB parts.** The first write of the samples to S3 failed on
+  every segment for a 76.5 MB block under the 62.5 MB budget: DuckDB's S3 writer
+  uploads in parts of `s3_uploader_max_filesize` (800 GB) over
+  `s3_uploader_max_parts_per_file` (10000), one buffer per part in flight (and up to
+  50 uploader threads of its own). Writers to S3 set the file limit to 80 GB, so 8 MB
+  parts, and two uploader threads; the same block had been misread as the Iceberg
+  writer's row group before.
 - **Reads through the catalog.** `ATTACH IF NOT EXISTS ... (TYPE iceberg, ENDPOINT,
   AUTHORIZATION_TYPE, TOKEN | CLIENT_ID/CLIENT_SECRET)` per server and backend, redone
   after a `DETACH` when the server's or the mapping's options change, forgotten with the
   instance; the reader is the attached table's name, so no file list is bound. The
   version-guessing setting is not needed there. `IMPORT FOREIGN SCHEMA "namespace"`
   lists the catalog's tables through `duckdb_tables()`.
+- **A region must keep an order the query still needs.** The samples ran an
+  `ORDER BY region` aggregate on the coordinator and got its groups unordered: ORCA had
+  planned a sorted GroupAggregate over a Sort with no Sort above it, the query's ORDER
+  BY being satisfied by the aggregate's output order, and the region replaced both with
+  a hash aggregate whose order DuckDB could not restore (text under a non-C collation).
+  On the segments the merge Gather Motion above had always declined such regions; at
+  the top of a plan nothing had. The pass now carries an output-order requirement down
+  the tree: the top node needs its order when the query has an ORDER BY, a Sort lifts
+  it from its child, a hash join, a hashed aggregate or a plain Motion drop it, a merge
+  join, a sorted aggregate, a merge Motion or a Unique impose it, and everything else
+  passes it through; a region whose output is not ordered is declined where it holds.
 - **`gg_duckdb.query()` is now superuser-only**, as the documents already claimed: with
   a remote prefix in `data_directories` DuckDB's external access is on for the whole
   backend, and the function ran arbitrary DuckDB SQL for any role.

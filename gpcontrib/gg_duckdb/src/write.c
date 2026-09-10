@@ -434,9 +434,9 @@ open_writer(Relation rel, PlanState *ps)
 	if (w->catalog)
 	{
 		/*
-		 * DuckDB's Iceberg writer allocates its Parquet row groups at
-		 * their default size, about 80 MB at a time, and nothing tunes
-		 * that from outside: the budget starts at 256 MB for it.
+		 * DuckDB's Iceberg writer sizes its Parquet row groups itself and
+		 * nothing tunes that from outside: the budget starts at 256 MB
+		 * for it.
 		 */
 		kb = Max(kb, (int64) 256 * 1024);
 	}
@@ -454,6 +454,23 @@ open_writer(Relation rel, PlanState *ps)
 	}
 	writer_exec(w, psprintf("SET memory_limit = '" INT64_FORMAT "KB'", kb), "could not set the memory limit for foreign table");
 	w->budget_kb = kb;
+
+	if (w->catalog || strstr(w->target, "://") != NULL)
+	{
+		/*
+		 * DuckDB uploads to S3 in parts of s3_uploader_max_filesize /
+		 * s3_uploader_max_parts_per_file, 80 MB by default, one buffer of
+		 * that size per part in flight: parts of 8 MB (files up to 80 GB)
+		 * and two uploader threads keep that inside the budget.  The
+		 * settings are the instance's; both are harmless for reads.
+		 */
+		char	   *err;
+
+		if ((err = writer_try(w, "SET s3_uploader_max_filesize = '80GB'")) != NULL)
+			pfree(err);
+		if ((err = writer_try(w, "SET s3_uploader_thread_limit = 2")) != NULL)
+			pfree(err);
+	}
 
 	w->table = psprintf("gg_w_%u", relid);
 	initStringInfo(&ddl);

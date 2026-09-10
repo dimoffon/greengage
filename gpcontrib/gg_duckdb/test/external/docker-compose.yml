@@ -52,7 +52,7 @@ services:
       REST_ENDPOINT: http://iceberg-rest:8181
     volumes:
       - ./init:/init:ro
-    command: bash -c "pip install -q --root-user-action=ignore 'pyarrow>=17' 'boto3' 'pyiceberg[s3fs]>=0.8' && python /init/setup.py"
+    command: bash -c "pip install -q --root-user-action=ignore 'pyarrow>=17' 'boto3' 'pyiceberg[s3fs]>=0.8' && python /init/setup.py && python /init/partitioned.py"
     depends_on:
       minio:
         condition: service_healthy

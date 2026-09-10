@@ -48,6 +48,7 @@ typedef struct PassContext
 	int			next_plan_node_id;
 	int			wrapped;
 	GGHints    *hints;			/* DuckDB()/NoDuckDB() hints of the query */
+	bool		order_required;	/* the node being visited must keep its output order */
 } PassContext;
 
 static Node *pass_mutator(Node *node, PassContext *ctx);
@@ -127,23 +128,39 @@ decision(PassContext *ctx, Plan *plan, const char *fmt,...)
 }
 
 /* Parents that consume their input in order. */
+/*
+ * Whether a node's children must keep their output order, given whether the
+ * node must keep its own: a Sort makes its own order, a hash join, a hashed
+ * aggregate or a plain Motion owe their parents none, a merge join, a sorted
+ * aggregate, a merge Motion and the like consume ordered input, and the
+ * rest pass their input's order through (a nested loop its outer side's;
+ * the inner side is held to the same, which is only conservative).  The
+ * top of the query needs its order when the query has an ORDER BY that no
+ * Sort above the node makes; a subplan is held to it always, since its
+ * query's ORDER BY is not seen here.
+ */
 static bool
-parent_needs_order(Plan *parent)
+child_order_required(Plan *node, bool required)
 {
-	if (parent == NULL)
-		return false;
-	switch (nodeTag(parent))
+	switch (nodeTag(node))
 	{
+		case T_Sort:
+		case T_HashJoin:
+		case T_Append:
+		case T_Sequence:
+		case T_Hash:
+			return false;
+		case T_Agg:
+			return ((Agg *) node)->aggstrategy == AGG_SORTED;
 		case T_MergeJoin:
 		case T_Unique:
 		case T_WindowAgg:
+		case T_MergeAppend:
 			return true;
-		case T_Agg:
-			return ((Agg *) parent)->aggstrategy == AGG_SORTED;
 		case T_Motion:
-			return ((Motion *) parent)->sendSorted;
+			return ((Motion *) node)->sendSorted;
 		default:
-			return false;
+			return required;
 	}
 }
 
@@ -486,9 +503,9 @@ try_region(PassContext *ctx, Plan *plan)
 		decision(ctx, plan, "nothing worth handing to DuckDB (no join, aggregate, sort or distinct)");
 		return NULL;
 	}
-	if (parent_needs_order(ctx->parent) && !spec.ordered)
+	if (ctx->order_required && !spec.ordered)
 	{
-		decision(ctx, plan, "its parent needs ordered input");
+		decision(ctx, plan, "its output order is needed");
 		return NULL;
 	}
 	foreach(lc, spec.leaves)
@@ -600,14 +617,17 @@ pass_mutator(Node *node, PassContext *ctx)
 	{
 		Motion	   *motion = (Motion *) node;
 		int			saved_slice = ctx->slice;
+		bool		saved_order = ctx->order_required;
 
 		/* the sender side of a Motion is another slice */
 		saved_parent = ctx->parent;
 		ctx->parent = (Plan *) node;
 		ctx->slice = motion->motionID;
+		ctx->order_required = child_order_required((Plan *) node, saved_order);
 		result = plan_tree_mutator(node, pass_mutator, ctx, false);
 		ctx->slice = saved_slice;
 		ctx->parent = saved_parent;
+		ctx->order_required = saved_order;
 		return result;
 	}
 
@@ -617,18 +637,31 @@ pass_mutator(Node *node, PassContext *ctx)
 
 		if (region != NULL)
 		{
+			bool		saved_order = ctx->order_required;
+
+			/* a region pulls its leaves in no particular order */
 			saved_parent = ctx->parent;
 			ctx->parent = region;
+			ctx->order_required = false;
 			descend_into_leaves(ctx, (CustomScan *) region);
 			ctx->parent = saved_parent;
+			ctx->order_required = saved_order;
 			return (Node *) region;
 		}
 	}
 
 	saved_parent = ctx->parent;
 	if (is_plan_node(node))
+	{
+		bool		saved_order = ctx->order_required;
+
 		ctx->parent = (Plan *) node;
-	result = plan_tree_mutator(node, pass_mutator, ctx, false);
+		ctx->order_required = child_order_required((Plan *) node, saved_order);
+		result = plan_tree_mutator(node, pass_mutator, ctx, false);
+		ctx->order_required = saved_order;
+	}
+	else
+		result = plan_tree_mutator(node, pass_mutator, ctx, false);
 	ctx->parent = saved_parent;
 	return result;
 }
@@ -740,6 +773,7 @@ gg_duckdb_post_planner(PlannedStmt *stmt, Query *parse, int cursorOptions,
 		int			i = 0;
 
 		ctx.hints = gg_duckdb_hints_collect(parse, stmt);
+		ctx.order_required = parse->sortClause != NIL;
 		stmt->planTree = (Plan *) pass_mutator((Node *) stmt->planTree, &ctx);
 
 		/*
@@ -756,6 +790,7 @@ gg_duckdb_post_planner(PlannedStmt *stmt, Query *parse, int cursorOptions,
 			{
 				ctx.slice = stmt->subplan_sliceIds ? stmt->subplan_sliceIds[i] : -1;
 				ctx.parent = NULL;
+				ctx.order_required = true;
 				lfirst(lc) = pass_mutator((Node *) sub, &ctx);
 			}
 			i++;
