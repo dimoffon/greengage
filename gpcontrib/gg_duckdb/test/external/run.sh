@@ -12,7 +12,8 @@ CREATE EXTENSION IF NOT EXISTS gg_duckdb;
 SET gg_duckdb.data_directories = 's3://ggduck/';
 DROP SERVER IF EXISTS minio CASCADE;
 CREATE SERVER minio FOREIGN DATA WRAPPER gg_duckdb
-    OPTIONS (s3_endpoint 'localhost:9100', s3_url_style 'path', s3_use_ssl 'false', s3_region 'us-east-1');
+    OPTIONS (s3_endpoint 'localhost:9100', s3_url_style 'path', s3_use_ssl 'false', s3_region 'us-east-1',
+             iceberg_endpoint 'http://localhost:8181', iceberg_auth 'none');
 CREATE USER MAPPING FOR CURRENT_USER SERVER minio
     OPTIONS (s3_access_key_id 'ggadmin', s3_secret_access_key 'gg-secret-1');
 CREATE FOREIGN TABLE s3_events (id bigint, k bigint, v text, amt numeric(12,2), ts timestamp, flag boolean, nullable bigint)
@@ -75,8 +76,41 @@ CREATE SCHEMA IF NOT EXISTS s3_imported;
 IMPORT FOREIGN SCHEMA "s3://ggduck/files" FROM SERVER minio INTO s3_imported;
 SELECT foreign_table_name FROM information_schema.foreign_tables WHERE foreign_table_schema = 's3_imported' ORDER BY 1;
 SELECT count(*) FROM s3_imported.events;
+\echo === Iceberg through the REST catalog: the same table by name
+CREATE FOREIGN TABLE ice_cat (id bigint, k bigint, v text, amt numeric(12,2), ts timestamp, flag boolean, nullable bigint)
+    SERVER minio OPTIONS (location 'demo.events', format 'iceberg');
+SET gg_duckdb.mode = off;
+SELECT x_check('SELECT * FROM ice_cat', 'SELECT * FROM ref_events WHERE id >= 100') AS catalog_scan;
+SELECT x_check('SELECT k, count(*) AS n FROM ice_cat WHERE id > 5900 AND flag GROUP BY k',
+               'SELECT k, count(*) AS n FROM ref_events WHERE id > 5900 AND flag GROUP BY k') AS catalog_quals;
+\echo === Iceberg writes: one writer, the coordinator, one snapshot per transaction
+SELECT gg_duckdb.query($q$ CREATE OR REPLACE TEMPORARY SECRET s3w (TYPE s3, KEY_ID 'ggadmin', SECRET 'gg-secret-1', ENDPOINT 'localhost:9100', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1') $q$);
+SELECT gg_duckdb.query($q$ ATTACH IF NOT EXISTS '' AS ice (TYPE iceberg, ENDPOINT 'http://localhost:8181', AUTHORIZATION_TYPE 'none') $q$);
+SELECT gg_duckdb.query($q$ DROP TABLE IF EXISTS ice.demo.written $q$);
+SELECT gg_duckdb.query($q$ CREATE TABLE ice.demo.written (id BIGINT, k BIGINT, v VARCHAR, amt DECIMAL(12,2), ts TIMESTAMP, flag BOOLEAN, nullable BIGINT) $q$);
+CREATE FOREIGN TABLE ice_written (id bigint, k bigint, v text, amt numeric(12,2), ts timestamp, flag boolean, nullable bigint)
+    SERVER minio OPTIONS (location 'demo.written', format 'iceberg', mpp_execute 'coordinator');
+EXPLAIN (COSTS OFF) INSERT INTO ice_written SELECT * FROM ref_events;
+INSERT INTO ice_written SELECT * FROM ref_events;
+SELECT x_check('SELECT * FROM ice_written', 'SELECT * FROM ref_events') AS catalog_written;
+BEGIN; INSERT INTO ice_written SELECT * FROM ref_events WHERE id < 10; ROLLBACK;
+SELECT count(*) AS after_rollback FROM ice_written;
+INSERT INTO ice_written SELECT * FROM ref_events WHERE id < 10;
+SELECT count(*) AS after_second_insert FROM ice_written;
+SELECT gg_duckdb.query($q$ SET GLOBAL unsafe_enable_version_guessing = true $q$);
+SELECT gg_duckdb.query($q$ SELECT count(*)::VARCHAR || ' snapshots' FROM iceberg_snapshots('s3://ggduck/warehouse/demo/written') $q$) AS snapshots;
+CREATE FOREIGN TABLE ice_written_segs (id bigint, k bigint, v text, amt numeric(12,2), ts timestamp, flag boolean, nullable bigint)
+    SERVER minio OPTIONS (location 'demo.written', format 'iceberg');
+INSERT INTO ice_written_segs SELECT * FROM ref_events WHERE id < 10;
+\echo === import a catalog namespace
+CREATE SCHEMA IF NOT EXISTS ice_imported;
+IMPORT FOREIGN SCHEMA "demo" FROM SERVER minio INTO ice_imported;
+SELECT foreign_table_name FROM information_schema.foreign_tables WHERE foreign_table_schema = 'ice_imported' ORDER BY 1;
+SELECT count(*) FROM ice_imported.written;
+SELECT gg_duckdb.query($q$ DROP TABLE ice.demo.written $q$);
 \set QUIET on
 RESET gg_duckdb.mode;
+DROP SCHEMA ice_imported CASCADE;
 DROP SCHEMA s3_imported CASCADE;
 DROP FUNCTION x_check(text, text);
 DROP TABLE ref_events;

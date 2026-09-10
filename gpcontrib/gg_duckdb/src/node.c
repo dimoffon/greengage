@@ -355,6 +355,8 @@ gg_duckdb_region_sql(const char *sql, List *natives, int nconst_params, bool res
 			elog(ERROR, "gg_duckdb: native leaf %d is not referenced by the region query", i);
 		if (files == NIL)
 			replacement = nl->empty;
+		else if (strstr(nl->reader, "%s") == NULL)
+			replacement = nl->reader;	/* a catalog table: nothing to bind */
 		else
 		{
 			replacement = psprintf(nl->reader, psprintf("$%d", next_param++));

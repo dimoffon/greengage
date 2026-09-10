@@ -105,7 +105,27 @@ shape wins.
 `mpp_execute 'all segments'` foreign tables over Parquet/CSV/JSON files: standalone, its
 `ForeignScan` is a region with no PG leaves; inside a region it is inlined as
 `read_parquet(...)` so filters, joins and aggregates push into DuckDB with row-group
-skipping. Files are sharded deterministically by `hash(path) % numsegments`.
+skipping. Files are sharded deterministically by `hash(path) % numsegments`. The same
+tables are written: an `INSERT` buffers each process's rows in its DuckDB instance for
+the transaction and DuckDB's `COPY` writes them as one file per segment and transaction
+when the transaction commits or prepares there (D9); an Iceberg table reached through
+its REST catalog (`location 'namespace.table'` on a server with `iceberg_endpoint`) is
+read and written through DuckDB's `ATTACH`, written by the coordinator alone.
+
+**D9 — Writes are buffered in DuckDB and published at commit.** The FDW modify callbacks
+append rows through the C API appender into a DuckDB table of the process's instance,
+tagged with the subtransaction that inserted them; a savepoint that rolls back deletes
+its rows, one that commits hands them to its parent; the transaction's `PRE_COMMIT` or
+`PRE_PREPARE` event runs the `COPY` (or the Iceberg `INSERT`) and an abort drops the
+buffer. Chosen over writing at statement end because a rolled-back transaction then
+writes nothing at all, and over a temp-name-and-rename scheme because object stores have
+no rename. What it cannot give: a segment publishes when its part of the distributed
+transaction prepares and never sees the coordinator's decision after that, so a rollback
+after every segment prepared, or a crash there, leaves files (named with the distributed
+transaction id); and the rows of an open transaction are invisible to its own reads.
+Iceberg tables are written by one process because DuckDB's Iceberg commits do not detect
+each other (three concurrent inserts from three processes left one snapshot and no
+error), so the table is `mpp_execute 'coordinator'` and locked for the transaction.
 
 ## Core changes (all small, behaviour-neutral without the extension)
 
@@ -131,9 +151,56 @@ validation, the pass and its GUC gate — M3 joins, Append, two-phase aggregates
 Motion/ShareInputScan leaves — M4 hints, cost calibration, benchmarks — M5 native readers
 (FDW) — M6 hardening and opt-ins (executor parameters, subplans, float aggregates, the
 isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed and
-deferred). Out of scope: DuckDB tables, DDL or writes
+deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
+
+## M7 findings (2026-09-10)
+
+- **The write path is short because the core already routes.** An `INSERT` into an
+  all-segments foreign table sends every row to a segment (randomly, or by the columns
+  with `insert_dist_by_key`) and calls `ExecForeignInsert` there, exactly as for writable
+  external tables; the wrapper implements the four modify callbacks and the two `COPY
+  FROM` ones. DuckDB has no push-style file writer in the C API, so the rows go through
+  the appender into a buffer table (the leaf's value writers fill the chunks) and one
+  `COPY` per table and transaction writes the file at commit; the buffer is DuckDB's, so
+  it spills under the memory budget (100 MB of rows per segment under 64 MB, in the tests).
+- **Two DuckDB memory traps in the writer.** The Parquet writer holds a whole row group
+  before writing it and DuckDB's default is 122880 rows, which for wide rows is a 128 MB
+  block: the row group size is derived from the measured average row width so that a
+  group takes an eighth of the budget. And with `preserve_insertion_order` on, DuckDB
+  buffers a COPY's batches in memory; the setting is switched off around the commit-time
+  writes (the file's order is nobody's business) and restored after.
+- **A third on the reader, found by the writer.** DuckDB detects a JSON file's layout
+  with a 32 MB buffer it keeps per file, so a table of several JSON files, which every
+  written table is, ran out of a 64 MB budget on read. `json_format` names the layout;
+  a pattern location defaults to newline-delimited, the layout the writer produces.
+- **Savepoints.** Rows carry the segment-local subtransaction id that inserted them
+  (`GetCurrentSubTransactionId()` on the QE, whose numbering differs from the QD's but
+  is consistent with the QE's own subtransaction events); a rolled-back savepoint's rows
+  are deleted from the buffer, a released one's re-tagged to the parent. The first
+  version decided whether to write a file from a row counter that a rollback had made
+  meaningless, and one segment out of three skipped its file: the count now comes from
+  the buffer itself.
+- **Iceberg writes are single-writer, measured.** Three CLI processes inserting into one
+  catalog table at the same time reported no error, wrote three data files and four
+  metadata files, and left a current snapshot with one process's rows. DuckDB's REST
+  commit does not carry the requirement that would make the catalog reject a stale
+  update. So a catalog table is written by the coordinator only (`mpp_execute
+  'coordinator'`; the segments refuse with that hint), with the foreign table locked for
+  the transaction so that two sessions of the cluster never commit at once; a writer
+  outside the cluster remains that risk. DuckDB's Iceberg writer allocates its Parquet
+  row groups at the default size and nothing tunes it from outside (a 76.5 MB block
+  under a 62.5 MB limit), so the coordinator's budget for such a write starts at 256 MB.
+- **Reads through the catalog.** `ATTACH IF NOT EXISTS ... (TYPE iceberg, ENDPOINT,
+  AUTHORIZATION_TYPE, TOKEN | CLIENT_ID/CLIENT_SECRET)` per server and backend, redone
+  after a `DETACH` when the server's or the mapping's options change, forgotten with the
+  instance; the reader is the attached table's name, so no file list is bound. The
+  version-guessing setting is not needed there. `IMPORT FOREIGN SCHEMA "namespace"`
+  lists the catalog's tables through `duckdb_tables()`.
+- **`gg_duckdb.query()` is now superuser-only**, as the documents already claimed: with
+  a remote prefix in `data_directories` DuckDB's external access is on for the whole
+  backend, and the function ran arbitrary DuckDB SQL for any role.
 
 ## M6 findings (2026-09-10)
 

@@ -11,3 +11,6 @@
 /sql/foreign.sql
 /expected/foreign.out
 /expected/foreign_optimizer.out
+/sql/write.sql
+/expected/write.out
+/expected/write_optimizer.out

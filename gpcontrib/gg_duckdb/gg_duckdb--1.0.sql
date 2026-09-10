@@ -17,6 +17,7 @@ CREATE FUNCTION gg_duckdb.query(sql text)
 RETURNS SETOF text
 AS 'MODULE_PATHNAME', 'gg_duckdb_query'
 LANGUAGE C STRICT VOLATILE;
+REVOKE ALL ON FUNCTION gg_duckdb.query(text) FROM PUBLIC;
 
 -- Per-backend state of the embedded DuckDB; call it through
 -- gp_dist_random('gp_id') to see every segment.

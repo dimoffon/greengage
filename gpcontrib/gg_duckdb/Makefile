@@ -5,12 +5,12 @@
 # prefix); gpcontrib/Makefile skips this directory otherwise.
 
 MODULE_big = gg_duckdb
-OBJS = src/gg_duckdb.o src/guc.o src/instance.o src/funcs.o src/types.o src/leaf.o src/node.o src/deparse.o src/pass.o src/hints.o src/query.o src/fdw.o
+OBJS = src/gg_duckdb.o src/guc.o src/instance.o src/funcs.o src/types.o src/leaf.o src/node.o src/deparse.o src/pass.o src/hints.o src/query.o src/fdw.o src/write.o
 
 EXTENSION = gg_duckdb
 DATA = gg_duckdb--1.0.sql
 
-REGRESS = setup basic region deparse joins hints foreign params teardown
+REGRESS = setup basic region deparse joins hints foreign params write teardown
 
 with_llvm = no
 

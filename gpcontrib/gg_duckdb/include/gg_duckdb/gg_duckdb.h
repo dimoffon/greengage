@@ -21,6 +21,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
 #include "nodes/plannodes.h"
+#include "utils/rel.h"
 
 /* gg_duckdb.mode */
 typedef enum GGDuckMode
@@ -391,6 +392,45 @@ extern List *gg_duckdb_native_pre_sql(List *natives);
 
 extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);
+
+/* fdw.c: the options of a foreign table, table over server over wrapper */
+typedef struct GGForeignOptions
+{
+	char	   *format;			/* parquet, csv, json or iceberg */
+	List	   *locations;		/* of char *: paths or globs */
+	bool		hive_partitioning;
+	bool		union_by_name;
+	char	   *json_format;	/* auto, newline_delimited, array, unstructured; NULL: by location */
+	List	   *reader_opts;	/* DefElems passed to the reader: header, delim, ... */
+	Oid			serverid;
+	bool		catalog;		/* an Iceberg table of the server's REST catalog */
+	char	   *catalog_ref;	/* its DuckDB name: gg_ice_<server>."ns"."table" */
+} GGForeignOptions;
+
+extern void gg_duckdb_foreign_options(Oid relid, GGForeignOptions *o);
+extern void gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid);
+extern char *gg_duckdb_iceberg_attach_sql(Oid serverid);
+extern void gg_duckdb_fdw_instance_closed(void);
+extern void gg_duckdb_check_locations(List *locations);
+extern void gg_duckdb_ensure_s3_secrets(Oid relid, GGForeignOptions *o);
+extern char *gg_duckdb_duck_literal(const char *s);
+extern char *gg_duckdb_duck_ident(const char *s);
+
+/* write.c: INSERT into foreign tables */
+struct ExplainState;
+struct ModifyTableState;
+struct ResultRelInfo;
+extern char *gg_duckdb_write_target(GGForeignOptions *o, const char *unique, const char **reason);
+extern int	gg_duckdb_fdw_updatable(Relation rel);
+extern void gg_duckdb_fdw_begin_modify(struct ModifyTableState *mtstate, struct ResultRelInfo *rinfo,
+									   List *fdw_private, int subplan_index, int eflags);
+extern void gg_duckdb_fdw_begin_insert(struct ModifyTableState *mtstate, struct ResultRelInfo *rinfo);
+extern TupleTableSlot *gg_duckdb_fdw_insert(EState *estate, struct ResultRelInfo *rinfo,
+											TupleTableSlot *slot, TupleTableSlot *planSlot);
+extern void gg_duckdb_fdw_end_modify(EState *estate, struct ResultRelInfo *rinfo);
+extern void gg_duckdb_fdw_end_insert(EState *estate, struct ResultRelInfo *rinfo);
+extern void gg_duckdb_fdw_explain_modify(struct ModifyTableState *mtstate, struct ResultRelInfo *rinfo,
+										 List *fdw_private, int subplan_index, struct ExplainState *es);
 extern bool gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti);
 extern void gg_duckdb_numeric_state_type(GGTypeInfo *ti, int scale);
 extern bool gg_duckdb_is_numeric_state(const GGTypeInfo *ti);

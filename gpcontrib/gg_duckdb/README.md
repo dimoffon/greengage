@@ -2,7 +2,7 @@
 
 `gg_duckdb` embeds [DuckDB](https://duckdb.org) in every Greengage backend as a
 second executor for segment-local, Motion-free parts of a plan. This directory
-is at **milestone M6**: the library builds into the tree, loads on the
+is at **milestone M7**: the library builds into the tree, loads on the
 coordinator and on every segment, opens a per-backend DuckDB instance lazily on
 the backend thread, and with `gg_duckdb.mode = auto|force` a planner pass turns
 eligible segment-local subtrees into DuckDB regions: hash, merge and nested-loop
@@ -30,7 +30,11 @@ way in. Executor parameters (an InitPlan's result, a correlated subquery's
 outer values, a prepared statement's or PL/pgSQL generic plan's arguments) are
 bound as DuckDB parameters, regions form inside InitPlans and correlated
 subqueries too, and a rescanned region binds the new values into its kept
-prepared statement. The design is in `doc/architecture/gg-duckdb-executor.md`.
+prepared statement. Foreign tables can be written: `INSERT` buffers the rows
+in DuckDB for the transaction and writes them at commit, one Parquet, CSV or
+JSON file per segment under the table's location pattern, or one snapshot of
+an Iceberg table reached through its REST catalog. The design is in
+`doc/architecture/gg-duckdb-executor.md`.
 
 ## Design in one paragraph
 
@@ -149,7 +153,12 @@ the default, `csv` or `json`, also settable on the server or the wrapper),
 options `header`, `delim`, `quote`, `escape`, `nullstr`, `skip`,
 `dateformat`, `timestampformat`, `compression`, `sample_size`,
 `maximum_object_size`, passed to DuckDB's `read_csv`/`read_json`; a column
-option `column_name` maps a column to a differently named file column. With
+option `column_name` maps a column to a differently named file column.
+`json_format` (`auto`, `newline_delimited`, `array`, `unstructured`) fixes a
+JSON table's layout: DuckDB detects it with a 32 MB buffer it keeps per file,
+which a table of several files does not get under the memory budget, so a
+pattern location reads as newline-delimited (what the writer produces)
+unless told otherwise, and a single file is detected. With
 a DuckDB built with `DUCKDB_REMOTE_EXTENSIONS=1` (see `duckdb/build.sh`) the
 location may be an S3 URL and the format `iceberg`:
 
@@ -189,6 +198,64 @@ an error, not a silent conversion. Quals over carried types and operators
 are evaluated inside DuckDB (`EXPLAIN VERBOSE` shows the DuckDB query),
 the rest by the executor.
 
+### Iceberg through a REST catalog
+
+A server with `iceberg_endpoint` (and `iceberg_warehouse`, `iceberg_auth`
+`none`/`bearer`/`oauth2` with `iceberg_token` or `iceberg_client_id` and
+`iceberg_client_secret` on the user mapping, `iceberg_oauth2_server_uri`)
+reaches an Iceberg REST catalog; a table whose `location` is
+`namespace.table` with `format 'iceberg'` is that catalog's table, read
+through DuckDB's `ATTACH` (no version guessing, the catalog knows the
+current snapshot) and written through it. `IMPORT FOREIGN SCHEMA "namespace"
+FROM SERVER s` creates one foreign table per table of the namespace. The
+data files are wherever the catalog says, so `gg_duckdb.data_directories`
+must hold a remote prefix, and the S3 secret of such a table has no bucket
+scope.
+
+## Writing: INSERT into foreign tables
+
+```sql
+CREATE FOREIGN TABLE sales (id bigint, day date, amount numeric(12,2))
+    SERVER duck OPTIONS (location '/data/sales/part_*.parquet');
+INSERT INTO sales SELECT ... ;                 -- one file per segment and transaction
+COPY sales FROM '/tmp/sales.csv' CSV;
+CREATE FOREIGN TABLE ice_sales (...) SERVER minio
+    OPTIONS (location 'shop.sales', format 'iceberg', mpp_execute 'coordinator');
+INSERT INTO ice_sales SELECT ... ;             -- one snapshot per transaction
+```
+
+A file table is writable when its one location's file name holds exactly
+one `*`: each new file takes the wildcard's place
+(`part_gg-<transaction>-<segment>.parquet`), so the reader's pattern finds
+it. The rows a process receives (every segment of an all-segments table,
+randomly or by the columns with the core's `insert_dist_by_key` option; the
+coordinator otherwise) are buffered in a table of its DuckDB instance for the
+transaction, under the memory budget and spilling beyond it, and written by
+DuckDB's `COPY` when the transaction commits, or prepares on a segment of a
+distributed transaction. A transaction that rolls back writes nothing; a
+savepoint rolled back takes its rows out of the buffer; the rows of an open
+transaction are not visible to its own reads. Parquet row groups shrink to
+the budget when the rows are wide. CSV takes the `header`, `delim`, `quote`,
+`escape`, `nullstr`, `dateformat`, `timestampformat` and `compression`
+options, Parquet and JSON `compression`. Only `INSERT` (and `COPY FROM`):
+files are immutable, so `UPDATE` and `DELETE` are refused.
+
+An Iceberg catalog table is written by one process, the coordinator
+(`mpp_execute 'coordinator'`; an all-segments table refuses the insert with
+that hint), with the foreign table locked for the transaction: DuckDB's
+Iceberg commits do not detect each other, three concurrent inserts from
+separate processes left one snapshot and no error, so the wrapper never runs
+two. A writer from outside the cluster is still that risk. The coordinator's
+DuckDB budget for such a write starts at 256 MB, since DuckDB's Iceberg
+writer allocates its Parquet row groups at their default size.
+
+What a commit cannot undo: a segment writes its file when its part of the
+distributed transaction prepares, and does not see the coordinator's decision
+after that, so a rollback after every segment prepared, or a crash there,
+leaves the files; their names carry the distributed transaction id. An error
+while writing aborts the transaction, but the files of the tables already
+written by it remain. `gg_duckdb.query()` is a superuser function.
+
 ## Tests
 
 ```sh
@@ -221,7 +288,13 @@ rescans, ANALYZE, IMPORT FOREIGN SCHEMA, and the refused locations. `params`
 covers executor parameters inside regions (an InitPlan's result in a HAVING
 clause and a join condition, a generic plan's arguments, a PL/pgSQL variable,
 correlated subqueries rescanned with new values) and the float-aggregate
-opt-in. `bench/` holds the TPC-H-shaped benchmark (see its README).
+opt-in. `write` (an `input/*.source` test) covers `INSERT` into Parquet, CSV
+and JSON tables: every carried type round-tripping, one file per segment,
+rollback, savepoints, a failing insert, `COPY FROM`, the refused statements,
+and a buffer larger than the memory budget. `test/external/run.sh` covers the
+Iceberg catalog: reads by name, a coordinator-side insert against a
+reference, rollback, the refusal from the segments, and the namespace
+import. `bench/` holds the TPC-H-shaped benchmark (see its README).
 
 ```sh
 make -C gpcontrib/gg_duckdb/isolation2 installcheck

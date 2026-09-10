@@ -38,6 +38,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/value.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -60,18 +61,10 @@ PG_FUNCTION_INFO_V1(gg_duckdb_foreign_files);
 #define GG_FDW_PRIVATE_VERSION	1
 
 static char *duck_literal(const char *s);
+static char *duck_ident(const char *s);
 static List *duck_text_column(const char *sql, const char *what);
 
 /* ---------- options ---------- */
-
-typedef struct GGForeignOptions
-{
-	char	   *format;			/* parquet, csv or json */
-	List	   *locations;		/* of char *: paths or globs */
-	bool		hive_partitioning;
-	bool		union_by_name;
-	List	   *reader_opts;	/* DefElems passed to the reader: header, delim, ... */
-} GGForeignOptions;
 
 typedef struct GGOptionDef
 {
@@ -92,11 +85,22 @@ static const GGOptionDef valid_options[] =
 	{"s3_access_key_id", UserMappingRelationId},
 	{"s3_secret_access_key", UserMappingRelationId},
 	{"s3_session_token", UserMappingRelationId},
+	/* an Iceberg REST catalog: tables named namespace.table in `location` */
+	{"iceberg_endpoint", ForeignServerRelationId},
+	{"iceberg_warehouse", ForeignServerRelationId},
+	{"iceberg_auth", ForeignServerRelationId},
+	{"iceberg_oauth2_server_uri", ForeignServerRelationId},
+	{"iceberg_token", UserMappingRelationId},
+	{"iceberg_client_id", UserMappingRelationId},
+	{"iceberg_client_secret", UserMappingRelationId},
 	{"location", ForeignTableRelationId},
 	{"hive_partitioning", ForeignServerRelationId},
 	{"hive_partitioning", ForeignTableRelationId},
 	{"union_by_name", ForeignServerRelationId},
 	{"union_by_name", ForeignTableRelationId},
+	/* JSON: auto, newline_delimited, array or unstructured */
+	{"json_format", ForeignServerRelationId},
+	{"json_format", ForeignTableRelationId},
 	/* CSV and JSON reader options, passed through */
 	{"header", ForeignTableRelationId},
 	{"delim", ForeignTableRelationId},
@@ -110,6 +114,9 @@ static const GGOptionDef valid_options[] =
 	{"sample_size", ForeignTableRelationId},
 	{"maximum_object_size", ForeignTableRelationId},
 	{"column_name", AttributeRelationId},
+	/* the core's own: which columns distribute inserted rows over the segments */
+	{"insert_dist_by_key", AttributeRelationId},
+	{"insert_dist_by_key_weight", AttributeRelationId},
 	{NULL, InvalidOid}
 };
 
@@ -214,6 +221,14 @@ location_allowed(const char *location, List *dirs)
 	return false;
 }
 
+static void check_locations(List *locations);
+
+void
+gg_duckdb_check_locations(List *locations)
+{
+	check_locations(locations);
+}
+
 static void
 check_locations(List *locations)
 {
@@ -253,12 +268,44 @@ apply_options(List *options, GGForeignOptions *o)
 			o->hive_partitioning = defGetBoolean(def);
 		else if (strcmp(def->defname, "union_by_name") == 0)
 			o->union_by_name = defGetBoolean(def);
+		else if (strcmp(def->defname, "json_format") == 0)
+			o->json_format = defGetString(def);
 		else if (is_reader_option(def->defname))
 			o->reader_opts = lappend(o->reader_opts, def);
 	}
 }
 
+/* A catalog table name: namespace.table, neither a path nor a URL. */
+static bool
+is_catalog_name(const char *loc)
+{
+	return strchr(loc, '/') == NULL && !is_remote(loc) && strchr(loc, '.') != NULL;
+}
+
+static const char *
+server_option(ForeignServer *server, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, name) == 0)
+			return defGetString(def);
+	}
+	return NULL;
+}
+
 /* Table options override server options override wrapper options. */
+static void get_options(Oid relid, GGForeignOptions *o);
+
+void
+gg_duckdb_foreign_options(Oid relid, GGForeignOptions *o)
+{
+	get_options(relid, o);
+}
+
 static void
 get_options(Oid relid, GGForeignOptions *o)
 {
@@ -268,6 +315,7 @@ get_options(Oid relid, GGForeignOptions *o)
 
 	memset(o, 0, sizeof(*o));
 	o->format = "parquet";
+	o->serverid = server->serverid;
 	apply_options(wrapper->options, o);
 	apply_options(server->options, o);
 	apply_options(table->options, o);
@@ -279,6 +327,150 @@ get_options(Oid relid, GGForeignOptions *o)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 				 errmsg("gg_duckdb: unknown format \"%s\"", o->format)));
+	if (strcmp(o->format, "iceberg") == 0 && list_length(o->locations) == 1 &&
+		is_catalog_name((const char *) linitial(o->locations)))
+	{
+		const char *name = (const char *) linitial(o->locations);
+		const char *dot = strrchr(name, '.');
+
+		if (server_option(server, "iceberg_endpoint") == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+					 errmsg("gg_duckdb: foreign table \"%s\" names the catalog table \"%s\", but server \"%s\" has no iceberg_endpoint option",
+							get_rel_name(relid), name, server->servername)));
+		o->catalog = true;
+		o->catalog_ref = psprintf("gg_ice_%u.%s.%s", server->serverid,
+								  duck_ident(pnstrdup(name, dot - name)), duck_ident(dot + 1));
+	}
+}
+
+/*
+ * The ATTACH of a server's Iceberg REST catalog, credentials from the
+ * caller's user mapping: none, a bearer token, or an OAuth2 client.
+ */
+char *
+gg_duckdb_iceberg_attach_sql(Oid serverid)
+{
+	ForeignServer *server = GetForeignServer(serverid);
+	UserMapping *um = NULL;
+	const char *endpoint = server_option(server, "iceberg_endpoint");
+	const char *warehouse = server_option(server, "iceberg_warehouse");
+	const char *auth = server_option(server, "iceberg_auth");
+	const char *oauth_uri = server_option(server, "iceberg_oauth2_server_uri");
+	const char *token = NULL,
+			   *client_id = NULL,
+			   *client_secret = NULL;
+	StringInfoData sql;
+	ListCell   *lc;
+
+	if (endpoint == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+				 errmsg("gg_duckdb: server \"%s\" has no iceberg_endpoint option", server->servername)));
+	PG_TRY();
+	{
+		um = GetUserMapping(GetUserId(), serverid);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		um = NULL;
+	}
+	PG_END_TRY();
+	if (um != NULL)
+	{
+		foreach(lc, um->options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "iceberg_token") == 0)
+				token = defGetString(def);
+			else if (strcmp(def->defname, "iceberg_client_id") == 0)
+				client_id = defGetString(def);
+			else if (strcmp(def->defname, "iceberg_client_secret") == 0)
+				client_secret = defGetString(def);
+		}
+	}
+	if (auth == NULL)
+		auth = token ? "bearer" : client_id ? "oauth2" : "none";
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "ATTACH IF NOT EXISTS %s AS gg_ice_%u (TYPE iceberg, ENDPOINT %s, AUTHORIZATION_TYPE %s",
+					 duck_literal(warehouse ? warehouse : ""), serverid,
+					 duck_literal(endpoint), duck_literal(auth));
+	if (token)
+		appendStringInfo(&sql, ", TOKEN %s", duck_literal(token));
+	if (client_id)
+		appendStringInfo(&sql, ", CLIENT_ID %s", duck_literal(client_id));
+	if (client_secret)
+		appendStringInfo(&sql, ", CLIENT_SECRET %s", duck_literal(client_secret));
+	if (oauth_uri)
+		appendStringInfo(&sql, ", OAUTH2_SERVER_URI %s", duck_literal(oauth_uri));
+	appendStringInfoChar(&sql, ')');
+	return sql.data;
+}
+
+/*
+ * Attached catalogs are the instance's: one ATTACH per server and backend,
+ * done again (after a DETACH) when the server's or the mapping's options
+ * changed, and forgotten with the instance.
+ */
+static List *attached = NIL;	/* of (serverid Oid as int, ATTACH text), TopMemoryContext */
+
+void
+gg_duckdb_fdw_instance_closed(void)
+{
+	attached = NIL;
+}
+
+void
+gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid)
+{
+	char	   *sql = gg_duckdb_iceberg_attach_sql(serverid);
+	ListCell   *lc;
+	List	   *entry = NIL;
+	MemoryContext oldcxt;
+	duckdb_result res;
+
+	foreach(lc, attached)
+	{
+		List	   *e = (List *) lfirst(lc);
+
+		if ((Oid) intVal(linitial(e)) == serverid)
+		{
+			entry = e;
+			break;
+		}
+	}
+	if (entry != NULL && strcmp((const char *) lsecond(entry), sql) == 0)
+		return;
+	if (entry != NULL)
+	{
+		char	   *detach = psprintf("DETACH gg_ice_%u", serverid);
+
+		if (duckdb_query(conn, detach, &res) == DuckDBError)
+		{
+			/* not attached after all: nothing to detach */
+		}
+		duckdb_destroy_result(&res);
+		attached = list_delete_ptr(attached, entry);
+	}
+	if (duckdb_query(conn, sql, &res) == DuckDBError)
+	{
+		const char *msg = duckdb_result_error(&res);
+		char	   *copy = pstrdup(msg ? msg : "unknown error");
+
+		duckdb_destroy_result(&res);
+		gg_duckdb_note_error(copy);
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("gg_duckdb: could not attach the Iceberg catalog of server \"%s\": %s",
+						GetForeignServer(serverid)->servername, copy)));
+	}
+	duckdb_destroy_result(&res);
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	attached = lappend(attached, list_make2(makeInteger((int) serverid), pstrdup(sql)));
+	MemoryContextSwitchTo(oldcxt);
 }
 
 Datum
@@ -318,16 +510,48 @@ gg_duckdb_fdw_validator(PG_FUNCTION_ARGS)
 		if (strcmp(def->defname, "location") == 0)
 		{
 			List	   *locs = split_locations(defGetString(def));
+			bool		iceberg = false;
+			ListCell   *lc2;
 
+			foreach(lc2, options)
+			{
+				DefElem    *d2 = (DefElem *) lfirst(lc2);
+
+				if (strcmp(d2->defname, "format") == 0 && strcmp(defGetString(d2), "iceberg") == 0)
+					iceberg = true;
+			}
 			if (locs == NIL)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("gg_duckdb: location must name at least one file or pattern")));
-			check_locations(locs);
+			/* a catalog table (format iceberg, namespace.table) is the catalog's to check */
+			if (!(iceberg && list_length(locs) == 1 && is_catalog_name((const char *) linitial(locs))))
+				check_locations(locs);
 		}
 		if (strcmp(def->defname, "hive_partitioning") == 0 || strcmp(def->defname, "union_by_name") == 0 ||
-			strcmp(def->defname, "s3_use_ssl") == 0)
+			strcmp(def->defname, "s3_use_ssl") == 0 || strcmp(def->defname, "insert_dist_by_key") == 0)
 			(void) defGetBoolean(def);
+		if (strcmp(def->defname, "insert_dist_by_key_weight") == 0)
+			(void) defGetInt32(def);
+		if (strcmp(def->defname, "json_format") == 0)
+		{
+			const char *v = defGetString(def);
+
+			if (strcmp(v, "auto") != 0 && strcmp(v, "newline_delimited") != 0 &&
+				strcmp(v, "array") != 0 && strcmp(v, "unstructured") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+						 errmsg("gg_duckdb: json_format must be auto, newline_delimited, array or unstructured")));
+		}
+		if (strcmp(def->defname, "iceberg_auth") == 0)
+		{
+			const char *v = defGetString(def);
+
+			if (strcmp(v, "none") != 0 && strcmp(v, "bearer") != 0 && strcmp(v, "oauth2") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+						 errmsg("gg_duckdb: iceberg_auth must be none, bearer or oauth2")));
+		}
 		if (strcmp(def->defname, "s3_url_style") == 0 &&
 			strcmp(defGetString(def), "path") != 0 && strcmp(defGetString(def), "vhost") != 0)
 			ereport(ERROR,
@@ -351,6 +575,12 @@ ensure_s3_secrets(Oid relid, GGForeignOptions *o)
 	ensure_s3_secrets_for_server(GetForeignTable(relid)->serverid, o);
 }
 
+void
+gg_duckdb_ensure_s3_secrets(Oid relid, GGForeignOptions *o)
+{
+	ensure_s3_secrets(relid, o);
+}
+
 static void
 ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o)
 {
@@ -368,6 +598,12 @@ ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o)
 	List	   *scopes = NIL;
 	bool		any_s3 = false;
 
+	if (o->catalog)
+	{
+		/* the data files are wherever the catalog says: a secret without a scope */
+		any_s3 = true;
+		scopes = list_make1(pstrdup(""));
+	}
 	foreach(lc, o->locations)
 	{
 		const char *loc = (const char *) lfirst(lc);
@@ -442,8 +678,11 @@ ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o)
 		List	   *res;
 
 		initStringInfo(&sql);
-		appendStringInfo(&sql, "CREATE OR REPLACE TEMPORARY SECRET gg_%u_%s (TYPE s3, SCOPE %s",
-						 server->serverid, scope + 5, duck_literal(scope));
+		if (scope[0] == '\0')
+			appendStringInfo(&sql, "CREATE OR REPLACE TEMPORARY SECRET gg_%u_catalog (TYPE s3", server->serverid);
+		else
+			appendStringInfo(&sql, "CREATE OR REPLACE TEMPORARY SECRET gg_%u_%s (TYPE s3, SCOPE %s",
+							 server->serverid, scope + 5, duck_literal(scope));
 		if (key_id)
 			appendStringInfo(&sql, ", KEY_ID %s", duck_literal(key_id));
 		if (secret)
@@ -485,6 +724,12 @@ duck_literal(const char *s)
 	return buf.data;
 }
 
+char *
+gg_duckdb_duck_literal(const char *s)
+{
+	return duck_literal(s);
+}
+
 /* A DuckDB quoted identifier. */
 static char *
 duck_ident(const char *s)
@@ -502,6 +747,12 @@ duck_ident(const char *s)
 	}
 	appendStringInfoChar(&buf, '"');
 	return buf.data;
+}
+
+char *
+gg_duckdb_duck_ident(const char *s)
+{
+	return duck_ident(s);
 }
 
 /*
@@ -598,8 +849,41 @@ gg_duckdb_native_files(Oid relid)
 	int			nseg = -1;
 
 	get_options(relid, &o);
-	check_locations(o.locations);
-	ensure_s3_secrets(relid, &o);
+	if (o.catalog)
+	{
+		/* the catalog's files are remote: DuckDB's external access must be on */
+		bool		remote = false;
+
+		foreach(lc, allowed_directories())
+			if (is_remote((const char *) lfirst(lc)))
+				remote = true;
+		if (!remote)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("gg_duckdb: catalog table \"%s\" needs a remote prefix in gg_duckdb.data_directories",
+							get_rel_name(relid))));
+		ensure_s3_secrets(relid, &o);
+		{
+			duckdb_connection conn = gg_duckdb_connect();
+
+			PG_TRY();
+			{
+				gg_duckdb_iceberg_attach(conn, o.serverid);
+			}
+			PG_CATCH();
+			{
+				gg_duckdb_disconnect(&conn);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			gg_duckdb_disconnect(&conn);
+		}
+	}
+	else
+	{
+		check_locations(o.locations);
+		ensure_s3_secrets(relid, &o);
+	}
 	if (table->exec_location == FTEXECLOCATION_ALL_SEGMENTS &&
 		Gp_role == GP_ROLE_EXECUTE && GpIdentity.segindex >= 0 && getgpsegmentCount() > 1)
 		nseg = getgpsegmentCount();
@@ -608,7 +892,7 @@ gg_duckdb_native_files(Oid relid)
 	appendStringInfoString(&sql, "SELECT file FROM (");
 	foreach(lc, o.locations)
 	{
-		/* an Iceberg location is one table, read whole by whichever process it falls to */
+		/* an Iceberg table is one location, read whole by whichever process it falls to */
 		if (strcmp(o.format, "iceberg") == 0)
 			appendStringInfo(&sql, "%sSELECT %s AS file", first ? "" : " UNION ALL ",
 							 duck_literal((const char *) lfirst(lc)));
@@ -644,6 +928,12 @@ reader_call(GGForeignOptions *o)
 	ListCell   *lc;
 
 	initStringInfo(&buf);
+	if (o->catalog)
+	{
+		/* the attached catalog's table: no file list to bind */
+		appendStringInfoString(&buf, o->catalog_ref);
+		return buf.data;
+	}
 	if (strcmp(o->format, "iceberg") == 0)
 	{
 		/* the list parameter holds the one table location */
@@ -660,6 +950,28 @@ reader_call(GGForeignOptions *o)
 		appendStringInfo(&buf, ", union_by_name=%s", o->union_by_name ? "true" : "false");
 		if (o->hive_partitioning)
 			appendStringInfoString(&buf, ", hive_partitioning=true");
+		if (strcmp(o->format, "json") == 0)
+		{
+			/*
+			 * DuckDB detects a JSON file's layout with a 32 MB buffer it
+			 * keeps per file, more than a table of several files gets
+			 * under the memory budget: a pattern location reads as
+			 * newline-delimited (what the writer produces) unless told
+			 * otherwise, a single file is detected.
+			 */
+			const char *jf = o->json_format;
+
+			if (jf == NULL)
+			{
+				ListCell   *lc2;
+
+				foreach(lc2, o->locations)
+					if (strpbrk((const char *) lfirst(lc2), "*?[") != NULL)
+						jf = "newline_delimited";
+			}
+			if (jf != NULL && strcmp(jf, "auto") != 0)
+				appendStringInfo(&buf, ", format=%s", duck_literal(jf));
+		}
 	}
 	foreach(lc, o->reader_opts)
 	{
@@ -764,15 +1076,22 @@ List *
 gg_duckdb_native_pre_sql(List *natives)
 {
 	ListCell   *lc;
+	List	   *result = NIL;
+	bool		guessing = false;
 
 	foreach(lc, natives)
 	{
 		GGNativeLeaf *nl = (GGNativeLeaf *) lfirst(lc);
 
-		if (strstr(nl->reader, "iceberg_scan(") != NULL)
-			return list_make1("SET unsafe_enable_version_guessing = true");
+		if (strstr(nl->reader, "iceberg_scan(") != NULL && !guessing)
+		{
+			result = lappend(result, "SET unsafe_enable_version_guessing = true");
+			guessing = true;
+		}
+		else if (strncmp(nl->reader, "gg_ice_", 7) == 0)
+			result = lappend(result, gg_duckdb_iceberg_attach_sql(GetForeignTable(nl->relid)->serverid));
 	}
-	return NIL;
+	return result;
 }
 
 char *
@@ -1038,6 +1357,8 @@ fdw_begin(ForeignScanState *node, int eflags)
 	st->q.params = params;
 	if (strstr(ns.reader, "iceberg_scan(") != NULL)
 		st->q.pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
+	else if (strncmp(ns.reader, "gg_ice_", 7) == 0)
+		st->q.pre_sql = list_make1(gg_duckdb_iceberg_attach_sql(GetForeignTable(rte->relid)->serverid));
 
 	/* result column k is attribute attnos[k] of the scan tuple */
 	outtypes = palloc0(sizeof(GGTypeInfo) * Max(list_length(ns.attnos), 1));
@@ -1086,13 +1407,21 @@ fdw_start(GGForeignState *st)
 		st->q.started = true;
 		return;
 	}
-	reader = psprintf(st->reader, psprintf("$%d", list_length(st->q.params) + 1));
+	if (strstr(st->reader, "%s") != NULL)
+	{
+		reader = psprintf(st->reader, psprintf("$%d", list_length(st->q.params) + 1));
+		st->q.file_lists = list_make1(files);
+	}
+	else
+	{
+		reader = st->reader;	/* a catalog table: nothing to bind */
+		st->q.file_lists = NIL;
+	}
 	initStringInfo(&sql);
 	appendBinaryStringInfo(&sql, st->sql, at - st->sql);
 	appendStringInfoString(&sql, reader);
 	appendStringInfoString(&sql, at + strlen(token));
 	st->q.sql = sql.data;
-	st->q.file_lists = list_make1(files);
 	gg_duckdb_query_start(&st->q, NULL);
 }
 
@@ -1351,6 +1680,66 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname)));
 	}
+	if (server_option(server, "iceberg_endpoint") != NULL && strchr(dir, '/') == NULL && !is_remote(dir))
+	{
+		/* a namespace of the server's Iceberg catalog: one foreign table per table */
+		duckdb_connection conn = gg_duckdb_connect();
+		List	   *tables;
+		GGForeignOptions o;
+
+		memset(&o, 0, sizeof(o));
+		o.catalog = true;
+		ensure_s3_secrets_for_server(serverOid, &o);
+		PG_TRY();
+		{
+			gg_duckdb_iceberg_attach(conn, serverOid);
+		}
+		PG_CATCH();
+		{
+			gg_duckdb_disconnect(&conn);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		gg_duckdb_disconnect(&conn);
+		tables = duck_text_column(psprintf("SELECT table_name FROM duckdb_tables() WHERE database_name = 'gg_ice_%u' AND schema_name = %s ORDER BY 1",
+										   serverOid, duck_literal(dir)),
+								  "could not list the catalog's tables");
+		foreach(lc, tables)
+		{
+			char	   *name = (char *) lfirst(lc);
+			List	   *cols;
+			ListCell   *cc;
+			StringInfoData cmd;
+			bool		first = true;
+
+			cols = duck_text_pairs(psprintf("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM gg_ice_%u.%s.%s)",
+											serverOid, duck_ident(dir), duck_ident(name)),
+								   "could not describe the catalog table");
+			initStringInfo(&cmd);
+			appendStringInfo(&cmd, "CREATE FOREIGN TABLE %s (", quote_identifier(name));
+			foreach(cc, cols)
+			{
+				List	   *col = (List *) lfirst(cc);
+				const char *pgtype = pg_type_for_duck((char *) lsecond(col));
+
+				if (pgtype == NULL)
+				{
+					ereport(NOTICE,
+							(errmsg("gg_duckdb: column \"%s\" of \"%s\" has DuckDB type %s, which is not carried; skipped",
+									(char *) linitial(col), name, (char *) lsecond(col))));
+					continue;
+				}
+				appendStringInfo(&cmd, "%s\n    %s %s", first ? "" : ",",
+								 quote_identifier((char *) linitial(col)), pgtype);
+				first = false;
+			}
+			appendStringInfo(&cmd, "\n) SERVER %s OPTIONS (location %s, format 'iceberg')",
+							 quote_identifier(server->servername),
+							 quote_literal_cstr(psprintf("%s.%s", dir, name)));
+			commands = lappend(commands, cmd.data);
+		}
+		return commands;
+	}
 	if (!format_is_known(format) || strcmp(format, "iceberg") == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
@@ -1455,6 +1844,15 @@ gg_duckdb_fdw_handler(PG_FUNCTION_ARGS)
 	routine->ExplainForeignScan = fdw_explain;
 	routine->AnalyzeForeignTable = fdw_analyze;
 	routine->ImportForeignSchema = fdw_import_schema;
+
+	/* INSERT (write.c) */
+	routine->IsForeignRelUpdatable = gg_duckdb_fdw_updatable;
+	routine->BeginForeignModify = gg_duckdb_fdw_begin_modify;
+	routine->ExecForeignInsert = gg_duckdb_fdw_insert;
+	routine->EndForeignModify = gg_duckdb_fdw_end_modify;
+	routine->BeginForeignInsert = gg_duckdb_fdw_begin_insert;
+	routine->EndForeignInsert = gg_duckdb_fdw_end_insert;
+	routine->ExplainForeignModify = gg_duckdb_fdw_explain_modify;
 	PG_RETURN_POINTER(routine);
 }
 

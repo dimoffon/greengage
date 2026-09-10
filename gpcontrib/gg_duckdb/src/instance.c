@@ -317,6 +317,7 @@ gg_duckdb_instance_close(void)
 	instance = NULL;
 	instance_memory_limit = 0;
 	instance_threads = 0;
+	gg_duckdb_fdw_instance_closed();
 	elog(DEBUG1, "gg_duckdb: closed DuckDB");
 }
 
