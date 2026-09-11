@@ -16,9 +16,9 @@ Parquet/CSV/JSON files. The standard executor keeps everything Greengage-specifi
 Motion, slices, dispatch, DML, InitPlans, partition selection.
 
 Whether a subtree goes to DuckDB is decided in the GPORCA pipeline (a pass over the
-finished plan), gated by the core GUC `optimizer_enable_duckdb` and the extension GUC
-`gg_duckdb.mode`, steerable by pg_hint_plan hints `DuckDB(...)` / `NoDuckDB(...)`, and
-cost-based where both executors could run the subtree.
+finished plan), gated by the extension GUC `gg_duckdb.mode`, steerable by pg_hint_plan
+hints `DuckDB(...)` / `NoDuckDB(...)`, and cost-based where both executors could run
+the subtree.
 
 ## Decisions
 
@@ -145,7 +145,6 @@ error), so the table is `mpp_execute 'coordinator'` and locked for the transacti
 - `planner.c`/`planner.h`: `post_planner_hook`; `plan_hint_hook` moved here from ORCA's
   `COptTasks.cpp` and its declaration in `orca.h` out of `#ifdef USE_ORCA`
   (`pg_hint_plan` installs it unconditionally).
-- `guc_gp.c`: `optimizer_enable_duckdb` (unsynced; planning happens on the QD).
 - Build: `configure --with-duckdb=PREFIX`, `gpcontrib/Makefile` skips the extension
   without it; `libduckdb.so` is installed into `$GPHOME/lib`.
 

@@ -44,7 +44,6 @@ SELECT gp_segment_id, current_setting('gg_duckdb.max_memory') FROM gp_dist_rando
 SELECT gp_segment_id, (gg_duckdb.status()).memory_limit_bytes FROM gp_dist_random('gp_id') ORDER BY 1;
 RESET gg_duckdb.max_memory;
 SHOW gg_duckdb.mode;
-SHOW optimizer_enable_duckdb;
 
 -- version() matches the pinned build
 SELECT gg_duckdb.version() = (SELECT library_version FROM gg_duckdb.status()) AS same,

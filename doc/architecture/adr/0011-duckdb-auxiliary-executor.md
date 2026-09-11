@@ -183,9 +183,7 @@ All of this is `src/pass.c` (the walk, the gate, the region node) and `src/depar
 
 1. **When.** The hook runs on the coordinator only (`Gp_role == GP_ROLE_DISPATCH`), for
    plans whose command is `SELECT`, when `gg_duckdb.mode` is not `off`. Plans of
-   `INSERT`/`UPDATE`/`DELETE`, including their SELECT parts, are not rewritten. (The core
-   GUC `optimizer_enable_duckdb` exists for the deferred ORCA milestone and is not yet
-   consulted by the pass.)
+   `INSERT`/`UPDATE`/`DELETE`, including their SELECT parts, are not rewritten.
 
 2. **Where.** The pass walks the plan top-down with `plan_tree_mutator`, tracking the
    slice through `Motion.motionID`; the statement's subplans (InitPlans and correlated

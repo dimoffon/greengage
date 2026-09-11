@@ -116,8 +116,7 @@ each node's data directory), `max_temp_directory_size`,
 over float4/float8 inside regions, off: DuckDB's summation order differs, so
 the last digits of a float sum can differ from the standard executor's),
 `data_directories` and `http_proxy` (see the foreign data wrapper), and the
-development aids `debug_wrap` and `debug_region_sql`. The core GUC
-`optimizer_enable_duckdb` gates plans produced by GPORCA.
+development aids `debug_wrap` and `debug_region_sql`.
 
 ## Hints
 

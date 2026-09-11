@@ -119,12 +119,6 @@ SHOW gg_duckdb.mode;
  off
 (1 row)
 
-SHOW optimizer_enable_duckdb;
- optimizer_enable_duckdb 
--------------------------
- on
-(1 row)
-
 -- version() matches the pinned build
 SELECT gg_duckdb.version() = (SELECT library_version FROM gg_duckdb.status()) AS same,
        (SELECT library_version = pinned_version FROM gg_duckdb.status()) AS pinned;
