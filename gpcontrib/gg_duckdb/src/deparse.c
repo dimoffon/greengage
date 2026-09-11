@@ -1644,17 +1644,18 @@ sort_cost(double rows, double limit_rows)
  * Converting a value between PostgreSQL and DuckDB, per value and direction,
  * measured with identity regions over 2M rows per segment: a fixed-width
  * value (integers, floats, dates, timestamps) costs 10-17 ns either way, a
- * text 21 ns in and 130 ns out, a numeric 75 ns in (numeric_out and a parse)
- * and 380 ns out (a decimal string and numeric_in), a numeric aggregate
- * state about twice a numeric; the row itself 6 ns in and 3 ns out.
- * gg_duckdb.cost_convert_factor scales all of them.
+ * text 21 ns in and 130 ns out, a numeric 25 ns in and about 20 ns out
+ * (converted on its base-10000 digits; through numeric_out/numeric_in it
+ * was 75 and 380 ns), a numeric aggregate state about twice a numeric; the
+ * row itself 6 ns in and 3 ns out.  gg_duckdb.cost_convert_factor scales
+ * all of them.
  */
 #define CONV_ROW_IN			0.0004
 #define CONV_ROW_OUT		0.0002
 #define CONV_FIXED_IN		0.0007
 #define CONV_FIXED_OUT		0.0012
-#define CONV_NUMERIC_IN		0.005
-#define CONV_NUMERIC_OUT	0.025
+#define CONV_NUMERIC_IN		0.0017
+#define CONV_NUMERIC_OUT	0.0015
 #define CONV_VARLENA_IN		0.0015
 #define CONV_VARLENA_OUT	0.009
 #define CONV_BYTE			0.00002

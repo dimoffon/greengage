@@ -97,7 +97,7 @@ the gate, force takes every eligible region), `min_rows` (estimated input rows
 a region needs under auto, 10000), the cost gate's constants `cost_fixed`
 (planner cost units per region, 200: about 3 ms), `cost_convert_factor` (scales
 the measured per-value conversion costs: 10-17 ns for a fixed-width value in
-either direction, 21/130 ns for a text in/out, 75/380 ns for a numeric in/out,
+either direction, 21/130 ns for a text in/out, 25/20 ns for a numeric in/out,
 1.0), `cost_op_factor` (DuckDB's cost of an interior operator relative to the
 standard executor's, 0.25) and `cost_margin` (DuckDB must win by this fraction,
 0.25), `cost_boundary` (let the gate end a region above a subtree whose output
@@ -328,20 +328,21 @@ Opening the instance costs about 30 ms and 15–20 MB of RSS per backend
 the thread count of a QE stays at two (main + interconnect receiver).
 
 On the TPC-H-shaped benchmark (`bench/`, SF 1, 3 primaries, medians of 3 in
-warm sessions), regions win by 1.4–1.9x where the interior does much work
-per input row (Q1's eight aggregates, Q4's semi join, Q13's left join and
-counts, Q18's large group-by: 1.66x under ORCA, 1.88x under the Postgres
-planner) and lose by up to 2x when a large input is converted for a join
-that produces little (Q3, Q5, Q10, the local top-N join). The gate's
+warm sessions), the 13 queries take 8.3 s without DuckDB and 5.7 s under
+`mode = auto` with ORCA (1.46x), 7.4 s and 5.0 s with the Postgres planner
+(1.49x): regions win by 1.6–2.6x where the interior does much work per
+input row (Q1's eight numeric aggregates 2.5x, Q18's large group-by
+2.0–2.3x, the co-located join with five numeric aggregates 1.7x, Q13's left
+join and counts and Q4's semi join 1.6–1.8x), and the rest run within a few
+percent of the standard executor, the join-heavy queries (Q3, Q5, Q10)
+either declined or cut down to the aggregate above the join. The gate's
 constants are measured, not fitted: converting a value costs 10–17 ns for a
-fixed-width type, 21/130 ns in/out for a text and 75/380 ns in/out for a
-numeric, while the executor's numeric operators cost 130 ns and its numeric
-aggregates 46–250 ns per row depending on the number of groups; and the gate
+fixed-width type, 21/130 ns in/out for a text and 25/20 ns in/out for a
+numeric (converted on its digits, not through text), while the executor's
+numeric operators cost 130 ns and its numeric aggregates 46–250 ns per row
+depending on the number of groups; and the gate
 draws each region's boundary by the same model, so a join that filters a
 large table through a small one stays with the executor and only the
-aggregate or top-N above it goes to DuckDB (l02, Q3, Q10: from a 2x loss
-under `force` to a small win or a wash under `auto`). Under `mode = auto`
-every query of the set runs within a few percent of the better engine under
-both optimizers. `mode` stays `off` by default; see
+aggregate or top-N above it goes to DuckDB. `mode` stays `off` by default; see
 `doc/architecture/gg-duckdb-executor.md` for the numbers, the measurements
 and the decision.

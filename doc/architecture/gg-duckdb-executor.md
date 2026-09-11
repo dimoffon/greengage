@@ -193,8 +193,8 @@ page reading.
 - **Per-value costs, measured** (identity regions over lineitem, 2M rows per segment,
   planner units at about 15 us each): converting a fixed-width value costs 10-17 ns in
   either direction, a text 21 ns in and 130 ns out, a numeric 75 ns in and 380 ns out
-  (both go through `numeric_out`/`numeric_in` text: the obvious follow-up is a direct
-  digit conversion), the row itself about 6 ns; a region's fixed cost in a warm session is
+  when it went through `numeric_out`/`numeric_in` text (see the next item), the row itself
+  about 6 ns; a region's fixed cost in a warm session is
   3-4 ms (`cost_fixed` 200). On the executor's side, a numeric operator costs 130 ns
   (3.5x `cpu_operator_cost`), a numeric aggregate transition 46 ns in a plain aggregate
   and 250 ns in a hashed one with 500k groups (its state is reallocated per row), and a
@@ -208,37 +208,53 @@ page reading.
   numeric sum over 500k groups costs the executor 830 ms and DuckDB 250 ms including
   conversion (C5 in the notes), a 2.3x win the old model declined as a loss, which is
   exactly the Q18 miss under the Postgres planner.
+- **Numerics are converted on their digits.** `types.c` mirrors numeric.c's storage
+  layout (the header word with sign, display scale and weight, then base-10000 digits;
+  stable since 9.1, read with memcpy because heap values are unaligned short varlenas)
+  and accumulates the digits into the scaled 128-bit integer DuckDB's DECIMAL wants, and
+  builds the Numeric back from that integer's base-10000 digits the way `make_result()`
+  does; the numeric aggregate states are read and written in `numeric_send()`'s wire
+  format the same way. A self-test on first use in each backend converts known values
+  both ways against the server's own `numeric_in`/`numeric_out`, including a hand-built
+  long-form value, and errors out if the layout is not the expected one. Measured: a
+  numeric now costs 25 ns in and about 20 ns out (from 75 and 380), and every numeric
+  probe flipped: four numeric sums over 2M rows 358 ms in DuckDB against 470 in the
+  executor (865 before), the `sum(l_extendedprice * (1 - l_discount))` expression 286
+  against 569 (575 before), the grouped numeric sum 316 against 994 (436 before).
 - **Benchmark** (`bench/`, SF 1, 3 primaries, medians of 3, warm sessions, ms; `whole`
-  is `auto` with `cost_boundary` off, the speedups are off/force and off/auto):
+  is `auto` with `cost_boundary` off, the speedups are off/force and off/auto; the table
+  is the run after the numeric conversion fix):
 
   | query | what the region covers | ORCA off | force | auto | whole | off/auto | planner off | force | auto | whole | off/auto |
   |---|---|---|---|---|---|---|---|---|---|---|---|
-  | q01 | 8 numeric aggregates over 2M rows/segment | 1625 | 1163 | 1173 | 1173 | 1.39 | 1579 | 1119 | 1117 | 1107 | 1.41 |
-  | q04 | semi join + count | 663 | 375 | 389 | 393 | 1.70 | 360 | 346 | 368 | 369 | 0.98 |
-  | q13 | left join, count, count of counts | 383 | 218 | 482 | 219 | 0.79 | 336 | 196 | 194 | 195 | 1.73 |
-  | q18 | join + large group-by (planner: two joins + the aggregate) | 1578 | 1084 | 953 | 948 | 1.66 | 1633 | 974 | 868 | 857 | 1.88 |
-  | l01 | co-located join + 5 aggregates (agg over the executor's join) | 886 | 898 | 896 | 877 | 0.99 | 763 | 860 | 752 | 749 | 1.01 |
-  | l02 | co-located join, 77k groups, top-50 (agg + top-N over the executor's join) | 402 | 583 | 388 | 406 | 1.04 | 331 | 547 | 316 | 341 | 1.04 |
-  | q03 | 3-way join, top-10 (agg + top-N over the executor's join) | 462 | 549 | 462 | 439 | 1.00 | 408 | 485 | 405 | 393 | 1.01 |
-  | q10 | 3-way join, 7 group columns, top-20 (cut region) | 450 | 484 | 447 | 428 | 1.01 | 333 | 440 | 342 | 360 | 0.98 |
-  | q12 | join + CASE sums | 357 | 380 | 370 | 378 | 0.96 | 320 | 345 | 330 | 356 | 0.97 |
-  | q05 | 6-way join, 9 groups (declined) | 470 | 784 | 495 | 471 | 0.95 | 344 | 651 | 341 | 349 | 1.01 |
-  | q06 | filtered sum over 150k rows (declined) | 244 | 258 | 246 | 246 | 0.99 | 240 | 243 | 223 | 226 | 1.07 |
-  | q14 | join under a CASE the region declines (declined) | 271 | 287 | 271 | 270 | 1.00 | 228 | 265 | 232 | 238 | 0.98 |
-  | q19 | join with OR-of-IN predicates (declined) | 337 | 346 | 324 | 336 | 1.04 | 296 | 314 | 302 | 284 | 0.98 |
+  | q01 | 8 numeric aggregates over 2M rows/segment | 1632 | 659 | 664 | 648 | 2.46 | 1580 | 617 | 612 | 607 | 2.58 |
+  | q18 | join + large group-by (planner: the whole slice, three joins and the aggregate) | 1651 | 830 | 814 | 831 | 2.03 | 1717 | 734 | 746 | 723 | 2.30 |
+  | l01 | co-located join + 5 numeric aggregates | 907 | 520 | 517 | 520 | 1.75 | 783 | 481 | 470 | 469 | 1.67 |
+  | q13 | left join, count, count of counts | 383 | 204 | 210 | 215 | 1.83 | 331 | 194 | 213 | 219 | 1.56 |
+  | q04 | semi join + count | 702 | 385 | 410 | 381 | 1.71 | 379 | 355 | 379 | 365 | 1.00 |
+  | l02 | co-located join, 77k groups, top-50 (agg + top-N over the executor's join) | 419 | 372 | 395 | 417 | 1.06 | 343 | 328 | 320 | 360 | 1.07 |
+  | q03 | 3-way join, top-10 (agg + top-N over the executor's join) | 453 | 408 | 468 | 403 | 0.97 | 422 | 364 | 407 | 353 | 1.04 |
+  | q10 | 3-way join, 7 group columns, top-20 (agg + top-N over the executor's join) | 445 | 428 | 432 | 443 | 1.03 | 355 | 372 | 342 | 373 | 1.04 |
+  | q12 | join + CASE sums | 369 | 383 | 403 | 384 | 0.92 | 324 | 372 | 342 | 349 | 0.95 |
+  | q06 | filtered sum over 150k rows | 254 | 266 | 264 | 259 | 0.96 | 233 | 245 | 250 | 243 | 0.93 |
+  | q05 | 6-way join, 9 groups (declined) | 494 | 537 | 499 | 494 | 0.99 | 375 | 409 | 358 | 337 | 1.05 |
+  | q14 | join under a CASE the region declines (declined) | 282 | 273 | 280 | 290 | 1.01 | 239 | 248 | 228 | 244 | 1.05 |
+  | q19 | join with OR-of-IN predicates (declined) | 341 | 335 | 333 | 348 | 1.03 | 298 | 297 | 290 | 309 | 1.03 |
+  | total | 13 queries | 8333 | 5600 | 5690 | 5634 | 1.46 | 7379 | 5016 | 4957 | 4953 | 1.49 |
 
-  The q13 `auto` outlier under ORCA (482) is a host hiccup: the plan is the same as under
-  `whole`, and six consecutive warm runs right after measured 157-216 ms. Under the
-  Postgres planner q04's region is a 20k-row aggregate over the executor's semi join,
-  accepted by 7% of the estimate and a wash in practice.
+  Before the numeric fix the same run totalled 8130/6896 ms under ORCA and 7170/5790
+  under the planner (1.18x and 1.24x), with q01 at 1.4x and q18 at 1.66x/1.88x.
 
-- **What the boundary buys, honestly.** On this set the losing whole-join regions are
-  declined as before; the boundary adds small wins where an aggregate or top-N sits over
-  a selective join (l02, Q3, Q10, Q12) and prunes the rest faster. The large wins stay
-  the aggregate-heavy and semi/anti-join regions, and the largest single change on this
-  set comes from the measured aggregate costs (Q18 under the planner), not from the
-  boundary. Regions that output many numeric or text rows stay expensive until the
-  output conversion is fixed.
+- **What each piece bought, honestly.** The boundary mostly declines losing regions
+  faster and adds a few percent where an aggregate or top-N sits over a selective join
+  (l02, q10); with cheap numerics the whole join is often the better region again, and
+  on q03 the cut region now trails the whole one by a few percent (the join credit in the
+  model is a little too small). The measured aggregate costs turned the planner's q18
+  from a miss into a win. The numeric conversion turned q01 from 1.4x into 2.5x, q18 into
+  2.0-2.3x and l01 (five numeric aggregates over a co-located join) from a wash into
+  1.7x, and it is what lifted the total from about 1.2x to about 1.5x. What remains
+  within noise or a few percent slower (q06, q12) is small regions of 30-50 ms of work,
+  where the model's few-percent errors are the whole margin.
 
 ## M7 findings (2026-09-10)
 
