@@ -2,6 +2,9 @@
 
 Status: milestones M0 (foundation), M1 (identity region) and M2 (deparser and planner pass) on branch `7.x-duck`. This document is the design
 record; the milestone plan and the verified facts behind each decision live with it.
+The decision record proper — how DuckDB is integrated, how a plan is rewritten and by
+which rules, what is supported and what is not — is
+[ADR-0011](adr/0011-duckdb-auxiliary-executor.md).
 
 ## What it is
 
