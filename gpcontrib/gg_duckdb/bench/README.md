@@ -28,3 +28,6 @@ report shows the median of the runs, the number of DuckDB regions in the
 forced plan, and the speedups off/force and off/auto.  With `-c` the gate's
 estimates follow each query, one line per candidate and one per subtree the
 executor keeps under it.
+
+`tpcds/` runs the 99 TPC-DS queries the same way on the schema of the
+Greengage TPC-DS harness; see `tpcds/README.md`.
