@@ -147,6 +147,51 @@ SELECT d_check($q$ SELECT id, cast(0 as decimal(12,2)) AS z, count(*) AS n FROM 
 SELECT d_check($q$ SELECT id, sum(z) AS s, count(*) AS n FROM (SELECT o.id, cast(0 as decimal(12,2)) AS z FROM d_orders o JOIN d_orders p ON o.id = p.id WHERE o.id < 100
                                                               UNION ALL SELECT id, amount FROM d_orders WHERE id < 200) u GROUP BY id $q$);
 
+-- the gate is memory-aware: a region's hash tables (the groups of an
+-- aggregate, the build side of a join, the rows of a DISTINCT) must fit the
+-- memory the region will have, the largest memquota share among the operators
+-- it replaces but at least gg_duckdb.min_memory and at most
+-- gg_duckdb.max_memory.  The boundary keeps a subtree with the executor when
+-- it would not fit; a region whose root would not fit is declined.
+CREATE TABLE d_wide AS SELECT i AS id, i % 1000 AS grp, repeat('x', 200) AS pad
+  FROM generate_series(1, 200000) i DISTRIBUTED BY (id);
+ANALYZE d_wide;
+SET gg_duckdb.mode = auto;
+SET gg_duckdb.min_rows = 0;
+SET gg_duckdb.cost_fixed = 0;
+SET gg_duckdb.cost_op_factor = 0;
+SET gg_duckdb.cost_convert_factor = 0;
+SET gg_duckdb.min_memory = '8MB';
+SET gg_duckdb.max_memory = '16MB';
+SET gg_duckdb.explain_decisions = on;
+-- the join's build side (67k rows of 200 bytes per segment, twice that as a
+-- hash table) does not fit 16 MB: the executor keeps the join, the aggregate
+-- above it is the region
+EXPLAIN (COSTS OFF)
+SELECT a.id, count(*), sum(length(a.pad) + length(b.pad)) FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id;
+-- the aggregate's groups (67k of 200 bytes) do not fit either: declined
+EXPLAIN (COSTS OFF)
+SELECT id, pad, count(*) FROM d_wide GROUP BY id, pad;
+-- with the default bounds both fit
+RESET gg_duckdb.min_memory;
+RESET gg_duckdb.max_memory;
+EXPLAIN (COSTS OFF)
+SELECT a.id, count(*), sum(length(a.pad) + length(b.pad)) FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id;
+EXPLAIN (COSTS OFF)
+SELECT id, pad, count(*) FROM d_wide GROUP BY id, pad;
+SET gg_duckdb.explain_decisions = off;
+SET gg_duckdb.min_memory = '8MB';
+SET gg_duckdb.max_memory = '16MB';
+SELECT d_check($q$ SELECT a.id, count(*) AS n, sum(length(a.pad) + length(b.pad)) AS s FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id $q$, 'auto');
+RESET gg_duckdb.min_memory;
+RESET gg_duckdb.max_memory;
+RESET gg_duckdb.min_rows;
+RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.cost_op_factor;
+RESET gg_duckdb.cost_convert_factor;
+SET gg_duckdb.mode = force;
+DROP TABLE d_wide;
+
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;

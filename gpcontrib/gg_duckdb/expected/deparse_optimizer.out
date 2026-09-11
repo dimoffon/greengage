@@ -420,6 +420,104 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
  0 | 0
 (1 row)
 
+-- the gate is memory-aware: a region's hash tables (the groups of an
+-- aggregate, the build side of a join, the rows of a DISTINCT) must fit the
+-- memory the region will have, the largest memquota share among the operators
+-- it replaces but at least gg_duckdb.min_memory and at most
+-- gg_duckdb.max_memory.  The boundary keeps a subtree with the executor when
+-- it would not fit; a region whose root would not fit is declined.
+CREATE TABLE d_wide AS SELECT i AS id, i % 1000 AS grp, repeat('x', 200) AS pad
+  FROM generate_series(1, 200000) i DISTRIBUTED BY (id);
+ANALYZE d_wide;
+SET gg_duckdb.mode = auto;
+SET gg_duckdb.min_rows = 0;
+SET gg_duckdb.cost_fixed = 0;
+SET gg_duckdb.cost_op_factor = 0;
+SET gg_duckdb.cost_convert_factor = 0;
+SET gg_duckdb.min_memory = '8MB';
+SET gg_duckdb.max_memory = '16MB';
+SET gg_duckdb.explain_decisions = on;
+-- the join's build side (67k rows of 200 bytes per segment, twice that as a
+-- hash table) does not fit 16 MB: the executor keeps the join, the aggregate
+-- above it is the region
+EXPLAIN (COSTS OFF)
+SELECT a.id, count(*), sum(length(a.pad) + length(b.pad)) FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(CAST((CAST(length(n1.c2) AS INTEGER)) + (CAST(length(n1.c3) AS INTEGER)) AS INTEGER)) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: HashJoin (plan node 2): kept by the executor as a leaf of that region: its working set would not fit the region's memory
+NOTICE:  gg_duckdb: HashJoin (plan node 2): its working set would not fit the region's memory
+                  QUERY PLAN                  
+----------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Hash Join
+               Hash Cond: (a.id = b.id)
+               ->  Seq Scan on d_wide a
+               ->  Hash
+                     ->  Seq Scan on d_wide b
+ Optimizer: GPORCA
+(9 rows)
+
+-- the aggregate's groups (67k of 200 bytes) do not fit either: declined
+EXPLAIN (COSTS OFF)
+SELECT id, pad, count(*) FROM d_wide GROUP BY id, pad;
+NOTICE:  gg_duckdb: Agg (plan node 1): its working set would not fit the region's memory
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: id, pad
+         ->  Seq Scan on d_wide
+ Optimizer: GPORCA
+(5 rows)
+
+-- with the default bounds both fit
+RESET gg_duckdb.min_memory;
+RESET gg_duckdb.max_memory;
+EXPLAIN (COSTS OFF)
+SELECT a.id, count(*), sum(length(a.pad) + length(b.pad)) FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(CAST((CAST(length(n3.c2) AS INTEGER)) + (CAST(length(n3.c3) AS INTEGER)) AS INTEGER)) AS BIGINT) AS c3 FROM (SELECT n1.c1 AS c1, n1.c2 AS c2, n2.c2 AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c1) = (n2.c1))) AS n3 GROUP BY n3.c1) AS n4
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Join Agg over 2 leaves
+         ->  Seq Scan on d_wide a
+         ->  Seq Scan on d_wide b
+ Optimizer: GPORCA
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id, pad, count(*) FROM d_wide GROUP BY id, pad;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, n1.c2 AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1, n1.c2) AS n2
+                QUERY PLAN                
+------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Seq Scan on d_wide
+ Optimizer: GPORCA
+(5 rows)
+
+SET gg_duckdb.explain_decisions = off;
+SET gg_duckdb.min_memory = '8MB';
+SET gg_duckdb.max_memory = '16MB';
+SELECT d_check($q$ SELECT a.id, count(*) AS n, sum(length(a.pad) + length(b.pad)) AS s FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id $q$, 'auto');
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+RESET gg_duckdb.min_memory;
+RESET gg_duckdb.max_memory;
+RESET gg_duckdb.min_rows;
+RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.cost_op_factor;
+RESET gg_duckdb.cost_convert_factor;
+SET gg_duckdb.mode = force;
+DROP TABLE d_wide;
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;

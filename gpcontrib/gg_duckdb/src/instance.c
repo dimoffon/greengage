@@ -159,6 +159,15 @@ open_instance(void)
 	/* No DuckDB-owned threads: the backend thread drives every task. */
 	set_config(cfg, "threads", "1");
 	set_config(cfg, "external_threads", "1");
+	/*
+	 * A region's joins keep the plan's order and build sides: the planner
+	 * chose them with statistics, DuckDB has none for the leaves (table
+	 * functions) and would reorder blindly, and the gate's memory estimate
+	 * charges the plan's build sides.  At TPC-DS SF50 DuckDB built a
+	 * four-join region on its widest side and ran out of memory where the
+	 * plan's sides fit.  The setting is global to the instance.
+	 */
+	set_config(cfg, "disabled_optimizers", "join_order,build_side_probe_side");
 	snprintf(buf, sizeof(buf), "%dMB", gg_duckdb_max_memory_mb);
 	set_config(cfg, "memory_limit", buf);
 	set_config(cfg, "temp_directory", instance_temp_dir);

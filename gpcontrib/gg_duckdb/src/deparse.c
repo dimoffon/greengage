@@ -1622,6 +1622,55 @@ rows_of(Plan *plan)
 }
 
 /*
+ * The region's working set: what its hash tables hold at once, per QE.
+ * DuckDB spills a hash aggregate or a hash join that outgrows its memory
+ * limit, but only down to a floor its partitions and their blocks need;
+ * a region whose hash tables are larger than the memory it will have fails
+ * at execution ("failed to pin block"), and nothing falls back.  So the
+ * groups of a hashed aggregate, the build side of a join and the distinct
+ * rows of a DISTINCT are charged at twice their planner width, the hash
+ * table's overhead on the rows; a sort spills without such a floor and is
+ * not charged.  Rows are per QE already: the planner's estimates are.
+ */
+#define WORKSET_HASH_FACTOR 2.0
+
+static void
+workset_charge(DeparseCtx *ctx, double rows, int width)
+{
+	ctx->spec->workset_kb += rows * Max(width, 1) * WORKSET_HASH_FACTOR / 1024.0;
+}
+
+/*
+ * The memory quota memquota assigned the node (pass.c ran the executor's
+ * policy over the plan first).  The region will have at least the largest
+ * quota among the memory-intensive nodes it replaces: memquota divides the
+ * query's memory among such nodes, and a region stands for several.
+ */
+static void
+quota_note(DeparseCtx *ctx, Plan *plan)
+{
+	if (plan != NULL && (double) plan->operatorMemKB > ctx->spec->quota_kb)
+		ctx->spec->quota_kb = (double) plan->operatorMemKB;
+}
+
+/*
+ * The memory a region will have at execution, as query.c derives it from
+ * its memquota share: the share, but at least gg_duckdb.min_memory and at
+ * most gg_duckdb.max_memory.  The share is estimated from the plan the
+ * region is cut from (see quota_note); work_mem when memquota assigned
+ * nothing, as PlanStateOperatorMemKB then answers.
+ */
+double
+gg_duckdb_region_budget_kb(const GGRegionSpec *spec)
+{
+	double		kb = spec->quota_kb > 0 ? spec->quota_kb : (double) work_mem;
+
+	kb = Max(kb, (double) gg_duckdb_min_memory_mb * 1024.0);
+	kb = Min(kb, (double) gg_duckdb_max_memory_mb * 1024.0);
+	return kb;
+}
+
+/*
  * As cost_sort for an in-memory sort.  A bounded (top-N) sort, a LIMIT above
  * it capping the output, is a heap of N: every input row is compared with
  * the heap's top and the few that enter (N * ln(n/N) of them) sift down,
@@ -1852,7 +1901,10 @@ attempt_undo(DeparseCtx *ctx, DeparseAttempt *a)
  * it moved to DuckDB, the children's own choices already made; the
  * alternative costs the conversion of the node's output.  Ties keep the
  * interior.  The base of a region is never a leaf, unless a Sort or Unique
- * above it keeps the region worth having.
+ * above it keeps the region worth having.  Whatever the costs, the executor
+ * keeps the subtree when its hash tables would take the region's working
+ * set past the memory the region will have (gg_duckdb_region_budget_kb):
+ * the region above it then holds only what fits.
  */
 static bool
 executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut)
@@ -1864,12 +1916,14 @@ executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut
 		operator_balance(spec->op_cost - a->spec.op_cost);
 	double		rows_out = rows_of(plan);
 	double		leaf = plan_conv_cost(plan);
+	double		budget = gg_duckdb_region_budget_kb(spec);
+	bool		memory = spec->workset_kb > budget;
 	GGRegionCut *c;
 
 	if (!spec->cost_boundary || leaf < 0)
 		return false;
 	leaf *= 1.0 + gg_duckdb_cost_margin;
-	if (leaf >= interior)
+	if (!memory && leaf >= interior)
 		return false;
 	if (ctx->depth == 0 && !ctx->root_cuttable)
 		return false;
@@ -1879,6 +1933,9 @@ executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut
 	c->leaf_cost = leaf;
 	c->rows_in = rows_in;
 	c->interior_cost = interior;
+	c->memory = memory;
+	c->workset_kb = spec->workset_kb;
+	c->budget_kb = budget;
 	*cut = c;
 	return true;
 }
@@ -2284,7 +2341,10 @@ deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 		return deparse_append(ctx, (Append *) plan, out, cols);
 
 	if (IsA(plan, Material))
+	{
+		quota_note(ctx, plan);	/* DuckDB does not materialise here, but memquota gave it memory */
 		return deparse_base(ctx, plan->lefttree, out, cols);
+	}
 
 	{
 		StringInfoData child_sql;
@@ -2379,6 +2439,12 @@ deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			}
 			ctx->spec->ninterior++;
 			ctx->spec->naggs++;
+			/* DuckDB hashes every grouped aggregate, sorted ones included */
+			if (agg->numCols > 0)
+				workset_charge(ctx, rows_of(plan), plan->plan_width);
+			quota_note(ctx, plan);
+			if (agg->aggstrategy == AGG_SORTED && IsA(plan->lefttree, Sort))
+				quota_note(ctx, plan->lefttree);
 			/* as cost_agg, per input row per aggregate and group key, weighted */
 			add_op_cost(ctx, cpu_operator_cost * rows_of(child) * agg_weight(plan, agg->numCols) +
 						cpu_tuple_cost * rows_of(plan) +
@@ -2493,6 +2559,13 @@ deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 		double		irows = rows_of(innerp);
 		double		nclauses = Max(list_length(clauses), 1);
 
+		/* the inner side is built into a hash table (a merge join's sorts spill) */
+		if (!IsA(plan, MergeJoin))
+			workset_charge(ctx, irows, innerp->plan_width);
+		if (IsA(plan->righttree, Hash) || IsA(plan->righttree, Sort) || IsA(plan->righttree, Material))
+			quota_note(ctx, plan->righttree);
+		if (IsA(plan->lefttree, Sort))
+			quota_note(ctx, plan->lefttree);
 		if (IsA(plan, NestLoop))
 			add_op_cost(ctx, cpu_operator_cost * orows * irows * nclauses);
 		else if (IsA(plan, MergeJoin))
@@ -2661,6 +2734,8 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->cuts = NIL;
 	spec->conv_in = 0;
 	spec->conv_out = 0;
+	spec->workset_kb = 0;
+	spec->quota_kb = 0;
 
 	/* the top chain: [Limit] [Unique] [Sort], Materials in between are transparent */
 	for (;;)
@@ -2725,6 +2800,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		spec->nsorts++;
 		spec->ninterior++;
 		spec->ordered = true;
+		quota_note(&ctx, (Plan *) sort);
 		{
 			double		bound = 0;
 			int64		count = 0,
@@ -2749,6 +2825,7 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	if (uniq)
 	{
 		spec->ninterior++;
+		workset_charge(&ctx, rows_of((Plan *) uniq), ((Plan *) uniq)->plan_width);	/* DuckDB hashes DISTINCT */
 		add_op_cost(&ctx, cpu_operator_cost * rows_of(node) * Max(uniq->numCols, 1));
 	}
 	if (limit)

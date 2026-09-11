@@ -130,8 +130,20 @@ interior and kept by the executor instead when converting its output is cheaper 
 converting its inputs plus what DuckDB saves on its operators. The constants are measured
 on the development host (identity regions and aggregate probes; the numbers sit next to
 the constants in `deparse.c`) and scaled by GUCs; `DuckDB()`/`NoDuckDB()` hints beat the
-gate. The details are in "How the plan is rewritten" below. **Why measured rather than
-fitted:** the first, fitted constants separated 13 benchmark queries perfectly and still
+gate. The gate is memory-aware as well: a region's hash tables (aggregate groups, join
+build sides, DISTINCT rows, at twice their planner width) must fit the memory the region
+will have at execution, estimated as the largest memquota share among the operators it
+replaces (the executor's policy is run over the plan before the pass) within the
+`min_memory`/`max_memory` bounds; the boundary keeps a subtree with the executor when it
+would not fit and a region whose root would not fit is declined, because a hash table
+larger than DuckDB's memory limit fails ("failed to pin block") instead of spilling and
+nothing falls back at run time. For that estimate to hold, the instance disables DuckDB's
+`join_order` and `build_side_probe_side` optimizers: a region's joins keep the plan's order
+and build sides, which the planner chose with statistics DuckDB does not have for the
+leaves (at SF50, DuckDB's blind swap built a four-join region on its widest side and ran
+out of memory where the plan's sides fit). The details are in "How the plan is rewritten"
+below.
+**Why measured rather than fitted:** the first, fitted constants separated 13 benchmark queries perfectly and still
 mispredicted the next run; per-value and per-operator measurements transfer.
 
 ### D6 — Memory is budgeted up front, not tracked per allocation
@@ -139,7 +151,7 @@ mispredicted the next run; per-value and per-operator measurements transfer.
 A region carries `CUSTOMSCAN_GP_MEMORY_INTENSIVE` and `CUSTOMSCAN_GP_BLOCKING` when it
 contains an aggregate, sort or distinct, so memquota gives it a Sort-like share of the
 query's memory. At start the region takes that share (`PlanStateOperatorMemKB`), raised
-to `gg_duckdb.min_memory` (64 MB) and capped by `gg_duckdb.max_memory` (512 MB), reserves
+to `gg_duckdb.min_memory` (256 MB) and capped by `gg_duckdb.max_memory` (512 MB), reserves
 it with the vmem tracker (`gg_duckdb.reserve_memory`) and releases it at the end; the
 instance's `memory_limit` bounds DuckDB's buffer pool, and spills go to the per-node
 temporary directory. **Accepted cost:** DuckDB documents that some intermediates escape
@@ -395,7 +407,7 @@ process), `gg_duckdb.foreign_files(regclass)` (which segment reads which file), 
 `explain_decisions` NOTICEs and the DEBUG1 estimates, the fault points
 `gg_duckdb_before_batch`, `gg_duckdb_query_start` and `gg_duckdb_after_chunk` for tests.
 
-**GUCs** (`gg_duckdb.*`): `mode` (off), `max_memory` (512MB), `min_memory` (64MB),
+**GUCs** (`gg_duckdb.*`): `mode` (off), `max_memory` (512MB), `min_memory` (256MB),
 `temp_directory`, `max_temp_directory_size`, `release_instance_at_end` (off),
 `min_rows` (10000), `cost_fixed` (200), `cost_convert_factor` (1.0), `cost_op_factor`
 (0.25), `cost_margin` (0.25), `cost_boundary` (on), `explain_decisions` (off),

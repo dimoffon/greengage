@@ -686,8 +686,11 @@ page reading.
   prepared, so the leaf table function's bind context must stay in place from prepare
   through the start of execution.
 - memquota grants a node that is not memory intensive about 100 KB; DuckDB cannot run
-  under such a limit, hence `gg_duckdb.min_memory` (64 MB) as the floor of a region's
-  memory limit, which is reserved with the vmem tracker while the region runs.
+  under such a limit, hence `gg_duckdb.min_memory` as the floor of a region's memory
+  limit, which is reserved with the vmem tracker while the region runs. The floor is
+  256 MB: at TPC-DS SF30 a hash aggregate over 29M rows per segment could not pin its
+  blocks in the 64 MB floor a small memquota share left it, and nothing falls back at
+  run time, so the gate now also declines or cuts what would not fit (see the gate).
 - gpdiff's `matchsubs` do not apply to NOTICE lines, so decision notices carry no row
   estimates (they go to the DEBUG1 log instead).
 - Aggregate outputs of unconstrained `numeric` can be region outputs (DuckDB's DECIMAL

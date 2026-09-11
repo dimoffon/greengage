@@ -20,7 +20,7 @@
 
 int			gg_duckdb_mode = GG_DUCKDB_MODE_OFF;
 int			gg_duckdb_max_memory_mb = 512;
-int			gg_duckdb_min_memory_mb = 64;
+int			gg_duckdb_min_memory_mb = 256;
 char	   *gg_duckdb_temp_directory = NULL;
 char	   *gg_duckdb_max_temp_directory_size = NULL;
 bool		gg_duckdb_release_instance_at_end = false;
@@ -80,9 +80,9 @@ gg_duckdb_define_gucs(void)
 
 	DefineCustomIntVariable("gg_duckdb.min_memory",
 							"Lower bound of a region's DuckDB memory limit.",
-							"A region's share of the query memory is raised to this: DuckDB needs room for its buffers even when memquota grants a node next to nothing.",
+							"A region's share of the query memory is raised to this: DuckDB's hash tables spill only down to a floor their partitions need, and memquota may grant a node next to nothing.",
 							&gg_duckdb_min_memory_mb,
-							64, 8, INT_MAX / 1024,
+							256, 8, INT_MAX / 1024,
 							PGC_USERSET,
 							GUC_UNIT_MB | GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);

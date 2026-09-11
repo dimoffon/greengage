@@ -26,6 +26,7 @@
 #include "cdb/cdbllize.h"
 #include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
+#include "cdb/memquota.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -552,15 +553,29 @@ try_region(PassContext *ctx, Plan *plan)
 		double		duck_cost = gg_duckdb_cost_fixed +
 			spec.op_cost * gg_duckdb_cost_op_factor +
 			spec.conv_in + spec.conv_out;
+		double		budget_kb = gg_duckdb_region_budget_kb(&spec);
 
 		foreach(lc, spec.cuts)
 		{
 			GGRegionCut *cut = (GGRegionCut *) lfirst(lc);
 
-			elog(DEBUG1, "gg_duckdb: plan node %d [%s]: the executor keeps %s (plan node %d): "
-				 "its %.0f output rows convert for %.1f, its %.0f input rows and its operators for %.1f",
-				 plan->plan_node_id, spec.label, plan_node_name(cut->plan), cut->plan->plan_node_id,
-				 cut->rows_out, cut->leaf_cost, cut->rows_in, cut->interior_cost);
+			if (cut->memory)
+				elog(DEBUG1, "gg_duckdb: plan node %d [%s]: the executor keeps %s (plan node %d): "
+					 "with it the working set is %.0f MB, the region's memory %.0f MB",
+					 plan->plan_node_id, spec.label, plan_node_name(cut->plan), cut->plan->plan_node_id,
+					 cut->workset_kb / 1024.0, cut->budget_kb / 1024.0);
+			else
+				elog(DEBUG1, "gg_duckdb: plan node %d [%s]: the executor keeps %s (plan node %d): "
+					 "its %.0f output rows convert for %.1f, its %.0f input rows and its operators for %.1f",
+					 plan->plan_node_id, spec.label, plan_node_name(cut->plan), cut->plan->plan_node_id,
+					 cut->rows_out, cut->leaf_cost, cut->rows_in, cut->interior_cost);
+		}
+		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: working set %.0f MB, memory %.0f MB",
+			 plan->plan_node_id, spec.label, spec.workset_kb / 1024.0, budget_kb / 1024.0);
+		if (spec.workset_kb > budget_kb)
+		{
+			decision(ctx, plan, "its working set would not fit the region's memory");
+			return NULL;
 		}
 		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in (conversion %.1f), "
 			 "%.0f rows out (conversion %.1f), standard executor %.1f, DuckDB %.1f (margin %.2f)",
@@ -589,8 +604,12 @@ try_region(PassContext *ctx, Plan *plan)
 		GGRegionCut *cut = (GGRegionCut *) lfirst(lc);
 
 		/* the estimates behind it are at DEBUG1: they vary with the statistics */
-		decision(ctx, cut->plan, "kept by the executor as a leaf of that region: "
-				 "its output is cheaper to convert than its inputs and its operators");
+		if (cut->memory)
+			decision(ctx, cut->plan, "kept by the executor as a leaf of that region: "
+					 "its working set would not fit the region's memory");
+		else
+			decision(ctx, cut->plan, "kept by the executor as a leaf of that region: "
+					 "its output is cheaper to convert than its inputs and its operators");
 	}
 	elog(DEBUG1, "gg_duckdb: plan node %d: region [%s], %.0f estimated input rows",
 		 plan->plan_node_id, spec.label, spec.rows_in);
@@ -797,6 +816,23 @@ gg_duckdb_post_planner(PlannedStmt *stmt, Query *parse, int cursorOptions,
 	ctx.parent = NULL;
 	ctx.next_plan_node_id = 1;
 	max_plan_node_id_walker((Node *) stmt->planTree, &ctx);
+
+	/*
+	 * The memory quota of every operator, as the executor's policy will
+	 * assign it to this plan: the gate holds a region's working set against
+	 * the quotas of the operators it replaces.  Without a resource manager
+	 * the query's memory is statement_mem; a resource queue or group may
+	 * grant more at execution, which only lifts the quotas.
+	 */
+	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO)
+	{
+		uint64		bytes = (uint64) statement_mem * 1024L;
+
+		if (IsResManagerMemoryPolicyAuto())
+			PolicyAutoAssignOperatorMemoryKB(stmt, bytes);
+		else if (IsResManagerMemoryPolicyEagerFree())
+			PolicyEagerFreeAssignOperatorMemoryKB(stmt, bytes);
+	}
 
 	if (gg_duckdb_debug_wrap == GG_DUCKDB_WRAP_SCANS)
 		stmt->planTree = (Plan *) wrap_mutator((Node *) stmt->planTree, &ctx);

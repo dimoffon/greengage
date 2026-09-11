@@ -356,6 +356,8 @@ typedef struct GGRegionSpec
 	bool		cost_boundary;	/* in: the cost model may end the region above a subtree */
 	int			ncuts;			/* out: subtrees the executor keeps as leaves */
 	List	   *cuts;			/* out: of GGRegionCut, for the decision log */
+	double		workset_kb;		/* estimated per-QE size of its hash tables and materialisations */
+	double		quota_kb;		/* largest memory quota among the memory-intensive nodes it replaces (0: none) */
 } GGRegionSpec;
 
 /* A subtree the cost model left with the executor, and the numbers that decided it. */
@@ -366,6 +368,9 @@ typedef struct GGRegionCut
 	double		leaf_cost;		/* gate units: converting that output */
 	double		rows_in;		/* rows the region would have converted instead */
 	double		interior_cost;	/* gate units: converting those, less DuckDB's gain on the operators */
+	bool		memory;			/* cut because the working set would not fit the region's memory */
+	double		workset_kb;		/* the working set with the subtree inside the region */
+	double		budget_kb;		/* the memory the region would have */
 } GGRegionCut;
 
 /* A gg_duckdb foreign table as DuckDB reads it (fdw.c describes, deparse.c writes). */
@@ -406,6 +411,7 @@ extern char *gg_duckdb_native_location_text(Oid relid);
 extern List *gg_duckdb_native_pre_sql(List *natives);
 
 extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec);
+extern double gg_duckdb_region_budget_kb(const GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);
 
 /* fdw.c: the options of a foreign table, table over server over wrapper */

@@ -104,11 +104,21 @@ standard executor's, 0.25) and `cost_margin` (DuckDB must win by this fraction,
 is cheaper to convert than its inputs, on; off judges every eligible region
 whole), `explain_decisions` (NOTICE per candidate subtree with the reason it was
 declined, or its DuckDB query and the subtrees the executor keeps under it; the
-gate's estimates go to the DEBUG1 log),
+gate's estimates go to the DEBUG1 log).  The gate is also memory-aware: a
+region's hash tables (the groups of an aggregate, the build side of a join,
+the rows of a DISTINCT, at twice their planner width) must fit the memory the
+region will have, the largest memquota share among the operators it replaces
+within the `min_memory`/`max_memory` bounds; the boundary keeps a subtree with
+the executor when it would not fit, and a region whose root would not fit is
+declined (a hash table larger than DuckDB's memory limit fails at execution
+rather than spilling, and nothing falls back).  For the estimate to hold, the
+instance runs with DuckDB's join reordering and build-side swapping disabled: a
+region's joins keep the plan's order and build sides, chosen with statistics
+DuckDB does not have for the leaves.  Then
 `strict` (an unhonoured `DuckDB()` hint is an error instead of a notice, off),
 `on_coordinator` (regions in coordinator slices, off), `validate_at_plan_time`
 (prepare every region query on the coordinator first, on), `max_memory` and
-`min_memory` (bounds of a region's DuckDB memory limit, 512MB and 64MB),
+`min_memory` (bounds of a region's DuckDB memory limit, 512MB and 256MB),
 `reserve_memory` (reserve the region's budget with the vmem tracker, on),
 `temp_directory` (default `base/pgsql_tmp/pgsql_tmp_gg_duckdb_<pid>` under
 each node's data directory), `max_temp_directory_size`,
