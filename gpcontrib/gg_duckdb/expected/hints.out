@@ -14,6 +14,8 @@ ANALYZE h_a; ANALYZE h_b;
 SET optimizer_trace_fallback = on;
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.explain_decisions = on;
+-- the gate is not the subject here: a row floor keeps it out of the way
+SET gg_duckdb.min_rows = 100000;
 -- without a hint the gate declines this small input
 EXPLAIN (COSTS OFF)
 SELECT a.k, count(*), sum(b.w) FROM h_a a JOIN h_b b ON a.k = b.k GROUP BY a.k;
@@ -221,3 +223,4 @@ DROP TABLE h_base; DROP TABLE h_duck;
 RESET gg_duckdb.mode;
 RESET optimizer_trace_fallback;
 DROP TABLE h_a; DROP TABLE h_b;
+RESET gg_duckdb.min_rows;

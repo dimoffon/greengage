@@ -472,8 +472,8 @@ try_region(PassContext *ctx, Plan *plan)
 	char	   *why = NULL;
 	ListCell   *lc;
 	GGHintVerdict verdict;
+	double		parent_limit = 0;
 
-	memset(&spec, 0, sizeof(spec));
 	if (ctx->parent != NULL && IsA(ctx->parent, Limit))
 	{
 		/*
@@ -486,16 +486,44 @@ try_region(PassContext *ctx, Plan *plan)
 		if (lim->limitCount && IsA(lim->limitCount, Const) &&
 			!((Const *) lim->limitCount)->constisnull)
 		{
-			spec.parent_limit = (double) DatumGetInt64(((Const *) lim->limitCount)->constvalue);
+			parent_limit = (double) DatumGetInt64(((Const *) lim->limitCount)->constvalue);
 			if (lim->limitOffset && IsA(lim->limitOffset, Const) &&
 				!((Const *) lim->limitOffset)->constisnull)
-				spec.parent_limit += (double) DatumGetInt64(((Const *) lim->limitOffset)->constvalue);
+				parent_limit += (double) DatumGetInt64(((Const *) lim->limitOffset)->constvalue);
 		}
 	}
+	memset(&spec, 0, sizeof(spec));
+	spec.parent_limit = parent_limit;
 	if (!gg_duckdb_deparse_region(ctx->stmt, plan, &spec))
 	{
 		decision(ctx, plan, "not eligible: %s", spec.reject ? spec.reject : "?");
 		return NULL;
+	}
+
+	/*
+	 * Hints address a region by the scans of its maximal shape, and a hint
+	 * that forces it takes that shape whole.  Under the gate the region is
+	 * deparsed again with the cost model drawing its boundary: a subtree
+	 * whose output is cheaper to convert than its inputs stays with the
+	 * executor and becomes a leaf.
+	 */
+	verdict = gg_duckdb_hints_verdict(ctx->hints,
+									  gg_duckdb_region_aliases(ctx->stmt, spec.leaves));
+	if (verdict == GG_HINT_FORBID)
+	{
+		decision(ctx, plan, "forbidden by a NoDuckDB hint");
+		return NULL;
+	}
+	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO && verdict != GG_HINT_FORCE &&
+		gg_duckdb_cost_boundary)
+	{
+		GGRegionSpec bounded;
+
+		memset(&bounded, 0, sizeof(bounded));
+		bounded.parent_limit = parent_limit;
+		bounded.cost_boundary = true;
+		if (gg_duckdb_deparse_region(ctx->stmt, plan, &bounded))
+			spec = bounded;
 	}
 	if (spec.naggs == 0 && spec.nsorts == 0 && spec.njoins == 0 &&
 		strstr(spec.label, "Unique") == NULL)
@@ -518,29 +546,26 @@ try_region(PassContext *ctx, Plan *plan)
 			return NULL;
 		}
 	}
-	verdict = gg_duckdb_hints_verdict(ctx->hints,
-									  gg_duckdb_region_aliases(ctx->stmt, spec.leaves));
-	if (verdict == GG_HINT_FORBID)
-	{
-		decision(ctx, plan, "forbidden by a NoDuckDB hint");
-		return NULL;
-	}
 	if (gg_duckdb_mode == GG_DUCKDB_MODE_AUTO && verdict != GG_HINT_FORCE)
 	{
 		double		pg_cost = spec.op_cost;
-		double		rows_conv = spec.rows_in - spec.rows_native + spec.rows_out;
-		double		bytes_conv = spec.rows_in > 0 ?
-			spec.bytes_in * (spec.rows_in - spec.rows_native) / spec.rows_in + spec.bytes_out :
-			spec.bytes_out;
 		double		duck_cost = gg_duckdb_cost_fixed +
 			spec.op_cost * gg_duckdb_cost_op_factor +
-			rows_conv * gg_duckdb_cost_convert_row +
-			bytes_conv * gg_duckdb_cost_convert_byte;
+			spec.conv_in + spec.conv_out;
 
-		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in (%.0f bytes), "
-			 "%.0f rows out (%.0f bytes), standard executor %.1f, DuckDB %.1f (margin %.2f)",
-			 plan->plan_node_id, spec.label, spec.rows_in, spec.bytes_in,
-			 spec.rows_out, spec.bytes_out, pg_cost, duck_cost, gg_duckdb_cost_margin);
+		foreach(lc, spec.cuts)
+		{
+			GGRegionCut *cut = (GGRegionCut *) lfirst(lc);
+
+			elog(DEBUG1, "gg_duckdb: plan node %d [%s]: the executor keeps %s (plan node %d): "
+				 "its %.0f output rows convert for %.1f, its %.0f input rows and its operators for %.1f",
+				 plan->plan_node_id, spec.label, plan_node_name(cut->plan), cut->plan->plan_node_id,
+				 cut->rows_out, cut->leaf_cost, cut->rows_in, cut->interior_cost);
+		}
+		elog(DEBUG1, "gg_duckdb: plan node %d [%s]: %.0f rows in (conversion %.1f), "
+			 "%.0f rows out (conversion %.1f), standard executor %.1f, DuckDB %.1f (margin %.2f)",
+			 plan->plan_node_id, spec.label, spec.rows_in, spec.conv_in,
+			 spec.rows_out, spec.conv_out, pg_cost, duck_cost, gg_duckdb_cost_margin);
 		if (spec.rows_in < (double) gg_duckdb_min_rows)
 		{
 			decision(ctx, plan, "estimated input rows below gg_duckdb.min_rows");
@@ -559,6 +584,14 @@ try_region(PassContext *ctx, Plan *plan)
 	}
 	decision(ctx, plan, "region [%s]%s: %s", spec.label,
 			 verdict == GG_HINT_FORCE ? " forced by a DuckDB hint" : "", spec.sql);
+	foreach(lc, spec.cuts)
+	{
+		GGRegionCut *cut = (GGRegionCut *) lfirst(lc);
+
+		/* the estimates behind it are at DEBUG1: they vary with the statistics */
+		decision(ctx, cut->plan, "kept by the executor as a leaf of that region: "
+				 "its output is cheaper to convert than its inputs and its operators");
+	}
 	elog(DEBUG1, "gg_duckdb: plan node %d: region [%s], %.0f estimated input rows",
 		 plan->plan_node_id, spec.label, spec.rows_in);
 	return make_region(ctx, plan, &spec);

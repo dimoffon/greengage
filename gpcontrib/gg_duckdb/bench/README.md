@@ -21,6 +21,10 @@ published TPC-H numbers.  Decimal columns are narrow (`numeric(12,2)` prices,
 `queries/` holds TPC-H Q1, Q3, Q4, Q5, Q6, Q10, Q12, Q13, Q14, Q18 and Q19 with
 the spec's validation parameters (Q18's threshold lowered for the generator's
 quantities), and two local queries over the co-located `orders`/`lineitem`
-pair.  Each is run under `gg_duckdb.mode = off`, `force` and `auto`; the
-report shows the median of the runs, the number of DuckDB regions in the forced
-plan, and the off/force speedup.
+pair.  Each is run under `gg_duckdb.mode = off`, `force`, `auto` and `auto`
+with `gg_duckdb.cost_boundary = off` (`whole_ms`: the gate judging every
+eligible region whole, as it did before the boundary was cost-chosen); the
+report shows the median of the runs, the number of DuckDB regions in the
+forced plan, and the speedups off/force and off/auto.  With `-c` the gate's
+estimates follow each query, one line per candidate and one per subtree the
+executor keeps under it.

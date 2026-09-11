@@ -81,8 +81,10 @@ Motion leaf is allowed only when the region has no external params. Executor par
 are bound as DuckDB parameters when the query starts, and a rescan binds them again
 into the kept prepared statement. The gate needs at least one join/aggregate/sort/unique operator, a minimum row
 count, and a PostgreSQL-unit cost model over per-segment row estimates (ORCA's
-`total_cost` is in ORCA units and is not compared); `gg_duckdb.mode = force` bypasses
-the gate, never eligibility.
+`total_cost` is in ORCA units and is not compared); the same model draws the region's
+boundary, each node of the candidate subtree choosing between being an interior operator
+and a leaf the executor runs (see the boundary findings); `gg_duckdb.mode = force`
+bypasses the gate, never eligibility, and takes eligible regions whole.
 
 **D5 — Memory budgeted up front.** The region is memory-intensive/blocking for
 `memquota.c` through two new `CustomScan.flags` bits, so it receives a Sort-like share
@@ -154,6 +156,89 @@ isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed
 deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
 page reading.
+
+## Boundary and calibration findings (2026-09-11)
+
+- **The region's boundary is chosen by cost.** The gate used to judge each candidate
+  subtree as a whole: the deparser built the maximal region rooted at a node and the pass
+  accepted or declined it, so a join that filters a large table through a small one (Q3,
+  Q5, Q10, the local top-N join) dragged the aggregate above it down with it, and `auto`
+  fell back to the standard executor for the whole subtree. Now, under `mode = auto`, the
+  deparser tries every interior-capable node as an interior first and then asks whether
+  the executor should keep it instead: the attempt's cost is the conversion of the leaves
+  it took plus the balance of the operators it moved to DuckDB (each operator counts
+  `op * ((1 + margin) * factor - 1)`, negative when DuckDB is cheaper), the alternative is
+  the conversion of the node's own output; when the leaf is cheaper the attempt is undone
+  (the same undo the Result fallback of M6 used, generalised: leaves, parameters, readers,
+  aliases, estimates) and the node becomes a leaf the executor runs. The objective is
+  additive over the tree, so the bottom-up choice is the optimum of the model, and with
+  no cut the decision reduces exactly to the old gate. The base of a region is never a
+  leaf unless a Sort or Unique above it keeps the region worth having; hints see the
+  maximal shape (a `DuckDB()` hint forces it whole, a `NoDuckDB()` hint forbids by its
+  scans), so under a hint nothing changes. `gg_duckdb.cost_boundary` (on) switches it;
+  `explain_decisions` reports each kept subtree, and the two costs behind the choice go
+  to the DEBUG1 log with the gate's other estimates (`bench/run.sh -c` prints them per
+  candidate). `min_rows` drops to 10000: a region over a join's output is
+  legitimately smaller than the join's input, and the fixed cost is modelled.
+- **The first benchmark of the boundary was flat, and the reasons were in the model
+  and in the harness, not in the mechanism.** With the M4 constants the boundary carved
+  `Limit Sort Agg` regions over the executor's join for l02 and Q3 and they measured as
+  a wash and a 4% loss. Three things were wrong. `bench/run.sh` timed each query in a
+  fresh session, so every DuckDB run paid the ~30 ms opening of the instance on each QE
+  that `off` never paid (the runner now warms the session first; warm, those two regions
+  win 7% and 3%). The bounded-sort cost took cost_sort's `n * log2(2N)` comparisons,
+  eight times what a top-10 heap over 185k rows does (now `n + N ln(n/N) log2 N`). And the
+  conversion and aggregate constants were fitted on 13 queries rather than measured, which
+  the next item corrects.
+- **Per-value costs, measured** (identity regions over lineitem, 2M rows per segment,
+  planner units at about 15 us each): converting a fixed-width value costs 10-17 ns in
+  either direction, a text 21 ns in and 130 ns out, a numeric 75 ns in and 380 ns out
+  (both go through `numeric_out`/`numeric_in` text: the obvious follow-up is a direct
+  digit conversion), the row itself about 6 ns; a region's fixed cost in a warm session is
+  3-4 ms (`cost_fixed` 200). On the executor's side, a numeric operator costs 130 ns
+  (3.5x `cpu_operator_cost`), a numeric aggregate transition 46 ns in a plain aggregate
+  and 250 ns in a hashed one with 500k groups (its state is reallocated per row), and a
+  group key 45 ns at 10k groups to 140 ns at 500k. The deparser now charges conversion
+  per column and direction, only for the leaf columns the region references (DuckDB
+  projects only those into `gg_leaf`; ORCA's scans carry the whole physical target list),
+  counts the operators of every expression it deparses (aggregate arguments per input
+  row), and weights numeric aggregates and group keys by `log2(groups)`. The constants
+  are in `deparse.c` next to the measurements; `cost_convert_factor` scales the
+  conversion side for another host. Why it matters: a 2M-row hash aggregate with a
+  numeric sum over 500k groups costs the executor 830 ms and DuckDB 250 ms including
+  conversion (C5 in the notes), a 2.3x win the old model declined as a loss, which is
+  exactly the Q18 miss under the Postgres planner.
+- **Benchmark** (`bench/`, SF 1, 3 primaries, medians of 3, warm sessions, ms; `whole`
+  is `auto` with `cost_boundary` off, the speedups are off/force and off/auto):
+
+  | query | what the region covers | ORCA off | force | auto | whole | off/auto | planner off | force | auto | whole | off/auto |
+  |---|---|---|---|---|---|---|---|---|---|---|---|
+  | q01 | 8 numeric aggregates over 2M rows/segment | 1625 | 1163 | 1173 | 1173 | 1.39 | 1579 | 1119 | 1117 | 1107 | 1.41 |
+  | q04 | semi join + count | 663 | 375 | 389 | 393 | 1.70 | 360 | 346 | 368 | 369 | 0.98 |
+  | q13 | left join, count, count of counts | 383 | 218 | 482 | 219 | 0.79 | 336 | 196 | 194 | 195 | 1.73 |
+  | q18 | join + large group-by (planner: two joins + the aggregate) | 1578 | 1084 | 953 | 948 | 1.66 | 1633 | 974 | 868 | 857 | 1.88 |
+  | l01 | co-located join + 5 aggregates (agg over the executor's join) | 886 | 898 | 896 | 877 | 0.99 | 763 | 860 | 752 | 749 | 1.01 |
+  | l02 | co-located join, 77k groups, top-50 (agg + top-N over the executor's join) | 402 | 583 | 388 | 406 | 1.04 | 331 | 547 | 316 | 341 | 1.04 |
+  | q03 | 3-way join, top-10 (agg + top-N over the executor's join) | 462 | 549 | 462 | 439 | 1.00 | 408 | 485 | 405 | 393 | 1.01 |
+  | q10 | 3-way join, 7 group columns, top-20 (cut region) | 450 | 484 | 447 | 428 | 1.01 | 333 | 440 | 342 | 360 | 0.98 |
+  | q12 | join + CASE sums | 357 | 380 | 370 | 378 | 0.96 | 320 | 345 | 330 | 356 | 0.97 |
+  | q05 | 6-way join, 9 groups (declined) | 470 | 784 | 495 | 471 | 0.95 | 344 | 651 | 341 | 349 | 1.01 |
+  | q06 | filtered sum over 150k rows (declined) | 244 | 258 | 246 | 246 | 0.99 | 240 | 243 | 223 | 226 | 1.07 |
+  | q14 | join under a CASE the region declines (declined) | 271 | 287 | 271 | 270 | 1.00 | 228 | 265 | 232 | 238 | 0.98 |
+  | q19 | join with OR-of-IN predicates (declined) | 337 | 346 | 324 | 336 | 1.04 | 296 | 314 | 302 | 284 | 0.98 |
+
+  The q13 `auto` outlier under ORCA (482) is a host hiccup: the plan is the same as under
+  `whole`, and six consecutive warm runs right after measured 157-216 ms. Under the
+  Postgres planner q04's region is a 20k-row aggregate over the executor's semi join,
+  accepted by 7% of the estimate and a wash in practice.
+
+- **What the boundary buys, honestly.** On this set the losing whole-join regions are
+  declined as before; the boundary adds small wins where an aggregate or top-N sits over
+  a selective join (l02, Q3, Q10, Q12) and prunes the rest faster. The large wins stay
+  the aggregate-heavy and semi/anti-join regions, and the largest single change on this
+  set comes from the measured aggregate costs (Q18 under the planner), not from the
+  boundary. Regions that output many numeric or text rows stay expensive until the
+  output conversion is fixed.
 
 ## M7 findings (2026-09-10)
 
@@ -328,7 +413,9 @@ page reading.
 - **`mode` default.** Still `off`. The gate is calibrated on one host and one data
   set, and D5's accounting is coarse; both are what a default needs before it flips.
   `auto` is the evaluation setting, and every benchmark query of M4 runs within noise
-  of the better engine under it.
+  of the better engine under it. (The 2026-09-11 recalibration
+  replaced the fitted constants with measured ones and made the boundary cost-chosen;
+  see the boundary findings.)
 
 ## M5 findings (2026-09-09)
 

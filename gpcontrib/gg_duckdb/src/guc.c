@@ -26,7 +26,7 @@ char	   *gg_duckdb_max_temp_directory_size = NULL;
 bool		gg_duckdb_release_instance_at_end = false;
 int			gg_duckdb_debug_wrap = GG_DUCKDB_WRAP_OFF;
 char	   *gg_duckdb_debug_region_sql = NULL;
-int			gg_duckdb_min_rows = 100000;
+int			gg_duckdb_min_rows = 10000;
 bool		gg_duckdb_explain_decisions = false;
 bool		gg_duckdb_validate_at_plan_time = true;
 bool		gg_duckdb_on_coordinator = false;
@@ -35,11 +35,11 @@ bool		gg_duckdb_strict = false;
 char	   *gg_duckdb_data_directories = NULL;
 char	   *gg_duckdb_http_proxy = NULL;
 bool		gg_duckdb_allow_float_aggregates = false;
-double		gg_duckdb_cost_fixed = 50.0;
-double		gg_duckdb_cost_convert_row = 0.001;
-double		gg_duckdb_cost_convert_byte = 0.0003;
+double		gg_duckdb_cost_fixed = 200.0;
+double		gg_duckdb_cost_convert_factor = 1.0;
 double		gg_duckdb_cost_op_factor = 0.25;
 double		gg_duckdb_cost_margin = 0.25;
+bool		gg_duckdb_cost_boundary = true;
 
 static const struct config_enum_entry gg_duckdb_debug_wrap_options[] =
 {
@@ -137,7 +137,7 @@ gg_duckdb_define_gucs(void)
 							"Estimated rows a region must take in before mode=auto uses DuckDB for it.",
 							NULL,
 							&gg_duckdb_min_rows,
-							100000, 0, INT_MAX,
+							10000, 0, INT_MAX,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
@@ -189,27 +189,18 @@ gg_duckdb_define_gucs(void)
 
 	DefineCustomRealVariable("gg_duckdb.cost_fixed",
 							 "Cost gate: fixed cost of a region (preparing and starting a DuckDB query), in planner cost units.",
-							 NULL,
+							 "About 3 ms of executor time per region on the calibration host.",
 							 &gg_duckdb_cost_fixed,
-							 50.0, 0.0, 1e9,
+							 200.0, 0.0, 1e9,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomRealVariable("gg_duckdb.cost_convert_row",
-							 "Cost gate: cost of converting one row into or out of DuckDB, in planner cost units.",
-							 NULL,
-							 &gg_duckdb_cost_convert_row,
-							 0.001, 0.0, 1e9,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomRealVariable("gg_duckdb.cost_convert_byte",
-							 "Cost gate: cost of converting one byte into or out of DuckDB, in planner cost units.",
-							 NULL,
-							 &gg_duckdb_cost_convert_byte,
-							 0.0003, 0.0, 1e9,
+	DefineCustomRealVariable("gg_duckdb.cost_convert_factor",
+							 "Cost gate: scales the measured cost of converting values into and out of DuckDB.",
+							 "The per-type constants (a fixed-width value, a numeric, a text, in each direction) are measured on the calibration host; raise the factor on a host where conversion is slower relative to the executor.",
+							 &gg_duckdb_cost_convert_factor,
+							 1.0, 0.0, 1e9,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -228,6 +219,15 @@ gg_duckdb_define_gucs(void)
 							 NULL,
 							 &gg_duckdb_cost_margin,
 							 0.25, 0.0, 1e9,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.cost_boundary",
+							 "Cost gate: let the gate choose where a region ends.",
+							 "A subtree whose output is cheaper to convert than its inputs, given what DuckDB would save on its operators, stays with the standard executor as a leaf of the region above it; off takes every eligible region whole.",
+							 &gg_duckdb_cost_boundary,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

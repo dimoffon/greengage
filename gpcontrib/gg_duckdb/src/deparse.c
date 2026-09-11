@@ -57,6 +57,8 @@ typedef struct NodeCols
 {
 	int			ncols;
 	GGTypeInfo *types;
+	Plan	   *leaf;			/* the node when it is a converted leaf, else NULL */
+	bool	   *used;			/* of a leaf: columns the parent's expressions reference */
 } NodeCols;
 
 typedef struct DeparseCtx
@@ -68,6 +70,15 @@ typedef struct DeparseCtx
 	NodeCols   *inner;			/* columns of the inner child (joins), or NULL */
 	const char *inner_alias;
 	bool		in_agg;			/* Aggrefs are allowed (Agg tlist / HAVING) */
+	int			depth;			/* interior nodes above the one being deparsed */
+	bool		root_cuttable;	/* a Sort or Unique above the base keeps a region worth having */
+
+	/* operators deparsed so far, for the executor's expression cost */
+	double		nops;			/* operators and functions */
+	double		nops_numeric;	/* of those, on numerics */
+	double		arg_ops;		/* the same, inside aggregate arguments */
+	double		arg_ops_numeric;
+	double		proj_rows_in;	/* rows the node being projected reads, set by its deparser */
 
 	/* Vars of a natively read foreign table (varno = its range table index) */
 	Index		scan_relid;
@@ -86,6 +97,20 @@ typedef struct DeparseCtx
 
 static bool deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols);
 static bool deparse_expr(DeparseCtx *ctx, Node *node, StringInfo out, GGTypeInfo *type);
+
+/* Operators counted before a stretch of expressions, to charge them afterwards. */
+typedef struct OpCounts
+{
+	double		nops;
+	double		nops_numeric;
+	double		arg_ops;
+	double		arg_ops_numeric;
+} OpCounts;
+
+static double rows_of(Plan *plan);
+static void charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all);
+static void ops_begin(DeparseCtx *ctx, OpCounts *c);
+static void ops_charge(DeparseCtx *ctx, OpCounts *c, double rows, double rows_in);
 
 /* ---------- small helpers ---------- */
 
@@ -269,11 +294,22 @@ deparse_var(DeparseCtx *ctx, Var *var, StringInfo out, GGTypeInfo *type)
 	if (var->varlevelsup != 0)
 		REJECT(ctx, "outer-level Var");
 	*type = cols->types[var->varattno - 1];
+	if (cols->used != NULL)
+		cols->used[var->varattno - 1] = true;
 	if (alias)
 		appendStringInfo(out, "%s.c%d", alias, (int) var->varattno);
 	else
 		appendStringInfo(out, "c%d", (int) var->varattno);
 	return true;
+}
+
+/* An operator or function the node evaluates: counted for the executor's cost. */
+static void
+count_op(DeparseCtx *ctx, Oid resulttype, Oid argtype)
+{
+	ctx->nops += 1;
+	if (resulttype == NUMERICOID || argtype == NUMERICOID)
+		ctx->nops_numeric += 1;
 }
 
 /*
@@ -326,6 +362,7 @@ deparse_opexpr(DeparseCtx *ctx, OpExpr *op, StringInfo out, GGTypeInfo *type)
 
 	if (list_length(op->args) != 2 && list_length(op->args) != 1)
 		REJECT(ctx, "operator with %d arguments", list_length(op->args));
+	count_op(ctx, op->opresulttype, exprType((Node *) linitial(op->args)));
 	/* numeric arithmetic has no typmod: its DECIMAL shape follows from the operands */
 	if (op->opresulttype != NUMERICOID && !map_type(ctx, op->opresulttype, -1, type))
 		return false;
@@ -486,6 +523,7 @@ deparse_funcexpr(DeparseCtx *ctx, FuncExpr *f, StringInfo out, GGTypeInfo *type)
 		REJECT(ctx, "set-returning function");
 	if (!map_type(ctx, f->funcresulttype, -1, type))
 		return false;
+	count_op(ctx, f->funcresulttype, argtype);
 
 	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(f->funcid));
 	if (!HeapTupleIsValid(tup))
@@ -620,10 +658,17 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	else
 	{
 		TargetEntry *te = (TargetEntry *) linitial(agg->args);
+		double		ops0 = ctx->nops;
+		double		num0 = ctx->nops_numeric;
 
 		argtype = exprType((Node *) te->expr);
 		if (!deparse_expr(ctx, (Node *) te->expr, &a, &ta))
 			return false;
+		/* the argument is evaluated once per input row, not per group */
+		ctx->arg_ops += ctx->nops - ops0;
+		ctx->arg_ops_numeric += ctx->nops_numeric - num0;
+		ctx->nops = ops0;
+		ctx->nops_numeric = num0;
 	}
 
 	/*
@@ -1388,6 +1433,8 @@ deparse_native_leaf(DeparseCtx *ctx, ForeignScan *fs, StringInfo out, NodeCols *
 	ctx->spec->natives = lappend(ctx->spec->natives, nl);
 	ctx->spec->rows_in += fs->scan.plan.plan_rows;
 	ctx->spec->rows_native += fs->scan.plan.plan_rows;
+	cols->leaf = NULL;
+	cols->used = NULL;
 	appendStringInfo(out, "%s FROM (%s) AS n0", proj.data, ns.sql);
 	return true;
 }
@@ -1415,6 +1462,9 @@ deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 											exprTypmod((Node *) te->expr)));
 		k++;
 	}
+	/* the conversion is charged by the parent, for the columns it uses */
+	cols->leaf = plan;
+	cols->used = palloc0(sizeof(bool) * Max(cols->ncols, 1));
 	ctx->spec->leaves = lappend(ctx->spec->leaves, plan);
 	ctx->spec->rows_in += plan->plan_rows;
 	ctx->spec->bytes_in += plan->plan_rows * Max(plan->plan_width, 1);
@@ -1443,6 +1493,8 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
 	int			k = 0;
 	bool		ok = true;
 
+	OpCounts	c0;
+
 	ctx->child = outer;
 	ctx->outer_alias = outer_alias;
 	ctx->inner = inner;
@@ -1450,7 +1502,10 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
 	ctx->in_agg = is_agg;
 	cols->ncols = list_length(plan->targetlist);
 	cols->types = palloc0(sizeof(GGTypeInfo) * Max(cols->ncols, 1));
+	cols->leaf = NULL;
+	cols->used = NULL;
 
+	ops_begin(ctx, &c0);
 	appendStringInfoString(out, "SELECT ");
 	if (cols->ncols == 0)
 		appendStringInfoString(out, "1 AS c1");
@@ -1468,6 +1523,8 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
 		appendStringInfo(out, " AS c%d", k + 1);
 		k++;
 	}
+	/* the target list: per output row, its aggregate arguments per input row */
+	ops_charge(ctx, &c0, rows_of(plan), ctx->proj_rows_in);
 	if (ok)
 	{
 		appendStringInfo(out, " FROM %s", from_clause);
@@ -1489,6 +1546,8 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
 					break;
 				}
 			}
+			/* a filter: per input row */
+			ops_charge(ctx, &c0, ctx->proj_rows_in, ctx->proj_rows_in);
 		}
 		if (ok && group_by != NULL)
 			appendStringInfoString(out, group_by);
@@ -1510,7 +1569,16 @@ deparse_projection(DeparseCtx *ctx, Plan *plan, const char *from_clause,
 					break;
 				}
 			}
+			/* HAVING: per group, its aggregate arguments per input row */
+			ops_charge(ctx, &c0, rows_of(plan), ctx->proj_rows_in);
 		}
+	}
+	if (ok)
+	{
+		/* the leaves this node reads: converting the columns it uses */
+		charge_leaf(ctx, outer, false);
+		if (inner != NULL)
+			charge_leaf(ctx, inner, false);
 	}
 	ctx->child = saved_child;
 	ctx->inner = saved_inner;
@@ -1545,40 +1613,308 @@ rows_of(Plan *plan)
 }
 
 /*
- * As cost_sort: comparisons of an in-memory sort, or of a bounded (top-N)
- * one when a LIMIT above it caps the output.
+ * As cost_sort for an in-memory sort.  A bounded (top-N) sort, a LIMIT above
+ * it capping the output, is a heap of N: every input row is compared with
+ * the heap's top and the few that enter (N * ln(n/N) of them) sift down,
+ * so its cost is nearly linear in the input.  cost_sort charges it
+ * n * log2(2N) comparisons, which overstates a top-10 over 185k rows
+ * eight-fold; measured, such a sort costs the executor 25-100 ns per input
+ * row, as this formula says.
  */
 static double
 sort_cost(double rows, double limit_rows)
 {
 	double		n = Max(rows, 2.0);
-	double		l = limit_rows > 0 && limit_rows < n ? Max(2.0 * limit_rows, 2.0) : n;
+	double		comparisons;
 
-	return 2.0 * cpu_operator_cost * n * log(l) / log(2.0);
+	if (limit_rows > 0 && limit_rows < n)
+	{
+		double		l = Max(limit_rows, 2.0);
+
+		comparisons = n + l * log(n / l) * log(l) / log(2.0);
+	}
+	else
+		comparisons = n * log(n) / log(2.0);
+	return 2.0 * cpu_operator_cost * comparisons;
 }
 
+/* ---------- measured costs (planner units; 1 unit is about 15 us here) ---------- */
+
+/*
+ * Converting a value between PostgreSQL and DuckDB, per value and direction,
+ * measured with identity regions over 2M rows per segment: a fixed-width
+ * value (integers, floats, dates, timestamps) costs 10-17 ns either way, a
+ * text 21 ns in and 130 ns out, a numeric 75 ns in (numeric_out and a parse)
+ * and 380 ns out (a decimal string and numeric_in), a numeric aggregate
+ * state about twice a numeric; the row itself 6 ns in and 3 ns out.
+ * gg_duckdb.cost_convert_factor scales all of them.
+ */
+#define CONV_ROW_IN			0.0004
+#define CONV_ROW_OUT		0.0002
+#define CONV_FIXED_IN		0.0007
+#define CONV_FIXED_OUT		0.0012
+#define CONV_NUMERIC_IN		0.005
+#define CONV_NUMERIC_OUT	0.025
+#define CONV_VARLENA_IN		0.0015
+#define CONV_VARLENA_OUT	0.009
+#define CONV_BYTE			0.00002
+
+/*
+ * The standard executor's cost of numeric work, relative to
+ * cpu_operator_cost (about 37 ns here), measured on lineitem: an arithmetic
+ * operator on numerics costs 130 ns (3.5x); a numeric aggregate transition
+ * 46 ns in a plain aggregate (1.2x) and 250 ns in a hashed one with 500k
+ * groups (6x: the state is reallocated per row); a group key 45 ns at 10k
+ * groups and 140 ns at 500k (cache misses).  The group-dependent weights
+ * grow with log2(groups), saturating at 2^19 groups.
+ */
+#define W_NUMERIC_OP			3.5
+#define W_NUMERIC_AGG_PLAIN		1.2
+#define W_NUMERIC_AGG_HASHED	6.0
+#define W_KEY_HASHED			4.0
+
+static double
+group_factor(double groups)
+{
+	if (groups <= 1.0)
+		return 0.0;
+	return Min(1.0, log(groups) / log(2.0) / 19.0);
+}
+
+/* The cost of converting one value of this type, into DuckDB or out of it. */
+static double
+value_conv_cost(const GGTypeInfo *ti, bool in)
+{
+	double		c;
+
+	if (ti->duck == DUCKDB_TYPE_STRUCT)
+		c = 2.0 * (in ? CONV_NUMERIC_IN : CONV_NUMERIC_OUT);
+	else
+		switch (ti->typid)
+		{
+			case NUMERICOID:
+				c = in ? CONV_NUMERIC_IN : CONV_NUMERIC_OUT;
+				break;
+			case TEXTOID:
+			case VARCHAROID:
+			case BPCHAROID:
+			case BYTEAOID:
+				c = (in ? CONV_VARLENA_IN : CONV_VARLENA_OUT) +
+					CONV_BYTE * get_typavgwidth(ti->typid, ti->typmod);
+				break;
+			default:
+				c = in ? CONV_FIXED_IN : CONV_FIXED_OUT;
+				break;
+		}
+	return c * gg_duckdb_cost_convert_factor;
+}
+
+/*
+ * Charge the conversion of a leaf child's rows: the columns the parent's
+ * expressions referenced (DuckDB projects only those into gg_leaf), or all
+ * of them when the parent takes the child's columns positionally.
+ */
+static void
+charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
+{
+	double		per_row = CONV_ROW_IN * gg_duckdb_cost_convert_factor;
+	int			k;
+
+	if (cols == NULL || cols->leaf == NULL)
+		return;
+	for (k = 0; k < cols->ncols; k++)
+		if (all || cols->used[k])
+			per_row += value_conv_cost(&cols->types[k], true);
+	ctx->spec->conv_in += rows_of(cols->leaf) * per_row;
+	cols->leaf = NULL;			/* charged once */
+}
+
+/* The conversion of a node's whole output, were it a leaf; -1 when a column is not carried. */
+static double
+plan_conv_cost(Plan *plan)
+{
+	double		per_row = CONV_ROW_IN * gg_duckdb_cost_convert_factor;
+	int			ncols = list_length(plan->targetlist);
+	int			k;
+
+	for (k = 0; k < ncols; k++)
+	{
+		GGTypeInfo	ti;
+
+		if (!gg_duckdb_leaf_column_type(plan, k, &ti))
+			return -1.0;
+		per_row += value_conv_cost(&ti, true);
+	}
+	return rows_of(plan) * per_row;
+}
+
+static void
+ops_begin(DeparseCtx *ctx, OpCounts *c)
+{
+	c->nops = ctx->nops;
+	c->nops_numeric = ctx->nops_numeric;
+	c->arg_ops = ctx->arg_ops;
+	c->arg_ops_numeric = ctx->arg_ops_numeric;
+}
+
+/*
+ * As cost_qual_eval: cpu_operator_cost per operator per row, numerics
+ * weighted; operators inside aggregate arguments run per input row.
+ */
+static void
+ops_charge(DeparseCtx *ctx, OpCounts *c, double rows, double rows_in)
+{
+	double		ops = (ctx->nops - c->nops) +
+		(ctx->nops_numeric - c->nops_numeric) * (W_NUMERIC_OP - 1.0);
+	double		arg_ops = (ctx->arg_ops - c->arg_ops) +
+		(ctx->arg_ops_numeric - c->arg_ops_numeric) * (W_NUMERIC_OP - 1.0);
+
+	ctx->spec->op_cost += cpu_operator_cost * (ops * rows + arg_ops * rows_in);
+	ops_begin(ctx, c);
+}
+
+/* ---------- the cost model's share of the boundary ---------- */
+
+/*
+ * The gate (pass.c) accepts a region when
+ *
+ *   (cost_fixed + op_cost * cost_op_factor + conversion) * (1 + cost_margin) < op_cost
+ *
+ * with op_cost the standard executor's estimate for the operators the region
+ * takes over and conversion the cost of the values crossing into and out of
+ * DuckDB.  Relative to leaving everything with the executor, an interior
+ * operator therefore counts op * ((1 + margin) * factor - 1), negative when
+ * DuckDB is the cheaper engine, and every conversion (1 + margin) times its
+ * cost.  Both terms add up over the subtree, which is what lets each node
+ * choose for itself (executor_keeps).
+ */
+static double
+operator_balance(double op_cost)
+{
+	return op_cost * ((1.0 + gg_duckdb_cost_margin) * gg_duckdb_cost_op_factor - 1.0);
+}
+
+/*
+ * What an attempt at deparsing a node as interior must be able to undo: the
+ * leaves, parameters, readers and cuts it collected, the aliases it drew and
+ * the estimates it took.
+ */
+typedef struct DeparseAttempt
+{
+	GGRegionSpec spec;
+	DeparseCtx	ctx;
+	int			nleaves;
+	int			nparams;
+	int			nnatives;
+	int			ncuts;
+} DeparseAttempt;
+
+static void
+attempt_begin(DeparseCtx *ctx, DeparseAttempt *a)
+{
+	a->spec = *ctx->spec;
+	a->ctx = *ctx;
+	a->nleaves = list_length(ctx->spec->leaves);
+	a->nparams = list_length(ctx->spec->params);
+	a->nnatives = list_length(ctx->spec->natives);
+	a->ncuts = list_length(ctx->spec->cuts);
+}
+
+static void
+attempt_undo(DeparseCtx *ctx, DeparseAttempt *a)
+{
+	GGRegionSpec *spec = ctx->spec;
+
+	*spec = a->spec;
+	*ctx = a->ctx;
+	spec->leaves = list_truncate(spec->leaves, a->nleaves);
+	spec->params = list_truncate(spec->params, a->nparams);
+	spec->natives = list_truncate(spec->natives, a->nnatives);
+	spec->cuts = list_truncate(spec->cuts, a->ncuts);
+	spec->reject = NULL;
+}
+
+/*
+ * `plan` has just been deparsed as an interior node.  Would the region be
+ * cheaper with the executor running that subtree and the region reading its
+ * output through gg_leaf?  The attempt costs the conversion of the leaves it
+ * took (native readers convert nothing) plus the balance of the operators
+ * it moved to DuckDB, the children's own choices already made; the
+ * alternative costs the conversion of the node's output.  Ties keep the
+ * interior.  The base of a region is never a leaf, unless a Sort or Unique
+ * above it keeps the region worth having.
+ */
 static bool
-count_aggrefs_walker(Node *node, int *count)
+executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut)
+{
+	GGRegionSpec *spec = ctx->spec;
+	double		rows_in = (spec->rows_in - a->spec.rows_in) -
+		(spec->rows_native - a->spec.rows_native);
+	double		interior = (1.0 + gg_duckdb_cost_margin) * (spec->conv_in - a->spec.conv_in) +
+		operator_balance(spec->op_cost - a->spec.op_cost);
+	double		rows_out = rows_of(plan);
+	double		leaf = plan_conv_cost(plan);
+	GGRegionCut *c;
+
+	if (!spec->cost_boundary || leaf < 0)
+		return false;
+	leaf *= 1.0 + gg_duckdb_cost_margin;
+	if (leaf >= interior)
+		return false;
+	if (ctx->depth == 0 && !ctx->root_cuttable)
+		return false;
+	c = palloc0(sizeof(GGRegionCut));
+	c->plan = plan;
+	c->rows_out = rows_out;
+	c->leaf_cost = leaf;
+	c->rows_in = rows_in;
+	c->interior_cost = interior;
+	*cut = c;
+	return true;
+}
+
+typedef struct AggWeight
+{
+	double		f;				/* group_factor of the node */
+	double		weight;
+} AggWeight;
+
+static bool
+agg_weight_walker(Node *node, AggWeight *w)
 {
 	if (node == NULL)
 		return false;
 	if (IsA(node, Aggref))
 	{
-		(*count)++;
+		Aggref	   *agg = (Aggref *) node;
+		Oid			argtype = agg->args != NIL ?
+			exprType((Node *) ((TargetEntry *) linitial(agg->args))->expr) : InvalidOid;
+
+		if (argtype == NUMERICOID)
+			w->weight += W_NUMERIC_AGG_PLAIN + (W_NUMERIC_AGG_HASHED - W_NUMERIC_AGG_PLAIN) * w->f;
+		else
+			w->weight += 1.0;
 		return false;
 	}
-	return expression_tree_walker(node, count_aggrefs_walker, count);
+	return expression_tree_walker(node, agg_weight_walker, w);
 }
 
-/* The aggregates an Agg node evaluates, as cost_agg counts them. */
-static int
-count_aggrefs(Plan *plan)
+/*
+ * The per-input-row weight of an Agg node, as cost_agg counts one
+ * cpu_operator_cost per aggregate and per group key, with the measured
+ * weights of numeric aggregates and of grouping with many groups.
+ */
+static double
+agg_weight(Plan *plan, int numcols)
 {
-	int			count = 0;
+	AggWeight	w;
 
-	count_aggrefs_walker((Node *) plan->targetlist, &count);
-	count_aggrefs_walker((Node *) plan->qual, &count);
-	return Max(count, 1);
+	w.f = numcols > 0 ? group_factor(rows_of(plan)) : 0.0;
+	w.weight = 0.0;
+	agg_weight_walker((Node *) plan->targetlist, &w);
+	agg_weight_walker((Node *) plan->qual, &w);
+	w.weight = Max(w.weight, 1.0);
+	return w.weight + numcols * (1.0 + (W_KEY_HASHED - 1.0) * w.f);
 }
 
 static bool partition_selector_hazard(Plan *outer, Plan *inner);
@@ -1891,40 +2227,42 @@ static bool deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCo
 static bool
 deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
+	DeparseAttempt attempt;
+	StringInfoData sql;
+	GGRegionCut *cut = NULL;
+	bool		ok;
+
 	if (!node_is_interior_base(ctx, plan))
 		return deparse_leaf(ctx, plan, out, cols);
 
-	if (IsA(plan, Result))
+	/*
+	 * An interior node is tried first and undone when it does not pay: a
+	 * projection DuckDB cannot compute (a function outside the whitelist,
+	 * say) stays with the executor, and so does, when the cost model draws
+	 * the boundary, a subtree whose output is cheaper to convert than its
+	 * inputs, a join filtering a large input through a small one typically.
+	 * Either way the node becomes a leaf and the region goes on above it.
+	 * Any other failure rejects the region.
+	 */
+	attempt_begin(ctx, &attempt);
+	initStringInfo(&sql);
+	ctx->depth++;
+	ok = deparse_interior(ctx, plan, &sql, cols);
+	ctx->depth--;
+	if (ok && !executor_keeps(ctx, &attempt, plan, &cut))
 	{
-		/*
-		 * A projection DuckDB cannot compute (a function outside the
-		 * whitelist, say) stays with the executor: the Result becomes a
-		 * leaf and the region goes on above it.  The failed attempt is
-		 * undone first: the leaves, parameters and readers it collected,
-		 * the aliases and costs it took.
-		 */
-		GGRegionSpec saved_spec = *ctx->spec;
-		DeparseCtx	saved_ctx = *ctx;
-		int			nleaves = list_length(ctx->spec->leaves);
-		int			nparams = list_length(ctx->spec->params);
-		int			nnatives = list_length(ctx->spec->natives);
-		StringInfoData attempt;
-
-		initStringInfo(&attempt);
-		if (deparse_interior(ctx, plan, &attempt, cols))
-		{
-			appendBinaryStringInfo(out, attempt.data, attempt.len);
-			return true;
-		}
-		*ctx->spec = saved_spec;
-		*ctx = saved_ctx;
-		ctx->spec->leaves = list_truncate(ctx->spec->leaves, nleaves);
-		ctx->spec->params = list_truncate(ctx->spec->params, nparams);
-		ctx->spec->natives = list_truncate(ctx->spec->natives, nnatives);
-		ctx->spec->reject = NULL;
-		return deparse_leaf(ctx, plan, out, cols);
+		appendBinaryStringInfo(out, sql.data, sql.len);
+		return true;
 	}
-	return deparse_interior(ctx, plan, out, cols);
+	if (!ok && !IsA(plan, Result))
+		return false;
+	attempt_undo(ctx, &attempt);
+	if (cut != NULL)
+	{
+		ctx->spec->ncuts++;
+		ctx->spec->cuts = lappend(ctx->spec->cuts, cut);
+	}
+	return deparse_leaf(ctx, plan, out, cols);
 }
 
 static bool
@@ -1994,6 +2332,7 @@ deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 					return false;
 				plan->qual = lappend(list_copy(plan->qual), r->resconstantqual);
 				from = subquery_from(ctx, child_sql.data, &alias);
+				ctx->proj_rows_in = rows_of(child);
 				ok = deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 				plan->qual = saved_qual;
 				ctx->spec->ninterior++;
@@ -2003,6 +2342,7 @@ deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			ctx->spec->ninterior++;
 			add_op_cost(ctx, cpu_tuple_cost * rows_of(child));
 			from = subquery_from(ctx, child_sql.data, &alias);
+			ctx->proj_rows_in = rows_of(child);
 			return deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL, NULL, false, out, cols);
 		}
 		else
@@ -2029,12 +2369,12 @@ deparse_interior(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 			}
 			ctx->spec->ninterior++;
 			ctx->spec->naggs++;
-			/* as cost_agg: one operator per input row per aggregate and group key */
-			add_op_cost(ctx, cpu_operator_cost * rows_of(child) *
-						(count_aggrefs(plan) + agg->numCols) +
+			/* as cost_agg, per input row per aggregate and group key, weighted */
+			add_op_cost(ctx, cpu_operator_cost * rows_of(child) * agg_weight(plan, agg->numCols) +
 						cpu_tuple_cost * rows_of(plan) +
 						(agg->aggstrategy == AGG_SORTED && agg->numCols > 0 ?
 						 sort_cost(rows_of(child), 0) : 0.0));
+			ctx->proj_rows_in = rows_of(child);
 			if (!deparse_projection(ctx, plan, from, &childcols, alias, NULL, NULL,
 									agg->numCols > 0 ? gb.data : NULL, true, out, cols))
 				return false;
@@ -2154,6 +2494,7 @@ deparse_join(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 						cpu_tuple_cost * irows);
 		add_op_cost(ctx, cpu_tuple_cost * rows_of(plan));
 	}
+	ctx->proj_rows_in = rows_of(plan);
 	return deparse_projection(ctx, plan, from.data, &ocols, oalias, &icols, ialias,
 							  NULL, false, out, cols);
 }
@@ -2182,6 +2523,7 @@ deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols)
 		initStringInfo(&csql);
 		if (!deparse_base(ctx, child, &csql, &ccols))
 			return false;
+		charge_leaf(ctx, &ccols, true);	/* UNION ALL takes every column */
 		if (have_first)
 		{
 			int			i;
@@ -2205,6 +2547,7 @@ deparse_append(DeparseCtx *ctx, Append *ap, StringInfo out, NodeCols *cols)
 	ctx->spec->ninterior++;
 	add_op_cost(ctx, cpu_tuple_cost * 0.5 * rows_of((Plan *) ap));
 	from = subquery_from(ctx, u.data, &alias);
+	ctx->proj_rows_in = rows_of((Plan *) ap);
 	return deparse_projection(ctx, (Plan *) ap, from, &first, alias, NULL, NULL,
 							  NULL, false, out, cols);
 }
@@ -2304,6 +2647,10 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->njoins = 0;
 	spec->agg_order = NULL;
 	spec->ordered = false;
+	spec->ncuts = 0;
+	spec->cuts = NIL;
+	spec->conv_in = 0;
+	spec->conv_out = 0;
 
 	/* the top chain: [Limit] [Unique] [Sort], Materials in between are transparent */
 	for (;;)
@@ -2346,8 +2693,11 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 		REJECT(&ctx, "top chain node changes the column list");
 
 	initStringInfo(&base_sql);
+	ctx.depth = 0;
+	ctx.root_cuttable = (uniq != NULL || sort != NULL);
 	if (!deparse_base(&ctx, node, &base_sql, &cols))
 		return false;
+	charge_leaf(&ctx, &cols, true);	/* a leaf base under the top chain: every column */
 	if (limit == NULL && uniq == NULL && sort == NULL && spec->ninterior == 0)
 	{
 		if (IsA(node, HashJoin) || IsA(node, MergeJoin) || IsA(node, NestLoop))
@@ -2411,6 +2761,13 @@ gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec *spec)
 	spec->sql = sql.data;
 	spec->rows_out = rows_of(root);
 	spec->bytes_out = spec->rows_out * Max(root->plan_width, 1);
+	{
+		double		per_row = CONV_ROW_OUT * gg_duckdb_cost_convert_factor;
+
+		for (i = 0; i < cols.ncols; i++)
+			per_row += value_conv_cost(&cols.types[i], false);
+		spec->conv_out = spec->rows_out * per_row;
+	}
 	spec->nleaves = list_length(spec->leaves);
 	spec->ncols = cols.ncols;
 	spec->outtypes = cols.types;

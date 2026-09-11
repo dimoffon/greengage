@@ -98,12 +98,12 @@ NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT
 
 SET gg_duckdb.explain_decisions = off;
 -- results equal the plain plan: materialise both and compare both ways
-CREATE OR REPLACE FUNCTION d_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION d_check(q text, m text DEFAULT 'force') RETURNS text LANGUAGE plpgsql AS $$
 DECLARE missing bigint; extra bigint;
 BEGIN
   SET LOCAL gg_duckdb.mode = off;
   EXECUTE 'CREATE TEMP TABLE d_base AS ' || q;
-  SET LOCAL gg_duckdb.mode = force;
+  EXECUTE 'SET LOCAL gg_duckdb.mode = ' || m;
   EXECUTE 'CREATE TEMP TABLE d_duck AS ' || q;
   SET LOCAL gg_duckdb.mode = off;
   EXECUTE 'SELECT count(*) FROM (TABLE d_base EXCEPT ALL TABLE d_duck) x' INTO missing;
@@ -198,10 +198,10 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307487)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=3129987)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2307487)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=3129987)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -230,7 +230,7 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
  Optimizer: GPORCA
 (8 rows)
 
-SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_row = 0; SET gg_duckdb.cost_convert_byte = 0;
+SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_factor = 0;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
                 QUERY PLAN                
 ------------------------------------------
@@ -242,7 +242,88 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 (5 rows)
 
 RESET gg_duckdb.min_rows;
-RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_row; RESET gg_duckdb.cost_convert_byte;
+RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_factor;
+-- the boundary: the gate ends a region above a subtree whose output is
+-- cheaper to convert than its inputs.  A join filtering a large table
+-- through a small one stays with the executor and the aggregates above it
+-- are the region; with the boundary off the maximal region (join and
+-- aggregates) is judged as a whole and declined.  The costs are the
+-- measured defaults but for a small fixed cost.
+CREATE TABLE d_dim (id int, grp int, name text) DISTRIBUTED BY (id);
+INSERT INTO d_dim SELECT i, i % 5, 'dim ' || i FROM generate_series(0, 96) i;
+ANALYZE d_dim;
+SET gp_enable_multiphase_agg = on;
+SET gg_duckdb.mode = auto;
+SET gg_duckdb.min_rows = 0;
+SET gg_duckdb.cost_fixed = 5;
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF)
+SELECT d.id, count(*), sum(o.qty), sum(o.amount), min(o.id), max(o.id), max(o.big), max(o.ts)
+  FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id;
+NOTICE:  gg_duckdb: Agg (plan node 1): the cost gate prefers the standard executor
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c6 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c2) AS BIGINT) AS c3, struct_pack(s := CAST(sum(n1.c3) AS DECIMAL(38,2)), n := count(n1.c3)) AS c4, CAST(min(n1.c1) AS INTEGER) AS c5, CAST(max(n1.c1) AS INTEGER) AS c6, CAST(max(n1.c5) AS BIGINT) AS c7, CAST(max(n1.c4) AS TIMESTAMP) AS c8 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c6) AS n2
+NOTICE:  gg_duckdb: HashJoin (plan node 5): kept by the executor as a leaf of that region: its output is cheaper to convert than its inputs and its operators
+NOTICE:  gg_duckdb: HashJoin (plan node 5): the cost gate prefers the standard executor
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: gg_duckdb_region.id
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region.id
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     ->  Hash Join
+                           Hash Cond: (o.cust = d.id)
+                           ->  Seq Scan on d_orders o
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on d_dim d
+                                             Filter: (grp = 1)
+ Optimizer: GPORCA
+(15 rows)
+
+SET gg_duckdb.cost_boundary = off;
+EXPLAIN (COSTS OFF)
+SELECT d.id, count(*), sum(o.qty), sum(o.amount), min(o.id), max(o.id), max(o.big), max(o.ts)
+  FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id;
+NOTICE:  gg_duckdb: Agg (plan node 1): the cost gate prefers the standard executor
+NOTICE:  gg_duckdb: Agg (plan node 4): the cost gate prefers the standard executor
+NOTICE:  gg_duckdb: HashJoin (plan node 5): the cost gate prefers the standard executor
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: d.id
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d.id
+               ->  Streaming Partial HashAggregate
+                     Group Key: d.id
+                     ->  Hash Join
+                           Hash Cond: (o.cust = d.id)
+                           ->  Seq Scan on d_orders o
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on d_dim d
+                                             Filter: (grp = 1)
+ Optimizer: GPORCA
+(15 rows)
+
+RESET gg_duckdb.cost_boundary;
+SET gg_duckdb.explain_decisions = off;
+-- results equal the plain plan with the executor's join as the region's leaf
+SELECT d_check($q$ SELECT d.id, count(*) AS n, sum(o.qty) AS s1, sum(o.amount) AS s2, min(o.id) AS mn, max(o.id) AS mx, max(o.big) AS mb, max(o.ts) AS mt
+                   FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id $q$, 'auto');
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+SET gp_enable_multiphase_agg = off;
+DROP TABLE d_dim;
 -- a bad query never leaves the planner: plan-time validation declines it
 SET gg_duckdb.mode = force;
 SET gg_duckdb.explain_decisions = on;
@@ -289,5 +370,5 @@ RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;
 RESET gg_duckdb.mode;
-DROP FUNCTION d_check(text);
+DROP FUNCTION d_check(text, text);
 DROP TABLE d_orders;

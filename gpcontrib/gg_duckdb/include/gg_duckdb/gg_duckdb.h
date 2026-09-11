@@ -57,10 +57,10 @@ extern char *gg_duckdb_data_directories;
 extern char *gg_duckdb_http_proxy;
 extern bool gg_duckdb_allow_float_aggregates;
 extern double gg_duckdb_cost_fixed;
-extern double gg_duckdb_cost_convert_row;
-extern double gg_duckdb_cost_convert_byte;
+extern double gg_duckdb_cost_convert_factor;
 extern double gg_duckdb_cost_op_factor;
 extern double gg_duckdb_cost_margin;
+extern bool gg_duckdb_cost_boundary;
 
 extern void gg_duckdb_define_gucs(void);
 
@@ -337,9 +337,11 @@ typedef struct GGRegionSpec
 	const char *reject;			/* why the subtree is ineligible, or NULL */
 	double		rows_in;		/* estimated rows entering DuckDB */
 	double		bytes_in;		/* estimated bytes entering DuckDB */
+	double		conv_in;		/* planner-unit cost of converting the leaves' used columns */
 	double		op_cost;		/* PostgreSQL-unit cost of the interior operators */
 	double		rows_out;		/* estimated rows the region returns */
 	double		bytes_out;
+	double		conv_out;		/* planner-unit cost of converting the output */
 	double		parent_limit;	/* in: rows a Limit right above the root keeps, else 0 */
 	bool		rescanned;		/* the root has outer parameters: expect rescans */
 	int			ninterior;
@@ -351,7 +353,20 @@ typedef struct GGRegionSpec
 	List	   *natives;		/* of GGNativeLeaf: foreign tables DuckDB reads itself */
 	double		rows_native;	/* of rows_in, the rows DuckDB reads natively */
 	List	   *rtable;			/* in: the statement's range table */
+	bool		cost_boundary;	/* in: the cost model may end the region above a subtree */
+	int			ncuts;			/* out: subtrees the executor keeps as leaves */
+	List	   *cuts;			/* out: of GGRegionCut, for the decision log */
 } GGRegionSpec;
+
+/* A subtree the cost model left with the executor, and the numbers that decided it. */
+typedef struct GGRegionCut
+{
+	Plan	   *plan;
+	double		rows_out;		/* rows the executor hands the region */
+	double		leaf_cost;		/* gate units: converting that output */
+	double		rows_in;		/* rows the region would have converted instead */
+	double		interior_cost;	/* gate units: converting those, less DuckDB's gain on the operators */
+} GGRegionCut;
 
 /* A gg_duckdb foreign table as DuckDB reads it (fdw.c describes, deparse.c writes). */
 typedef struct GGNativeInfo

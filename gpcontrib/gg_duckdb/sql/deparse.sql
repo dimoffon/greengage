@@ -39,12 +39,12 @@ SELECT note, id FROM d_orders ORDER BY note COLLATE "C", id LIMIT 3;
 SET gg_duckdb.explain_decisions = off;
 
 -- results equal the plain plan: materialise both and compare both ways
-CREATE OR REPLACE FUNCTION d_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION d_check(q text, m text DEFAULT 'force') RETURNS text LANGUAGE plpgsql AS $$
 DECLARE missing bigint; extra bigint;
 BEGIN
   SET LOCAL gg_duckdb.mode = off;
   EXECUTE 'CREATE TEMP TABLE d_base AS ' || q;
-  SET LOCAL gg_duckdb.mode = force;
+  EXECUTE 'SET LOCAL gg_duckdb.mode = ' || m;
   EXECUTE 'CREATE TEMP TABLE d_duck AS ' || q;
   SET LOCAL gg_duckdb.mode = off;
   EXECUTE 'SELECT count(*) FROM (TABLE d_base EXCEPT ALL TABLE d_duck) x' INTO missing;
@@ -86,10 +86,40 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 SET gg_duckdb.min_rows = 0;
 -- ... and the cost gate must favour DuckDB; for a tiny input it does not
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders WHERE id < 30 GROUP BY id;
-SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_row = 0; SET gg_duckdb.cost_convert_byte = 0;
+SET gg_duckdb.cost_fixed = 0; SET gg_duckdb.cost_convert_factor = 0;
 EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
 RESET gg_duckdb.min_rows;
-RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_row; RESET gg_duckdb.cost_convert_byte;
+RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_factor;
+
+-- the boundary: the gate ends a region above a subtree whose output is
+-- cheaper to convert than its inputs.  A join filtering a large table
+-- through a small one stays with the executor and the aggregates above it
+-- are the region; with the boundary off the maximal region (join and
+-- aggregates) is judged as a whole and declined.  The costs are the
+-- measured defaults but for a small fixed cost.
+CREATE TABLE d_dim (id int, grp int, name text) DISTRIBUTED BY (id);
+INSERT INTO d_dim SELECT i, i % 5, 'dim ' || i FROM generate_series(0, 96) i;
+ANALYZE d_dim;
+SET gp_enable_multiphase_agg = on;
+SET gg_duckdb.mode = auto;
+SET gg_duckdb.min_rows = 0;
+SET gg_duckdb.cost_fixed = 5;
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF)
+SELECT d.id, count(*), sum(o.qty), sum(o.amount), min(o.id), max(o.id), max(o.big), max(o.ts)
+  FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id;
+SET gg_duckdb.cost_boundary = off;
+EXPLAIN (COSTS OFF)
+SELECT d.id, count(*), sum(o.qty), sum(o.amount), min(o.id), max(o.id), max(o.big), max(o.ts)
+  FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id;
+RESET gg_duckdb.cost_boundary;
+SET gg_duckdb.explain_decisions = off;
+-- results equal the plain plan with the executor's join as the region's leaf
+SELECT d_check($q$ SELECT d.id, count(*) AS n, sum(o.qty) AS s1, sum(o.amount) AS s2, min(o.id) AS mn, max(o.id) AS mx, max(o.big) AS mb, max(o.ts) AS mt
+                   FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id $q$, 'auto');
+RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+SET gp_enable_multiphase_agg = off;
+DROP TABLE d_dim;
 
 -- a bad query never leaves the planner: plan-time validation declines it
 SET gg_duckdb.mode = force;
@@ -107,5 +137,5 @@ RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;
 RESET gg_duckdb.mode;
-DROP FUNCTION d_check(text);
+DROP FUNCTION d_check(text, text);
 DROP TABLE d_orders;
