@@ -198,8 +198,11 @@ map_type(DeparseCtx *ctx, Oid typid, int32 typmod, GGTypeInfo *ti)
 }
 
 /*
- * A numeric constant has no typmod; its DECIMAL width and scale come from
- * its digits.
+ * An unconstrained numeric constant has no typmod; its DECIMAL width and
+ * scale come from its digits.  A constant with a typmod, such as
+ * cast(0 as decimal(7,2)), takes the typmod's shape like any other value of
+ * that type: the plan declares the column with it, and the region's output
+ * must match.
  */
 static void
 numeric_const_shape(const char *text, uint8 *width, uint8 *scale)
@@ -239,11 +242,17 @@ deparse_const(DeparseCtx *ctx, Const *c, StringInfo out, GGTypeInfo *type)
 
 		if (strcmp(text, "NaN") == 0)
 			REJECT(ctx, "numeric NaN constant");
-		memset(type, 0, sizeof(*type));
-		type->typid = NUMERICOID;
-		type->typmod = -1;
-		type->duck = DUCKDB_TYPE_DECIMAL;
-		numeric_const_shape(text, &type->width, &type->scale);
+		if (c->consttypmod < (int32) VARHDRSZ)
+		{
+			/* unconstrained: the DECIMAL shape comes from the digits */
+			memset(type, 0, sizeof(*type));
+			type->typid = NUMERICOID;
+			type->typmod = -1;
+			type->duck = DUCKDB_TYPE_DECIMAL;
+			numeric_const_shape(text, &type->width, &type->scale);
+		}
+		else if (!map_type(ctx, c->consttype, c->consttypmod, type))
+			return false;		/* the typmod's shape: it is what the plan declares the column as */
 	}
 	else if (!map_type(ctx, c->consttype, c->consttypmod, type))
 		return false;
@@ -1098,7 +1107,7 @@ expr_decimal_shape(Node *expr, Plan *child, int *width, int *scale)
 			{
 				Const	   *c = (Const *) expr;
 
-				if (c->consttype == NUMERICOID)
+				if (c->consttype == NUMERICOID && c->consttypmod < (int32) VARHDRSZ)
 				{
 					uint8		w,
 								sc;

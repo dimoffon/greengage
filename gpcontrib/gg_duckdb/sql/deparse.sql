@@ -133,6 +133,20 @@ EXPLAIN (COSTS OFF) SELECT upper(note) AS u, count(*), sum(qty) FROM d_orders GR
 SET gg_duckdb.explain_decisions = off;
 SELECT d_check($q$ SELECT upper(note) AS u, count(*) AS n, sum(qty) AS s FROM d_orders GROUP BY 1 $q$);
 
+-- a numeric constant with a typmod takes the typmod's shape, the one the plan
+-- declares its column with: a region outputs it as such, and a UNION ALL of
+-- the constant with a column of that type has children of one type
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF)
+SELECT id, cast(0 as decimal(12,2)) AS z, count(*) FROM d_orders WHERE id < 3000 GROUP BY id;
+EXPLAIN (COSTS OFF)
+SELECT id, sum(z), count(*) FROM (SELECT o.id, cast(0 as decimal(12,2)) AS z FROM d_orders o JOIN d_orders p ON o.id = p.id WHERE o.id < 100
+                                  UNION ALL SELECT id, amount FROM d_orders WHERE id < 200) u GROUP BY id;
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT id, cast(0 as decimal(12,2)) AS z, count(*) AS n FROM d_orders WHERE id < 3000 GROUP BY id $q$);
+SELECT d_check($q$ SELECT id, sum(z) AS s, count(*) AS n FROM (SELECT o.id, cast(0 as decimal(12,2)) AS z FROM d_orders o JOIN d_orders p ON o.id = p.id WHERE o.id < 100
+                                                              UNION ALL SELECT id, amount FROM d_orders WHERE id < 200) u GROUP BY id $q$);
+
 RESET gg_duckdb.explain_decisions;
 RESET gg_duckdb.validate_at_plan_time;
 RESET gp_enable_multiphase_agg;
