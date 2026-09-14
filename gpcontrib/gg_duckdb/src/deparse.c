@@ -276,9 +276,9 @@ deparse_var(DeparseCtx *ctx, Var *var, StringInfo out, GGTypeInfo *type)
 	NodeCols   *cols;
 	const char *alias;
 
-	if (ctx->scan_relid > 0 && var->varno == ctx->scan_relid)
+	if (ctx->scan_relid > 0 && (var->varno == ctx->scan_relid || var->varno == INDEX_VAR))
 	{
-		/* a column of the foreign table DuckDB reads natively */
+		/* a column of the foreign table DuckDB reads natively (its pushed quals refer to it as INDEX_VAR) */
 		if (var->varlevelsup != 0)
 			REJECT(ctx, "outer-level Var");
 		if (var->varattno < 1 || var->varattno > ctx->scan_natts ||

@@ -58,7 +58,7 @@ PG_FUNCTION_INFO_V1(gg_duckdb_fdw_handler);
 PG_FUNCTION_INFO_V1(gg_duckdb_fdw_validator);
 PG_FUNCTION_INFO_V1(gg_duckdb_foreign_files);
 
-#define GG_FDW_PRIVATE_VERSION	1
+#define GG_FDW_PRIVATE_VERSION	2
 
 static char *duck_literal(const char *s);
 static char *duck_ident(const char *s);
@@ -1230,6 +1230,32 @@ fdw_get_paths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	set_cheapest(baserel);
 }
 
+/*
+ * A pushed qual keeps its Vars as INDEX_VAR references: the scan's range
+ * table index is not settled when GetForeignPlan runs (the planner offsets a
+ * subquery's scans in setrefs, ORCA's translator renumbers the scan after
+ * building it), and fdw_private is not post-processed with the plan.
+ */
+static Node *
+scan_vars_to_index(Node *node, Index *scan_relid)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varlevelsup == 0 && var->varno == *scan_relid)
+		{
+			var = copyObject(var);
+			var->varno = INDEX_VAR;
+			return (Node *) var;
+		}
+		return node;
+	}
+	return expression_tree_mutator(node, scan_vars_to_index, scan_relid);
+}
+
 static ForeignScan *
 fdw_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			 ForeignPath *best_path, List *tlist, List *scan_clauses, Plan *outer_plan)
@@ -1286,7 +1312,7 @@ fdw_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 			Node	   *clause = (Node *) lfirst(lc2);
 
 			if (gg_duckdb_native_qual_ok(foreigntableid, scan_relid, attnos, clause))
-				pushed = lappend(pushed, clause);
+				pushed = lappend(pushed, scan_vars_to_index(clause, &scan_relid));
 			else
 				local = lappend(local, clause);
 		}

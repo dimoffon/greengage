@@ -77,6 +77,12 @@ SET gg_duckdb.explain_decisions = off;
 SET gg_duckdb.mode = off;
 -- a scan rescanned by a correlated subquery
 SELECT r.k, (SELECT count(*) FROM parts p WHERE p.k = r.k) FROM (SELECT DISTINCT k FROM ref_parts) r ORDER BY 1;
+-- pushed quals of a scan whose range table index is settled after GetForeignPlan
+-- (a subquery's scan is offset in setrefs, ORCA renumbers the scan it builds)
+SELECT f_check('SELECT count(*) AS n, sum(runs) AS r FROM (SELECT k, count(*) AS runs FROM parts WHERE nullable IS NOT NULL AND k > 1 GROUP BY k) q',
+               'SELECT count(*) AS n, sum(runs) AS r FROM (SELECT k, count(*) AS runs FROM ref_parts WHERE nullable IS NOT NULL AND k > 1 GROUP BY k) q');
+SELECT f_check('WITH q AS (SELECT k, max(amt) AS m FROM parts WHERE flag GROUP BY k) SELECT count(*) AS n, sum(m) AS sm FROM q, items i WHERE i.id = q.k',
+               'WITH q AS (SELECT k, max(amt) AS m FROM ref_parts WHERE flag GROUP BY k) SELECT count(*) AS n, sum(m) AS sm FROM q, items i WHERE i.id = q.k');
 -- statistics
 ANALYZE parts;
 SELECT reltuples FROM pg_class WHERE relname = 'parts';
