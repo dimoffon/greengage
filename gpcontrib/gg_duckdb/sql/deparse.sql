@@ -118,6 +118,24 @@ SET gg_duckdb.explain_decisions = off;
 SELECT d_check($q$ SELECT d.id, count(*) AS n, sum(o.qty) AS s1, sum(o.amount) AS s2, min(o.id) AS mn, max(o.id) AS mx, max(o.big) AS mb, max(o.ts) AS mt
                    FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id $q$, 'auto');
 RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+
+-- integer aggregate states: a partial sum/avg(bigint) or avg(integer/smallint)
+-- hands its final phase the executor's own transition state, so the phases
+-- split between DuckDB and the executor either way round (the final avg
+-- stays with the executor, whose division sets the result's scale)
+SET gg_duckdb.mode = force;
+SET optimizer_force_multistage_agg = on;
+EXPLAIN (COSTS OFF)
+SELECT cust, sum(big), avg(big), avg(qty), count(*) FROM d_orders GROUP BY cust;
+EXPLAIN (COSTS OFF)
+SELECT cust, sum(big), count(*) FROM d_orders GROUP BY cust;
+SELECT d_check($q$ SELECT cust, sum(big) AS sb, avg(big) AS ab, avg(qty) AS aq,
+                          sum(big) FILTER (WHERE flag) AS sbf, avg(qty) FILTER (WHERE qty > 5) AS aqf, count(*) AS n
+                   FROM d_orders GROUP BY cust $q$);
+SELECT d_check($q$ SELECT cust, sum(big) AS sb, count(*) AS n FROM d_orders GROUP BY cust $q$);
+SELECT cust, sum(big), avg(big), avg(qty), sum(big) FILTER (WHERE flag), avg(qty) FILTER (WHERE qty > 12)
+  FROM d_orders WHERE cust IN (0, 1, 96) OR cust IS NULL GROUP BY cust ORDER BY cust;
+RESET optimizer_force_multistage_agg;
 SET gp_enable_multiphase_agg = off;
 DROP TABLE d_dim;
 

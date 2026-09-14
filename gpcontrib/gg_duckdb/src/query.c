@@ -146,8 +146,8 @@ gg_duckdb_query_set_output(GGDuckQuery *q, TupleDesc desc, GGTypeInfo *outtypes,
 		att = TupleDescAttr(desc, attno);
 		outtypes[i].typid = att->atttypid;
 		outtypes[i].typmod = att->atttypmod;
-		if (att->atttypid == BYTEAOID && outtypes[i].duck == DUCKDB_TYPE_STRUCT)
-			continue;			/* a numeric aggregate state, packed by DuckDB */
+		if (gg_duckdb_is_agg_state(&outtypes[i]))
+			continue;			/* an aggregate state, packed by DuckDB */
 		if (att->atttypid == NUMERICOID && att->atttypmod < (int32) VARHDRSZ)
 		{
 			/* unconstrained numeric: the DuckDB shape is whatever the planner emitted */

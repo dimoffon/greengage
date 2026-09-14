@@ -43,7 +43,7 @@ SELECT id % 7 AS g, count(*), sum(k), min(id), bool_and(flag) FROM j_a GROUP BY 
 -- a scalar aggregate: the partial Agg on the segments is a region, the final one on the coordinator is not
 EXPLAIN (COSTS OFF)
 SELECT count(*), max(k) FROM j_a;
--- sum(int8) serialises an internal state between the phases: neither phase is a region
+-- sum(int8) packs its transition state as the numeric sums do: both phases are regions
 EXPLAIN (COSTS OFF)
 SELECT id % 7 AS g, sum(w) FROM j_b GROUP BY id % 7;
 -- sum(numeric) and avg(numeric) too, but DuckDB packs their state: the partial

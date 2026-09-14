@@ -198,10 +198,10 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=3129987)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1153040)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=3129987)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1153040)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -322,6 +322,73 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
 (1 row)
 
 RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+-- integer aggregate states: a partial sum/avg(bigint) or avg(integer/smallint)
+-- hands its final phase the executor's own transition state, so the phases
+-- split between DuckDB and the executor either way round (the final avg
+-- stays with the executor, whose division sets the result's scale)
+SET gg_duckdb.mode = force;
+SET optimizer_force_multistage_agg = on;
+EXPLAIN (COSTS OFF)
+SELECT cust, sum(big), avg(big), avg(qty), count(*) FROM d_orders GROUP BY cust;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: gg_duckdb_region.cust
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region.cust
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(9 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT cust, sum(big), count(*) FROM d_orders GROUP BY cust;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region_1.cust
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     ->  Seq Scan on d_orders
+ Optimizer: GPORCA
+(9 rows)
+
+SELECT d_check($q$ SELECT cust, sum(big) AS sb, avg(big) AS ab, avg(qty) AS aq,
+                          sum(big) FILTER (WHERE flag) AS sbf, avg(qty) FILTER (WHERE qty > 5) AS aqf, count(*) AS n
+                   FROM d_orders GROUP BY cust $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'cust' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'cust' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT cust, sum(big) AS sb, count(*) AS n FROM d_orders GROUP BY cust $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT cust, sum(big), avg(big), avg(qty), sum(big) FILTER (WHERE flag), avg(qty) FILTER (WHERE qty > 12)
+  FROM d_orders WHERE cust IN (0, 1, 96) OR cust IS NULL GROUP BY cust ORDER BY cust;
+ cust |        sum        |         avg         |        avg         |       sum        | avg 
+------+-------------------+---------------------+--------------------+------------------+-----
+    0 | 18553287000000000 | 30021500000000.0000 | 6.0048543689320388 | 6204411000000000 |    
+    1 | 18553906000000000 | 29974000000000.0000 | 6.0016155088852989 | 6184635000000000 |    
+   96 | 18552669000000000 | 30020500000000.0000 | 6.0097087378640777 | 6164241000000000 |    
+      |                   |                     |                    |                  |    
+(4 rows)
+
+RESET optimizer_force_multistage_agg;
 SET gp_enable_multiphase_agg = off;
 DROP TABLE d_dim;
 -- a bad query never leaves the planner: plan-time validation declines it

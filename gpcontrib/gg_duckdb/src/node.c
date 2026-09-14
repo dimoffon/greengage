@@ -250,7 +250,7 @@ describe_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 		*ti = st->leaf_shapes[leafno][k];
 		ti->typid = att->atttypid;
 		ti->typmod = att->atttypmod;
-		if (gg_duckdb_is_numeric_state(ti))
+		if (gg_duckdb_is_agg_state(ti))
 			continue;
 		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &pgside))
 			ereport(ERROR,

@@ -95,20 +95,20 @@ NOTICE:  gg_duckdb: Agg (plan node 2): region [Agg over 1 leaf]: SELECT * FROM (
  Optimizer: GPORCA
 (6 rows)
 
--- sum(int8) serialises an internal state between the phases: neither phase is a region
+-- sum(int8) packs its transition state as the numeric sums do: both phases are regions
 EXPLAIN (COSTS OFF)
 SELECT id % 7 AS g, sum(w) FROM j_b GROUP BY id % 7;
-NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: final sum over a bytea partial
-NOTICE:  gg_duckdb: Agg (plan node 4): not eligible: partial sum(bigint) serialises an internal state
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(sum(struct_extract(n1.c2, 's')) AS DECIMAL(38,0)) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,0)), n := count(n1.c2)) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
                          QUERY PLAN                         
 ------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Finalize HashAggregate
-         Group Key: ((id % 7))
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
          ->  Redistribute Motion 3:3  (slice2; segments: 3)
-               Hash Key: ((id % 7))
-               ->  Streaming Partial HashAggregate
-                     Group Key: (id % 7)
+               Hash Key: gg_duckdb_region_1.g
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
                      ->  Seq Scan on j_b
  Optimizer: GPORCA
 (9 rows)

@@ -59,8 +59,8 @@ SELECT f_check('SELECT id, upper(v) FROM parts WHERE upper(v) = ''V42''', 'SELEC
 SELECT * FROM items ORDER BY id LIMIT 3;
 SELECT * FROM tags ORDER BY id LIMIT 3;
 SET gg_duckdb.mode = force;
-SELECT f_check('SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn FROM parts GROUP BY k',
-               'SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn FROM ref_parts GROUP BY k');
+SELECT f_check('SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn, sum(id) AS si, avg(id) AS ai, avg(n4) AS a4, avg(s) AS as2 FROM parts GROUP BY k',
+               'SELECT k, count(*) AS n, sum(amt) AS sa, min(ts) AS mt, max(d) AS md, bool_and(flag) AS bf, sum(s) AS ss, sum(n4) AS s4, count(nullable) AS cn, sum(id) AS si, avg(id) AS ai, avg(n4) AS a4, avg(s) AS as2 FROM ref_parts GROUP BY k');
 SELECT f_check('SELECT count(*) AS n, sum(amt) AS sa FROM parts WHERE k > 2 AND flag', 'SELECT count(*) AS n, sum(amt) AS sa FROM ref_parts WHERE k > 2 AND flag');
 SELECT f_check('SELECT p.k, i.name, count(*) AS n FROM parts p JOIN items i ON p.k = i.id GROUP BY p.k, i.name',
                'SELECT p.k, i.name, count(*) AS n FROM ref_parts p JOIN items i ON p.k = i.id GROUP BY p.k, i.name');

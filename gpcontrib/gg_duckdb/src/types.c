@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_type.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "libpq/pqformat.h"
@@ -470,25 +471,55 @@ numeric_init(void)
 }
 
 /*
- * The shape of a numeric aggregate state (the bytea a partial sum(numeric)
- * or avg(numeric) hands to its final phase) as DuckDB carries it: a STRUCT
- * of the sum, a DECIMAL(38,scale), and the count of non-null inputs.
+ * The shape of an aggregate state (what a partial sum or avg hands to its
+ * final phase, see GGStateKind) as DuckDB carries it: a STRUCT of the sum, a
+ * DECIMAL(38,scale) or for the integer averages a BIGINT, and the count of
+ * non-null inputs.
  */
 void
-gg_duckdb_numeric_state_type(GGTypeInfo *ti, int scale)
+gg_duckdb_agg_state_type(GGTypeInfo *ti, GGStateKind kind, int scale)
 {
 	memset(ti, 0, sizeof(*ti));
-	ti->typid = BYTEAOID;
 	ti->typmod = -1;
 	ti->duck = DUCKDB_TYPE_STRUCT;
-	ti->width = 38;
-	ti->scale = (uint8) scale;
+	switch (kind)
+	{
+		case GG_STATE_NUMERIC:
+			ti->typid = BYTEAOID;
+			ti->width = GG_STATE_WIDTH_NUMERIC;
+			ti->scale = (uint8) scale;
+			break;
+		case GG_STATE_INT8:
+			ti->typid = BYTEAOID;
+			ti->width = GG_STATE_WIDTH_INT8;
+			ti->scale = 0;
+			break;
+		case GG_STATE_INT4AVG:
+			ti->typid = INT8ARRAYOID;
+			ti->width = GG_STATE_WIDTH_INT4AVG;
+			ti->scale = 0;
+			break;
+		default:
+			elog(ERROR, "gg_duckdb: unexpected aggregate state kind %d", (int) kind);
+	}
+}
+
+GGStateKind
+gg_duckdb_agg_state_kind(const GGTypeInfo *ti)
+{
+	if (ti->duck != DUCKDB_TYPE_STRUCT)
+		return GG_STATE_NONE;
+	if (ti->typid == INT8ARRAYOID)
+		return GG_STATE_INT4AVG;
+	if (ti->typid == BYTEAOID)
+		return ti->width == GG_STATE_WIDTH_INT8 ? GG_STATE_INT8 : GG_STATE_NUMERIC;
+	return GG_STATE_NONE;
 }
 
 bool
-gg_duckdb_is_numeric_state(const GGTypeInfo *ti)
+gg_duckdb_is_agg_state(const GGTypeInfo *ti)
 {
-	return ti->duck == DUCKDB_TYPE_STRUCT && ti->typid == BYTEAOID;
+	return gg_duckdb_agg_state_kind(ti) != GG_STATE_NONE;
 }
 
 /* The DuckDB logical type for a mapped PG type; caller destroys it. */
@@ -497,13 +528,16 @@ gg_duckdb_logical_type(const GGTypeInfo *ti)
 {
 	if (ti->duck == DUCKDB_TYPE_DECIMAL)
 		return duckdb_create_decimal_type(ti->width, ti->scale);
-	if (gg_duckdb_is_numeric_state(ti))
+	if (gg_duckdb_is_agg_state(ti))
 	{
 		duckdb_logical_type members[2];
 		const char *names[2] = {"s", "n"};
 		duckdb_logical_type lt;
 
-		members[0] = duckdb_create_decimal_type(38, ti->scale);
+		if (gg_duckdb_agg_state_kind(ti) == GG_STATE_INT4AVG)
+			members[0] = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+		else
+			members[0] = duckdb_create_decimal_type(38, ti->scale);
 		members[1] = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
 		lt = duckdb_create_struct_type(members, names, 2);
 		duckdb_destroy_logical_type(&members[0]);
@@ -515,10 +549,11 @@ gg_duckdb_logical_type(const GGTypeInfo *ti)
 
 /*
  * Numeric aggregate states in numeric_avg_serialize()'s layout: N, sumX as
- * numeric_send() writes it, maxScale, maxScaleCount, NaNcount.
+ * numeric_send() writes it, maxScale, maxScaleCount, NaNcount; the bigint
+ * states (poly) in int8_avg_serialize()'s: N and sumX only.
  */
 static void
-numeric_state_unpack(Datum d, int scale, bool *sum_null, int128 *sum, int64 *n)
+numeric_state_unpack(Datum d, int scale, bool poly, bool *sum_null, int128 *sum, int64 *n)
 {
 	bytea	   *state = DatumGetByteaPP(d);
 	StringInfoData buf;
@@ -548,13 +583,16 @@ numeric_state_unpack(Datum d, int scale, bool *sum_null, int128 *sum, int64 *n)
 		elog(ERROR, "gg_duckdb: unexpected numeric aggregate state (%d digits)", ndigits);
 	for (i = 0; i < ndigits; i++)
 		digits[i] = (int16) pq_getmsgint(&buf, 2);
-	(void) pq_getmsgint(&buf, 4);	/* maxScale */
-	(void) pq_getmsgint64(&buf);	/* maxScaleCount */
-	nancount = pq_getmsgint64(&buf);
-	if (nancount > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("gg_duckdb: a numeric aggregate state holding NaN cannot be handed to DuckDB")));
+	if (!poly)
+	{
+		(void) pq_getmsgint(&buf, 4);	/* maxScale */
+		(void) pq_getmsgint64(&buf);	/* maxScaleCount */
+		nancount = pq_getmsgint64(&buf);
+		if (nancount > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("gg_duckdb: a numeric aggregate state holding NaN cannot be handed to DuckDB")));
+	}
 	if (!numeric_ready)
 		numeric_init();
 	nv.neg = (sign == GG_NUMERIC_NEG);
@@ -565,7 +603,7 @@ numeric_state_unpack(Datum d, int scale, bool *sum_null, int128 *sum, int64 *n)
 }
 
 static Datum
-numeric_state_pack(bool sum_null, int128 sum, int64 n, int scale)
+numeric_state_pack(bool sum_null, int128 sum, int64 n, int scale, bool poly)
 {
 	StringInfoData buf;
 	int16		digits[GG_NUMERIC_MAX_DIGITS];
@@ -595,10 +633,41 @@ numeric_state_pack(bool sum_null, int128 sum, int64 n, int scale)
 	pq_sendint16(&buf, scale);
 	for (i = 0; i < ndigits; i++)
 		pq_sendint16(&buf, digits[i]);
-	pq_sendint32(&buf, scale);		/* maxScale */
-	pq_sendint64(&buf, n);			/* maxScaleCount */
-	pq_sendint64(&buf, 0);			/* NaNcount */
+	if (!poly)
+	{
+		pq_sendint32(&buf, scale);	/* maxScale */
+		pq_sendint64(&buf, n);		/* maxScaleCount */
+		pq_sendint64(&buf, 0);		/* NaNcount */
+	}
 	return PointerGetDatum(pq_endtypsend(&buf));
+}
+
+/*
+ * The state of a partial avg(integer) or avg(smallint): a bigint[2] of the
+ * count and the sum (numeric.c's Int8TransTypeData), never null.
+ */
+static void
+int4avg_state_unpack(Datum d, bool *sum_null, int128 *sum, int64 *n)
+{
+	ArrayType  *a = DatumGetArrayTypeP(d);
+	int64	   *v;
+
+	if (ARR_NDIM(a) != 1 || ARR_DIMS(a)[0] != 2 || ARR_HASNULL(a) || ARR_ELEMTYPE(a) != INT8OID)
+		elog(ERROR, "gg_duckdb: unexpected integer average state");
+	v = (int64 *) ARR_DATA_PTR(a);
+	*n = v[0];
+	*sum = v[1];
+	*sum_null = (*n == 0);
+}
+
+static Datum
+int4avg_state_pack(bool sum_null, int64 sum, int64 n)
+{
+	Datum		vals[2];
+
+	vals[0] = Int64GetDatum(sum_null ? 0 : n);
+	vals[1] = Int64GetDatum(sum_null ? 0 : sum);
+	return PointerGetDatum(construct_array(vals, 2, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, 'd'));
 }
 
 const char *
@@ -734,18 +803,28 @@ gg_duckdb_write_datum(const GGTypeInfo *ti, const GGVectorTarget *t, idx_t row,
 			}
 		case DUCKDB_TYPE_STRUCT:
 			{
-				/* a numeric aggregate state: sum and count children */
-				duckdb_hugeint *h = &((duckdb_hugeint *) t->sum_data)[row];
+				/* an aggregate state: sum and count children */
+				GGStateKind kind = gg_duckdb_agg_state_kind(ti);
 				bool		sum_null;
 				int128		sum;
 				int64		n;
 
-				numeric_state_unpack(d, ti->scale, &sum_null, &sum, &n);
+				if (kind == GG_STATE_INT4AVG)
+					int4avg_state_unpack(d, &sum_null, &sum, &n);
+				else
+					numeric_state_unpack(d, ti->scale, kind == GG_STATE_INT8, &sum_null, &sum, &n);
 				validity_set(t->sum_validity, row, !sum_null);
 				if (!sum_null)
 				{
-					h->lower = (uint64) (sum & 0xffffffffffffffffULL);
-					h->upper = (int64) (sum >> 64);
+					if (kind == GG_STATE_INT4AVG)
+						((int64 *) t->sum_data)[row] = (int64) sum;
+					else
+					{
+						duckdb_hugeint *h = &((duckdb_hugeint *) t->sum_data)[row];
+
+						h->lower = (uint64) (sum & 0xffffffffffffffffULL);
+						h->upper = (int64) (sum >> 64);
+					}
 				}
 				((int64 *) t->count_data)[row] = n;
 				break;
@@ -844,8 +923,9 @@ gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
 	}
 	*isnull = false;
 
-	if (vt == DUCKDB_TYPE_STRUCT && gg_duckdb_is_numeric_state(ti))
+	if (vt == DUCKDB_TYPE_STRUCT && gg_duckdb_is_agg_state(ti))
 	{
+		GGStateKind kind = gg_duckdb_agg_state_kind(ti);
 		duckdb_vector sv = duckdb_struct_vector_get_child(vec, 0);
 		duckdb_vector nv = duckdb_struct_vector_get_child(vec, 1);
 		uint64_t   *sval = duckdb_vector_get_validity(sv);
@@ -853,13 +933,19 @@ gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int width, int scale,
 		int128		sum = 0;
 		int64		n = ((int64 *) duckdb_vector_get_data(nv))[row];
 
+		if (kind == GG_STATE_INT4AVG)
+		{
+			if (!sum_null)
+				sum = ((int64 *) duckdb_vector_get_data(sv))[row];
+			return int4avg_state_pack(sum_null, (int64) sum, n);
+		}
 		if (!sum_null)
 		{
 			duckdb_hugeint *h = &((duckdb_hugeint *) duckdb_vector_get_data(sv))[row];
 
 			sum = ((int128) h->upper << 64) | (int128) h->lower;
 		}
-		return numeric_state_pack(sum_null, sum, n, ti->scale);
+		return numeric_state_pack(sum_null, sum, n, ti->scale, kind == GG_STATE_INT8);
 	}
 
 	switch (ti->typid)

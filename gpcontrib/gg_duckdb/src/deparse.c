@@ -117,7 +117,9 @@ static void ops_charge(DeparseCtx *ctx, OpCounts *c, double rows, double rows_in
 const char *
 gg_duckdb_type_sql(const GGTypeInfo *ti)
 {
-	if (gg_duckdb_is_numeric_state(ti))
+	if (gg_duckdb_agg_state_kind(ti) == GG_STATE_INT4AVG)
+		return "STRUCT(s BIGINT, n BIGINT)";
+	if (gg_duckdb_is_agg_state(ti))
 		return psprintf("STRUCT(s DECIMAL(38,%d), n BIGINT)", ti->scale);
 	switch (ti->duck)
 	{
@@ -588,8 +590,8 @@ deparse_funcexpr(DeparseCtx *ctx, FuncExpr *f, StringInfo out, GGTypeInfo *type)
  * or in a region that adds the packed sums up.
  */
 static bool
-deparse_numeric_state(DeparseCtx *ctx, Aggref *agg, const char *arg, int scale,
-					  StringInfo out, GGTypeInfo *type)
+deparse_agg_state(DeparseCtx *ctx, Aggref *agg, const char *arg, GGStateKind kind, int scale,
+				  StringInfo out, GGTypeInfo *type)
 {
 	StringInfoData f;
 
@@ -604,11 +606,15 @@ deparse_numeric_state(DeparseCtx *ctx, Aggref *agg, const char *arg, int scale,
 			return false;
 		appendStringInfo(&f, " FILTER (WHERE %s)", fe.data);
 	}
-	if (agg->aggtype != BYTEAOID)
-		REJECT(ctx, "partial numeric aggregate declares %s", format_type_be(agg->aggtype));
-	gg_duckdb_numeric_state_type(type, scale);
-	appendStringInfo(out, "struct_pack(s := CAST(sum(%s)%s AS DECIMAL(38,%d)), n := count(%s)%s)",
-					 arg, f.data, scale, arg, f.data);
+	if (agg->aggtype != (kind == GG_STATE_INT4AVG ? INT8ARRAYOID : BYTEAOID))
+		REJECT(ctx, "partial aggregate state declares %s", format_type_be(agg->aggtype));
+	gg_duckdb_agg_state_type(type, kind, scale);
+	if (kind == GG_STATE_INT4AVG)
+		appendStringInfo(out, "struct_pack(s := CAST(sum(%s)%s AS BIGINT), n := count(%s)%s)",
+						 arg, f.data, arg, f.data);
+	else
+		appendStringInfo(out, "struct_pack(s := CAST(sum(%s)%s AS DECIMAL(38,%d)), n := count(%s)%s)",
+						 arg, f.data, scale, arg, f.data);
 	return true;
 }
 
@@ -692,7 +698,7 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 		bool		ok = false;
 
 		if (strcmp(name, "sum") == 0 && argtype == BYTEAOID &&
-			gg_duckdb_is_numeric_state(&ta) && agg->aggtype == NUMERICOID)
+			gg_duckdb_is_agg_state(&ta) && agg->aggtype == NUMERICOID)
 		{
 			/* the partial sums packed in the states, added up */
 			memset(type, 0, sizeof(*type));
@@ -749,7 +755,9 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 			cast = "BIGINT";
 		}
 		else if (partial && argtype == NUMERICOID && ta.duck == DUCKDB_TYPE_DECIMAL)
-			return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
+			return deparse_agg_state(ctx, agg, a.data, GG_STATE_NUMERIC, ta.scale, out, type);
+		else if (partial && argtype == INT8OID)
+			return deparse_agg_state(ctx, agg, a.data, GG_STATE_INT8, 0, out, type);
 		else if (type_is_float(argtype) && gg_duckdb_allow_float_aggregates)
 		{
 			/* the sum of floats depends on the order of summation: opted in */
@@ -801,7 +809,11 @@ deparse_aggref(DeparseCtx *ctx, Aggref *agg, StringInfo out, GGTypeInfo *type)
 	}
 	else if (strcmp(name, "avg") == 0 && partial && argtype == NUMERICOID &&
 			 ta.duck == DUCKDB_TYPE_DECIMAL)
-		return deparse_numeric_state(ctx, agg, a.data, ta.scale, out, type);
+		return deparse_agg_state(ctx, agg, a.data, GG_STATE_NUMERIC, ta.scale, out, type);
+	else if (strcmp(name, "avg") == 0 && partial && argtype == INT8OID)
+		return deparse_agg_state(ctx, agg, a.data, GG_STATE_INT8, 0, out, type);
+	else if (strcmp(name, "avg") == 0 && partial && (argtype == INT4OID || argtype == INT2OID))
+		return deparse_agg_state(ctx, agg, a.data, GG_STATE_INT4AVG, 0, out, type);
 	else if (strcmp(name, "avg") == 0 && !partial && !final && type_is_float(argtype) &&
 			 gg_duckdb_allow_float_aggregates)
 	{
@@ -1168,13 +1180,13 @@ expr_decimal_shape(Node *expr, Plan *child, int *width, int *scale)
 }
 
 /*
- * Is column `col` of leaf `plan` the serialised state of a partial
- * sum(numeric) or avg(numeric) computed below it, and at what scale?  The
- * leaf is typically a Motion above the partial Agg, possibly through nodes
- * that pass the column through.
+ * Is column `col` of leaf `plan` the transition state of a partial sum or
+ * avg computed below it (see GGStateKind), of what kind, and at what scale?
+ * The leaf is typically a Motion above the partial Agg, possibly through
+ * nodes that pass the column through.
  */
 static bool
-numeric_state_scale(Plan *plan, int col, int *scale)
+agg_state_shape(Plan *plan, int col, GGStateKind *kind, int *scale)
 {
 	int			depth;
 
@@ -1194,18 +1206,38 @@ numeric_state_scale(Plan *plan, int col, int *scale)
 		{
 			Aggref	   *agg = (Aggref *) expr;
 			char	   *name;
+			Node	   *arg;
+			Oid			argtype;
 			int			width;
 
-			if (agg->aggsplit != AGGSPLIT_INITIAL_SERIAL || agg->aggtype != BYTEAOID ||
+			if (agg->aggsplit != AGGSPLIT_INITIAL_SERIAL ||
 				list_length(agg->args) != 1 || agg->aggdistinct != NIL ||
 				agg->aggorder != NIL || agg->aggdirectargs != NIL)
 				return false;
 			name = get_func_name(agg->aggfnoid);
-			if (name == NULL || (strcmp(name, "sum") != 0 && strcmp(name, "avg") != 0) ||
-				exprType((Node *) ((TargetEntry *) linitial(agg->args))->expr) != NUMERICOID)
+			if (name == NULL || (strcmp(name, "sum") != 0 && strcmp(name, "avg") != 0))
 				return false;
-			return expr_decimal_shape((Node *) ((TargetEntry *) linitial(agg->args))->expr,
-									  plan->lefttree, &width, scale);
+			arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+			argtype = exprType(arg);
+			if (argtype == NUMERICOID && agg->aggtype == BYTEAOID)
+			{
+				*kind = GG_STATE_NUMERIC;
+				return expr_decimal_shape(arg, plan->lefttree, &width, scale);
+			}
+			if (argtype == INT8OID && agg->aggtype == BYTEAOID)
+			{
+				*kind = GG_STATE_INT8;
+				*scale = 0;
+				return true;
+			}
+			if (strcmp(name, "avg") == 0 && (argtype == INT4OID || argtype == INT2OID) &&
+				agg->aggtype == INT8ARRAYOID)
+			{
+				*kind = GG_STATE_INT4AVG;
+				*scale = 0;
+				return true;
+			}
+			return false;
 		}
 		if (!IsA(expr, Var) || ((Var *) expr)->varno != OUTER_VAR)
 			return false;
@@ -1224,15 +1256,16 @@ gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti)
 {
 	TargetEntry *te;
 	Oid			typid;
+	GGStateKind kind;
 	int			scale;
 
 	if (col < 0 || col >= list_length(plan->targetlist))
 		return false;
 	te = (TargetEntry *) list_nth(plan->targetlist, col);
 	typid = exprType((Node *) te->expr);
-	if (typid == BYTEAOID && numeric_state_scale(plan, col, &scale))
+	if ((typid == BYTEAOID || typid == INT8ARRAYOID) && agg_state_shape(plan, col, &kind, &scale))
 	{
-		gg_duckdb_numeric_state_type(ti, scale);
+		gg_duckdb_agg_state_type(ti, kind, scale);
 		return true;
 	}
 	return gg_duckdb_type_map(typid, exprTypmod((Node *) te->expr), ti);

@@ -453,8 +453,31 @@ extern void gg_duckdb_fdw_end_insert(EState *estate, struct ResultRelInfo *rinfo
 extern void gg_duckdb_fdw_explain_modify(struct ModifyTableState *mtstate, struct ResultRelInfo *rinfo,
 										 List *fdw_private, int subplan_index, struct ExplainState *es);
 extern bool gg_duckdb_leaf_column_type(Plan *plan, int col, GGTypeInfo *ti);
-extern void gg_duckdb_numeric_state_type(GGTypeInfo *ti, int scale);
-extern bool gg_duckdb_is_numeric_state(const GGTypeInfo *ti);
+
+/*
+ * The transition states of split aggregates a region carries as a STRUCT of
+ * the sum and the count: a partial sum/avg(numeric) hands its final phase
+ * numeric_avg_serialize()'s bytea, a partial sum/avg(bigint)
+ * int8_avg_serialize()'s (a prefix of the former: the count and the sum as a
+ * numeric), a partial avg(integer/smallint) a bigint[2] of the count and the
+ * sum.  The kind is read off the type: the PostgreSQL type, and for the two
+ * byteas a width marker, since a leaf's shape travels as (duck, width, scale).
+ */
+typedef enum GGStateKind
+{
+	GG_STATE_NONE = 0,
+	GG_STATE_NUMERIC,
+	GG_STATE_INT8,
+	GG_STATE_INT4AVG
+} GGStateKind;
+
+#define GG_STATE_WIDTH_NUMERIC	38
+#define GG_STATE_WIDTH_INT8		19
+#define GG_STATE_WIDTH_INT4AVG	18
+
+extern void gg_duckdb_agg_state_type(GGTypeInfo *ti, GGStateKind kind, int scale);
+extern GGStateKind gg_duckdb_agg_state_kind(const GGTypeInfo *ti);
+extern bool gg_duckdb_is_agg_state(const GGTypeInfo *ti);
 
 /* ---------- the planner pass (pass.c) ---------- */
 

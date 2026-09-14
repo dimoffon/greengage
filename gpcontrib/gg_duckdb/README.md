@@ -17,9 +17,11 @@ plan nodes pulled by DuckDB on the backend thread, and the subtree under a leaf
 gets regions of its own; a projection DuckDB cannot compute stays with the
 executor as a leaf and the region goes on above it. Every region query is prepared on the coordinator
 before it is used, so an ineligible or unbindable subtree simply stays on the
-standard executor. Partial `sum(numeric)` and `avg(numeric)` phases run in
-DuckDB too: the region packs DuckDB's exact sum and count into the aggregate
-state the final phase expects. `DuckDB()`/`NoDuckDB()` hints through
+standard executor. Partial `sum` and `avg` phases over numerics and bigints,
+and partial `avg` phases over integers and smallints, run in DuckDB too: the
+region packs DuckDB's exact sum and count into the transition state the
+executor's final phase expects (a final `avg` stays with the executor, whose
+division sets the result's scale). `DuckDB()`/`NoDuckDB()` hints through
 pg_hint_plan force or forbid regions, and under `mode = auto` a cost gate
 compares the standard executor's estimate for the interior operators with
 DuckDB's, conversion included, and draws the region's boundary by the same
