@@ -13,11 +13,15 @@
 #ifndef OPTIMIZER_HINTS_H
 #define OPTIMIZER_HINTS_H
 
+#ifdef __cplusplus
 extern "C" {
+#endif
 #include "postgres.h"
 #include "nodes/pathnodes.h"
 #include "utils/guc.h"
+#ifdef __cplusplus
 }
+#endif
 
 /* hint keyword of enum type*/
 typedef enum HintKeyword
@@ -48,6 +52,9 @@ typedef enum HintKeyword
 	HINT_KEYWORD_ROWS,
 	HINT_KEYWORD_PARALLEL,
 
+	HINT_KEYWORD_DUCKDB,
+	HINT_KEYWORD_NODUCKDB,
+
 	HINT_KEYWORD_UNRECOGNIZED
 } HintKeyword;
 
@@ -73,7 +80,7 @@ typedef const char *(*HintParseFunction) (Hint *hint, HintState *hstate,
 										  Query *parse, const char *str);
 
 /* hint types */
-#define NUM_HINT_TYPE	6
+#define NUM_HINT_TYPE	7
 typedef enum HintType
 {
 	HINT_TYPE_SCAN_METHOD,
@@ -81,7 +88,8 @@ typedef enum HintType
 	HINT_TYPE_LEADING,
 	HINT_TYPE_SET,
 	HINT_TYPE_ROWS,
-	HINT_TYPE_PARALLEL
+	HINT_TYPE_PARALLEL,
+	HINT_TYPE_DUCKDB
 } HintType;
 
 typedef enum HintTypeBitmap
@@ -202,6 +210,19 @@ typedef struct ParallelHint
 } ParallelHint;
 
 /*
+ * DuckDB(t1 t2 ...) / NoDuckDB(t1 t2 ...) hints of the gg_duckdb executor.
+ * An empty list addresses the whole query.  pg_hint_plan only parses them;
+ * gg_duckdb's planner pass applies them.
+ */
+typedef struct DuckDBHint
+{
+	Hint			base;
+	int				nrels;
+	char		  **relnames;
+	bool			negative;		/* NoDuckDB */
+} DuckDBHint;
+
+/*
  * Describes a context of hint processing.
  */
 struct HintState
@@ -243,6 +264,7 @@ struct HintState
 	GucContext		context;			/* which GUC parameters can we set? */
 	RowsHint	  **rows_hints;			/* parsed Rows hints */
 	ParallelHint  **parallel_hints;		/* parsed Parallel hints */
+	DuckDBHint	  **duckdb_hints;		/* parsed DuckDB/NoDuckDB hints */
 };
 
 #endif	// !OPTIMIZER_HINTS_H

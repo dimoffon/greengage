@@ -1,0 +1,83 @@
+-- A LIMIT above the Gather Motion is satisfied by the first segments that
+-- answer; the query then stops the regions still running elsewhere.  Segment 1
+-- is held inside its first leaf batch until the coordinator has its row, then
+-- released: its region is squelched (the DuckDB query dropped, the leaf
+-- stopped) and the query completes.  The second query has a Motion leaf, so
+-- the squelch has to reach the sending slice as well.
+1: SET gg_duckdb.mode = force;
+SET
+SELECT gp_inject_fault_infinite('gg_duckdb_before_batch', 'suspend', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1&: SELECT count(*) FROM (SELECT k, count(*) FROM iso_t GROUP BY k LIMIT 1) x;  <waiting ...>
+SELECT gp_wait_until_triggered_fault('gg_duckdb_before_batch', 1, dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:                      
+(1 row)
+SELECT pg_sleep(1);
+ pg_sleep 
+----------
+          
+(1 row)
+SELECT gp_inject_fault('gg_duckdb_before_batch', 'resume', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1<:  <... completed>
+ count 
+-------
+ 1     
+(1 row)
+SELECT gp_inject_fault('gg_duckdb_before_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+SELECT gp_inject_fault_infinite('gg_duckdb_before_batch', 'suspend', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1&: SELECT count(*) FROM (SELECT id % 7 AS g, count(*) FROM iso_t GROUP BY id % 7 LIMIT 1) x;  <waiting ...>
+SELECT gp_wait_until_triggered_fault('gg_duckdb_before_batch', 1, dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:                      
+(1 row)
+SELECT pg_sleep(1);
+ pg_sleep 
+----------
+          
+(1 row)
+SELECT gp_inject_fault('gg_duckdb_before_batch', 'resume', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1<:  <... completed>
+ count 
+-------
+ 1     
+(1 row)
+SELECT gp_inject_fault('gg_duckdb_before_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 1;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1: SELECT count(*) FROM iso_t;
+ count  
+--------
+ 300000 
+(1 row)
+1: SELECT gp_segment_id, (gg_duckdb.status()).errors, (gg_duckdb.status()).reopens FROM gp_dist_random('gp_id') ORDER BY 1;
+ gp_segment_id | errors | reopens 
+---------------+--------+---------
+ 0             | 0      | 0       
+ 1             | 0      | 0       
+ 2             | 0      | 0       
+(3 rows)
+1q: ... <quitting>

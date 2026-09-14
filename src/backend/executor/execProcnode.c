@@ -1254,6 +1254,27 @@ planstate_walk_kids(PlanState *planstate,
 			Assert(!planstate->lefttree && !planstate->righttree);
 			break;
 
+		case T_CustomScanState:
+			{
+				/*
+				 * A custom scan keeps its children in custom_ps (a DuckDB
+				 * region's leaves live there); lefttree/righttree are unused.
+				 */
+				CustomScanState *css = (CustomScanState *) planstate;
+				ListCell   *cell;
+
+				Assert(!planstate->lefttree && !planstate->righttree);
+				v = CdbVisit_Walk;
+				foreach(cell, css->custom_ps)
+				{
+					v = planstate_walk_node_extended((PlanState *) lfirst(cell),
+													 walker, context, flags);
+					if (v != CdbVisit_Walk)
+						break;
+				}
+				break;
+			}
+
 		default:
 			/* Left subtree */
 			v = planstate_walk_node_extended(planstate->lefttree, walker, context, flags);

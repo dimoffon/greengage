@@ -1006,6 +1006,9 @@
    (Always defined in GPDB) */
 #undef USE_FLOAT8_BYVAL
 
+/* Define to 1 to build with DuckDB (--with-duckdb) */
+#undef USE_DUCKDB
+
 /* Define to 1 to build with gpcloud (--enable-gpcloud) */
 #undef USE_GPCLOUD
 

@@ -749,6 +749,7 @@ enable_thread_safety
 INCLUDES
 enable_ic_proxy
 HAVE_CXX14
+with_duckdb
 enable_gpcloud
 enable_orca
 autodepend
@@ -879,6 +880,7 @@ enable_depend
 enable_cassert
 enable_orca
 enable_gpcloud
+with_duckdb
 enable_ic_proxy
 enable_thread_safety
 with_icu
@@ -1586,6 +1588,8 @@ Optional Packages:
   --with-extra-version=STRING
                           append STRING to version
   --with-template=NAME    override operating system template
+  --with-duckdb=PREFIX    build gpcontrib/gg_duckdb against the DuckDB
+                          installed under PREFIX
   --with-includes=DIRS    look for additional header files in DIRS
   --with-libraries=DIRS   look for additional libraries in DIRS
   --with-libs=DIRS        alternative spelling of --with-libraries
@@ -7931,6 +7935,46 @@ fi
 
 { $as_echo "$as_me:${as_lineno-$LINENO}: result: checking whether to build with gpcloud... $enable_gpcloud" >&5
 $as_echo "checking whether to build with gpcloud... $enable_gpcloud" >&6; }
+
+
+#
+# DuckDB (gpcontrib/gg_duckdb): built only when a prefix is given.  The prefix
+# is produced by gpcontrib/gg_duckdb/duckdb/build.sh from the pinned release.
+#
+
+
+# Check whether --with-duckdb was given.
+if test "${with_duckdb+set}" = set; then :
+  withval=$with_duckdb;
+  case $withval in
+    yes)
+      as_fn_error $? "argument required for --with-duckdb option" "$LINENO" 5
+      ;;
+    no)
+      as_fn_error $? "argument required for --with-duckdb option" "$LINENO" 5
+      ;;
+    *)
+
+      ;;
+  esac
+
+fi
+
+
+if test -n "$with_duckdb"; then
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for DuckDB under $with_duckdb" >&5
+$as_echo_n "checking for DuckDB under $with_duckdb... " >&6; }
+  if test -f "$with_duckdb/include/duckdb.h" && test -f "$with_duckdb/lib/libduckdb.so"; then
+    { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+  else
+    as_fn_error $? "--with-duckdb=$with_duckdb: include/duckdb.h or lib/libduckdb.so not found" "$LINENO" 5
+  fi
+
+$as_echo "#define USE_DUCKDB 1" >>confdefs.h
+
+fi
+
 
 
 

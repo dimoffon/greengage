@@ -808,6 +808,22 @@ PGAC_ARG_BOOL(enable, gpcloud, no, [enable gpcloud support],
 AC_MSG_RESULT([checking whether to build with gpcloud... $enable_gpcloud])
 AC_SUBST(enable_gpcloud)
 
+#
+# DuckDB (gpcontrib/gg_duckdb): built only when a prefix is given.  The prefix
+# is produced by gpcontrib/gg_duckdb/duckdb/build.sh from the pinned release.
+#
+PGAC_ARG_REQ(with, duckdb, [PREFIX], [build gpcontrib/gg_duckdb against the DuckDB installed under PREFIX])
+if test -n "$with_duckdb"; then
+  AC_MSG_CHECKING([for DuckDB under $with_duckdb])
+  if test -f "$with_duckdb/include/duckdb.h" && test -f "$with_duckdb/lib/libduckdb.so"; then
+    AC_MSG_RESULT([yes])
+  else
+    AC_MSG_ERROR([--with-duckdb=$with_duckdb: include/duckdb.h or lib/libduckdb.so not found])
+  fi
+  AC_DEFINE([USE_DUCKDB], 1, [Define to 1 to build with DuckDB (--with-duckdb)])
+fi
+AC_SUBST(with_duckdb)
+
 AS_IF([test "$enable_orca" = yes || test "$enable_gpcloud" = yes],
 [ # then
   AX_CXX_COMPILE_STDCXX([14], [noext], [mandatory])

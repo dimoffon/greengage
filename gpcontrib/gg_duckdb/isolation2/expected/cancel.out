@@ -1,0 +1,42 @@
+-- A region suspended inside a leaf callback on a segment is cancelled with
+-- the usual message, and the backend's DuckDB is fine afterwards.
+1: SET gg_duckdb.mode = force;
+SET
+SELECT gp_inject_fault_infinite('gg_duckdb_before_batch', 'suspend', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault_infinite 
+--------------------------
+ Success:                 
+(1 row)
+1&: SELECT k, count(*), sum(n) FROM iso_t GROUP BY k ORDER BY k LIMIT 3;  <waiting ...>
+SELECT gp_wait_until_triggered_fault('gg_duckdb_before_batch', 1, dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_wait_until_triggered_fault 
+-------------------------------
+ Success:                      
+(1 row)
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE query LIKE 'SELECT k, count(*), sum(n) FROM iso_t%' AND pid <> pg_backend_pid();
+ pg_cancel_backend 
+-------------------
+ t                 
+(1 row)
+1<:  <... completed>
+ERROR:  canceling statement due to user request
+SELECT gp_inject_fault('gg_duckdb_before_batch', 'reset', dbid) FROM gp_segment_configuration WHERE role = 'p' AND content = 0;
+ gp_inject_fault 
+-----------------
+ Success:        
+(1 row)
+1: SELECT k, count(*), sum(n) FROM iso_t GROUP BY k ORDER BY k LIMIT 3;
+ k | count | sum    
+---+-------+--------
+ 0 | 300   | 0.00   
+ 1 | 300   | 75.00  
+ 2 | 300   | 150.00 
+(3 rows)
+1: SELECT gp_segment_id, (gg_duckdb.status()).errors, (gg_duckdb.status()).reopens FROM gp_dist_random('gp_id') ORDER BY 1;
+ gp_segment_id | errors | reopens 
+---------------+--------+---------
+ 0             | 0      | 0       
+ 1             | 0      | 0       
+ 2             | 0      | 0       
+(3 rows)
+1q: ... <quitting>

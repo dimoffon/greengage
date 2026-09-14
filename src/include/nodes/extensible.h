@@ -82,6 +82,15 @@ extern const ExtensibleNodeMethods *GetExtensibleNodeMethods(const char *name,
 #define CUSTOMPATH_SUPPORT_MARK_RESTORE		0x0002
 
 /*
+ * Greengage: a custom scan provider may also set these on CustomScan.flags so
+ * that the memory quota policy (memquota.c) treats the node like a Sort or
+ * Hash (memory intensive) and/or like a blocking operator.  Kept well above
+ * the CUSTOMPATH_* bits upstream may add.
+ */
+#define CUSTOMSCAN_GP_MEMORY_INTENSIVE	0x0100
+#define CUSTOMSCAN_GP_BLOCKING			0x0200
+
+/*
  * Custom path methods.  Mostly, we just need to know how to convert a
  * CustomPath to a plan.
  */

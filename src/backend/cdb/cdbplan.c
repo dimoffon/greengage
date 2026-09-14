@@ -336,6 +336,11 @@ plan_tree_mutator(Node *node,
 
 				FLATCOPY(newcscan, cscan, CustomScan);
 				SCANMUTATE(newcscan, cscan);
+				/* mirror plan_tree_walker(): the custom fields are part of the plan */
+				MUTATE(newcscan->custom_plans, cscan->custom_plans, List *);
+				MUTATE(newcscan->custom_exprs, cscan->custom_exprs, List *);
+				MUTATE(newcscan->custom_private, cscan->custom_private, List *);
+				MUTATE(newcscan->custom_scan_tlist, cscan->custom_scan_tlist, List *);
 				return (Node *) newcscan;
 			}
 			break;

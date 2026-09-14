@@ -1,0 +1,6 @@
+# gg_duckdb extension
+comment = 'DuckDB auxiliary executor for Greengage'
+default_version = '1.0'
+module_pathname = '$libdir/gg_duckdb'
+relocatable = false
+schema = gg_duckdb

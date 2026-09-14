@@ -37,6 +37,17 @@ typedef void (*create_upper_paths_hook_type) (PlannerInfo *root,
 											  void *extra);
 extern PGDLLIMPORT create_upper_paths_hook_type create_upper_paths_hook;
 
+/*
+ * Greengage: hook for plugins to post-process the finished PlannedStmt of
+ * standard_planner(), whichever optimizer produced it.  Slices, plan node
+ * ids and setrefs are final at that point.
+ */
+typedef PlannedStmt *(*post_planner_hook_type) (PlannedStmt *result,
+												Query *parse,
+												int cursorOptions,
+												ParamListInfo boundParams);
+extern PGDLLIMPORT post_planner_hook_type post_planner_hook;
+
 
 extern PlannedStmt *standard_planner(Query *parse, int cursorOptions,
 									 ParamListInfo boundParams);

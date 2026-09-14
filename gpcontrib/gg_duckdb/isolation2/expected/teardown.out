@@ -1,0 +1,13 @@
+DROP TABLE iso_t;
+DROP TABLE
+!\retcode gpconfig -c shared_preload_libraries -v "$(psql -At -c "SELECT array_to_string(array_remove(string_to_array(current_setting('shared_preload_libraries'), ','), 'gg_duckdb'), ',')" postgres)";
+-- start_ignore
+20260910:01:12:58:2274069 gpconfig:dvoronkov-nb:dvoronkov-[INFO]:-completed successfully with parameters '-c shared_preload_libraries -v '''
+
+-- end_ignore
+(exited with code 0)
+!\retcode gpstop -raq -M fast;
+-- start_ignore
+
+-- end_ignore
+(exited with code 0)

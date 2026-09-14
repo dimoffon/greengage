@@ -79,8 +79,6 @@ using namespace gpdbcost;
 // default id for the source system
 const CSystemId default_sysid(IMDId::EmdidGeneral, GPOS_WSZ_STR_LENGTH("GPDB"));
 
-plan_hint_hook_type plan_hint_hook = nullptr;
-
 // Check one-to-one mapping of row hint types
 GPOS_CPL_ASSERT(CRowHint::RVT_ABSOLUTE ==
 					(CRowHint::RowsValueType) RVT_ABSOLUTE,

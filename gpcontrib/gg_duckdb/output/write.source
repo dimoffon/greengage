@@ -1,0 +1,161 @@
+-- INSERT into gg_duckdb foreign tables: rows buffered in DuckDB for the
+-- transaction and written as one file per segment and transaction, named
+-- after the table's location pattern.
+CREATE EXTENSION IF NOT EXISTS gg_duckdb;
+NOTICE:  extension "gg_duckdb" already exists, skipping
+SET gg_duckdb.data_directories = '@abs_srcdir@/data';
+\! rm -rf @abs_srcdir@/data/write && mkdir -p @abs_srcdir@/data/write
+CREATE SERVER wsrv FOREIGN DATA WRAPPER gg_duckdb;
+CREATE FOREIGN TABLE w_parquet (id bigint, k int, v text, amt numeric(12,2), ts timestamp,
+    flag boolean, b bytea, d date, u uuid, f8 float8, c char(3), s smallint)
+    SERVER wsrv OPTIONS (location '@abs_srcdir@/data/write/parq_*.parquet');
+CREATE FOREIGN TABLE w_csv (id bigint, v text, amt numeric(8,2))
+    SERVER wsrv OPTIONS (location '@abs_srcdir@/data/write/rows_*.csv', format 'csv', header 'true');
+CREATE FOREIGN TABLE w_json (id bigint, v text)
+    SERVER wsrv OPTIONS (location '@abs_srcdir@/data/write/rows_*.json', format 'json');
+CREATE FOREIGN TABLE w_ro (id bigint)
+    SERVER wsrv OPTIONS (location '@abs_srcdir@/data/write/a.parquet, @abs_srcdir@/data/write/b.parquet');
+CREATE TABLE w_src AS
+SELECT i AS id, i % 7 AS k, CASE WHEN i % 11 = 0 THEN NULL ELSE 'v' || i END AS v,
+       ((i % 1000) / 4.0)::numeric(12,2) AS amt, timestamp '2024-01-01' + i * interval '1 minute' AS ts,
+       i % 3 = 0 AS flag, decode(md5(i::text), 'hex') AS b, date '2024-01-01' + i AS d,
+       md5(i::text)::uuid AS u, i / 7.0 AS f8, ('a' || (i % 10))::char(3) AS c, (i % 300)::smallint AS s
+FROM generate_series(1, 20000) i DISTRIBUTED BY (id);
+-- the plan names the writer and the file pattern
+EXPLAIN (COSTS OFF) INSERT INTO w_parquet SELECT * FROM w_src;
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Insert on w_parquet
+   DuckDB writer: parquet @abs_srcdir@/data/write/parq_gg-<transaction>-<segment>.parquet
+   ->  Seq Scan on w_src
+ Optimizer: Postgres-based planner
+(4 rows)
+
+-- every carried type round-trips through the file
+INSERT INTO w_parquet SELECT * FROM w_src;
+SELECT count(*) FROM w_parquet;
+ count 
+-------
+ 20000
+(1 row)
+
+SELECT count(*) FROM (TABLE w_src EXCEPT ALL SELECT * FROM w_parquet) x;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM (SELECT * FROM w_parquet EXCEPT ALL TABLE w_src) x;
+ count 
+-------
+     0
+(1 row)
+
+-- one file per segment that received rows
+SELECT count(*) AS files FROM gg_duckdb.foreign_files('w_parquet');
+ files 
+-------
+     3
+(1 row)
+
+-- a transaction that rolls back writes nothing
+BEGIN;
+INSERT INTO w_parquet SELECT * FROM w_src WHERE id <= 10;
+ROLLBACK;
+SELECT count(*) FROM w_parquet;
+ count 
+-------
+ 20000
+(1 row)
+
+-- savepoints: a rolled-back one takes its rows out, a released one keeps them
+BEGIN;
+INSERT INTO w_parquet SELECT * FROM w_src WHERE id <= 10;
+SAVEPOINT a;
+INSERT INTO w_parquet SELECT * FROM w_src WHERE id > 10 AND id <= 30;
+ROLLBACK TO a;
+SAVEPOINT b;
+INSERT INTO w_parquet SELECT * FROM w_src WHERE id > 30 AND id <= 35;
+RELEASE b;
+INSERT INTO w_parquet (id, k, v) VALUES (999999, 1, 'x') RETURNING id, v;
+   id   | v 
+--------+---
+ 999999 | x
+(1 row)
+
+COMMIT;
+SELECT count(*), sum(id) FROM w_parquet WHERE id <= 35 OR id = 999999;
+ count |   sum   
+-------+---------
+    51 | 1000849
+(1 row)
+
+-- an insert that fails writes nothing
+INSERT INTO w_parquet SELECT * FROM w_src WHERE 1 / (id - 50) > 0;
+ERROR:  division by zero  (seg1 127.0.1.1:9003 pid=2519656)
+SELECT count(*) FROM w_parquet;
+ count 
+-------
+ 20017
+(1 row)
+
+-- CSV and JSON, INSERT and COPY
+INSERT INTO w_csv VALUES (1, 'a,b', 1.25), (2, 'quo"ted', NULL), (3, NULL, 3.5);
+COPY w_csv FROM STDIN WITH (FORMAT csv);
+SELECT * FROM w_csv ORDER BY id;
+ id |    v    |  amt  
+----+---------+-------
+  1 | a,b     |  1.25
+  2 | quo"ted |      
+  3 |         |  3.50
+ 10 | ten     | 10.50
+ 11 | eleven  | 11.50
+(5 rows)
+
+INSERT INTO w_json SELECT id, v FROM w_src WHERE id <= 12;
+SELECT * FROM w_json ORDER BY id;
+ id |  v  
+----+-----
+  1 | v1
+  2 | v2
+  3 | v3
+  4 | v4
+  5 | v5
+  6 | v6
+  7 | v7
+  8 | v8
+  9 | v9
+ 10 | v10
+ 11 | 
+ 12 | v12
+(12 rows)
+
+-- what cannot be done
+INSERT INTO w_ro VALUES (1);
+ERROR:  foreign table "w_ro" does not allow inserts
+UPDATE w_parquet SET k = 1 WHERE id = 1;
+ERROR:  cannot update foreign table "w_parquet"
+DELETE FROM w_parquet WHERE id = 1;
+ERROR:  cannot delete from foreign table "w_parquet"
+-- a buffer larger than the memory budget spills, and the Parquet row groups
+-- shrink to the budget
+SET gg_duckdb.max_memory = '64MB';
+SET gg_duckdb.min_memory = '64MB';
+INSERT INTO w_parquet SELECT id + 1000000 * g, k, repeat(v, 200), amt, ts, flag, b, d, u, f8, c, s
+FROM w_src, generate_series(1, 10) g WHERE v IS NOT NULL;
+SELECT count(*), sum(length(v)) FROM w_parquet WHERE id > 1000000;
+ count  |    sum    
+--------+-----------
+ 181820 | 197988000
+(1 row)
+
+RESET gg_duckdb.max_memory;
+RESET gg_duckdb.min_memory;
+DROP SERVER wsrv CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to foreign table w_parquet
+drop cascades to foreign table w_csv
+drop cascades to foreign table w_json
+drop cascades to foreign table w_ro
+DROP TABLE w_src;
+\! rm -rf @abs_srcdir@/data/write
