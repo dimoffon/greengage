@@ -16,3 +16,4 @@
 /expected/write_optimizer.out
 /bench/tpcds/queries/
 /bench/tpcds/results/
+/bench/redset/results/

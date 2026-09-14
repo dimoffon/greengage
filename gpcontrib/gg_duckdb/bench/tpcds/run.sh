@@ -13,7 +13,10 @@
 # The runs of the modes are interleaved (off, auto, off, auto, ...) so drift
 # on the host affects them alike; a mode that fails a query is not retried.
 # Connection settings come from the PG* environment; PGOPTIONS may select the
-# optimizer (PGOPTIONS='-c optimizer=on').
+# optimizer (PGOPTIONS='-c optimizer=on').  The queries run in the schema named
+# like the directory the script is in (BENCH_SCHEMA overrides it), so another
+# workload's directory can hold a symlink to this script, its queries/ and a
+# warmup.sql of its own.
 set -uo pipefail
 export LC_NUMERIC=C	# psql, bc, sort -n and printf all agree on the decimal point
 runs=3
@@ -34,6 +37,8 @@ while getopts "n:q:m:o:t:s:" opt; do
 	esac
 done
 here=$(cd "$(dirname "$0")" && pwd)
+schema=${BENCH_SCHEMA:-$(basename "$here")}	# the schema the queries run in: the bench directory's name
+warmup=$(cat "$here/warmup.sql" 2> /dev/null || echo "SELECT r_reason_desc, count(*) FROM reason GROUP BY 1;")
 out=${out:-$here/results/$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$out"
 export PGOPTIONS="${PGOPTIONS:-}"
@@ -49,16 +54,17 @@ ratio() {	# a b -> a/b or -
 }
 
 # The session every measurement runs in: the schema, the timeout, and a tiny
-# forced region first, as a region opens DuckDB on every QE and on the
-# coordinator (about 30 ms once per session), which is not the query's cost.
+# forced region first (warmup.sql, or one over TPC-DS's reason table), as a
+# region opens DuckDB on every QE and on the coordinator (about 30 ms once per
+# session), which is not the query's cost.
 session() {	# mode
 	cat <<-SQL
-		SET search_path = tpcds;
+		SET search_path = $schema;
 		SET statement_timeout = '${timeout}s';
 		$settings
 		\\o /dev/null
 		SET gg_duckdb.mode = force; SET gg_duckdb.min_rows = 0;
-		SELECT r_reason_desc, count(*) FROM reason GROUP BY 1;
+		$warmup
 		RESET gg_duckdb.min_rows;
 		\\o
 		SET gg_duckdb.mode = $1;
@@ -75,7 +81,7 @@ run_once() {	# mode file outfile errfile -> ms of the file's statements together
 
 regions() {	# mode file -> GGDuckDBRegion nodes in the plans of the file's statements
 	{
-		echo "SET search_path = tpcds; SET gg_duckdb.mode = $1; SET statement_timeout = '${timeout}s'; $settings"
+		echo "SET search_path = $schema; SET gg_duckdb.mode = $1; SET statement_timeout = '${timeout}s'; $settings"
 		awk 'BEGIN { need = 1 }
 		     need && /^[[:space:]]*(--.*)?$/ { print; next }
 		     need { print "EXPLAIN (COSTS OFF)"; need = 0 }
