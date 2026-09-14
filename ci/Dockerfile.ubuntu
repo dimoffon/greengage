@@ -37,19 +37,40 @@ RUN set -eux; \
       protobuf==3.20.0 \
       pytest
 
+# DuckDB for gpcontrib/gg_duckdb: the release pinned in duckdb.version, built
+# once into a prefix that configure --with-duckdb points at. Only the build
+# script and its pins are copied, so a source edit does not rebuild DuckDB.
+FROM base AS duckdb
+
+COPY gpcontrib/gg_duckdb/duckdb /tmp/gg_duckdb_duckdb
+
+# DuckDB's unity-build translation units take 1-2 GB each at -O3. On a host
+# with strict overcommit (vm.overcommit_memory=2) what bounds the parallelism
+# is the free commit headroom, not the cores: one compile per core and then 8
+# both failed with "virtual memory exhausted" on a 20-core, 32 GB machine.
+ARG DUCKDB_JOBS=3
+
+RUN JOBS=${DUCKDB_JOBS} DUCKDB_SHELL=0 bash /tmp/gg_duckdb_duckdb/build.sh /usr/local/duckdb /tmp/duckdb-build && \
+    rm -rf /tmp/duckdb-build /tmp/gg_duckdb_duckdb
+
 FROM base AS build
+
+COPY --from=duckdb /usr/local/duckdb /usr/local/duckdb
 
 COPY . gpdb_src
 
 RUN mkdir bin_gpdb
 
+# SKIP_UNITTESTS=1 skips the mock unit tests for an image that is only run.
+ARG SKIP_UNITTESTS=
+
 ENV TARGET_OS_VERSION=22 \
     TARGET_OS=ubuntu \
     OUTPUT_ARTIFACT_DIR=bin_gpdb \
-    SKIP_UNITTESTS= \
+    SKIP_UNITTESTS=${SKIP_UNITTESTS} \
 # To set default locale for unittests
     LANG=en_US.UTF-8 \
-    CONFIGURE_FLAGS="--enable-debug-extensions --with-gssapi --enable-cassert --enable-debug --enable-depend"
+    CONFIGURE_FLAGS="--enable-debug-extensions --with-gssapi --enable-cassert --enable-debug --enable-depend --with-duckdb=/usr/local/duckdb"
 
 # Compile with running mocking tests
 RUN gpdb_src/concourse/scripts/compile_gpdb.bash
