@@ -1907,10 +1907,31 @@ value_conv_cost(const GGTypeInfo *ti, bool in)
  */
 /*
  * A direct leaf skips the executor's scan node and slot for every row the
- * scan visits: 14 ns a row measured on TPC-H lineitem, cost the executor
- * would have spent whether or not the region runs.
+ * scan visits: a row read directly costs 23.5 ns less than the executor's
+ * scan of it (count(*) over TPC-H lineitem, 2M rows a segment: 79 ms
+ * direct, 126 ms through gg_leaf), CONV_ROW_IN included.  Its values cost
+ * their conversion net of deforming them, which the executor's scan does as
+ * well: about 9 ns for a fixed-width or numeric value (count() of bigint,
+ * numeric and date columns, direct against the executor's own count less
+ * its transition), a string its copy as for any leaf.
  */
-#define SCAN_ROW_SAVED		0.001
+#define SCAN_ROW_SAVED		0.002
+#define CONV_DIRECT_FIXED_IN 0.0006
+
+static double
+direct_value_conv_cost(const GGTypeInfo *ti)
+{
+	switch (ti->typid)
+	{
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+		case BYTEAOID:
+			return value_conv_cost(ti, true);
+		default:
+			return CONV_DIRECT_FIXED_IN * gg_duckdb_cost_convert_factor;
+	}
+}
 
 static void
 charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
@@ -1922,7 +1943,8 @@ charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
 		return;
 	for (k = 0; k < cols->ncols; k++)
 		if (all || cols->used[k])
-			per_row += value_conv_cost(&cols->types[k], true);
+			per_row += cols->direct ? direct_value_conv_cost(&cols->types[k]) :
+				value_conv_cost(&cols->types[k], true);
 	if (cols->direct)
 	{
 		per_row -= SCAN_ROW_SAVED;
@@ -2170,9 +2192,9 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 		rs->types[k].typmod = typmod;
 		rs->attnos[k] = a;
 		ctx->scan_types[a - 1] = rs->types[k];
-		all_conv += value_conv_cost(&rs->types[k], true);
+		all_conv += direct_value_conv_cost(&rs->types[k]);
 		if (!bms_is_member(x, tlattrs))
-			filter_conv += value_conv_cost(&rs->types[k], true);
+			filter_conv += direct_value_conv_cost(&rs->types[k]);
 		k++;
 	}
 

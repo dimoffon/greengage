@@ -187,8 +187,21 @@ page reading and partitioned DynamicSeqScans are next.
   pushdown but no filter pushdown), so every visited row is converted: conversion is
   charged on `reltuples / numsegments` (replicated: `reltuples`), filter-only attributes
   at the leaf, the columns the parent uses by the parent; the skipped scan node is credited
-  `SCAN_ROW_SAVED` 0.001 a row (14 ns measured); the filter runs on every visited row in
-  either engine and is credited to neither. When the cost model draws the boundary it
+  `SCAN_ROW_SAVED` a row and its values cost their conversion net of deforming them, which
+  the executor's scan does too; the filter runs on every visited row in either engine and
+  is credited to neither. Measured on lineitem (2M rows a segment, `count()` of one column
+  at a time, direct / through `gg_leaf` / standard executor): `count(*)` 79 / 126 / 138 ms,
+  so a row read directly costs 23.5 ns less than the executor's scan of it
+  (`SCAN_ROW_SAVED` 0.002 with `CONV_ROW_IN`); bigint, numeric and date columns cost the
+  direct leaf about 9 ns a value beyond what the executor spends deforming and counting
+  them (`CONV_DIRECT_FIXED_IN` 0.0006, against 10-25 ns in the `gg_leaf` constants, which
+  include the deform); strings cost 22-38 ns, the existing string constants. The first
+  constants charged the deform: an l02-shaped join (orders ⋈ lineitem) was kept by the
+  executor at an estimated 9165 against 6005, while taking it measured 223 ms against 288
+  (the executor's hash join itself about 38 ms, DuckDB's about 13 ms). DuckDB's filter
+  over the converted rows is nearly free (q06's filter with `count(*)`: 182 ms direct,
+  185 ms for converting its three columns without it); what makes q06's executor scan the
+  better leaf is its output column, converted for every row visited. When the cost model draws the boundary it
   also picks the leaf kind: a filter keeping few rows makes the executor's scan cheaper
   (it converts only what it keeps). A first version credited the filter at DuckDB's
   operator factor, and that credit outweighed the conversion of a selective scan: TPC-H
