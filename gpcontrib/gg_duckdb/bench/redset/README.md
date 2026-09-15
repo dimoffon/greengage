@@ -82,3 +82,18 @@ deparsed, so q05 and q06 convert their rows even on Parquet; q06 loses 5-11%
 to a sort-only region the memory gate leaves behind (a planner estimate of
 25M groups for 240 real ones).  Ten of the 19 queries use `FILTER`, on which
 GPORCA falls back to the planner.
+
+With `date_trunc` and `extract` deparsed (the next change, 14 September), q05
+and q06 do not move (0.96-1.0x and 0.91-0.98x): both optimizers compute the
+expression in the scan below the region, and the planner, to which GPORCA
+falls back on FILTER, estimates 25M groups for `GROUP BY instance_id,
+date_trunc('day', arrival_timestamp)` where there are 4,550 (240 for the
+hours of q06).  That estimate picks a one-phase aggregate after the
+redistribution, which is slower for the executor itself (q05 and q06 together
+24.3 s, against 14.8 s with `gp_eager_two_phase_agg = on`), and it makes the
+memory gate decline the partial aggregates (a 2.8 GB working set against the
+256 MB budget).  With the two-phase plan forced and the budget raised, q06
+runs at 2.10x on the column tables (12.1 s to 5.8 s); on Parquet its native
+partial aggregate is still declined on a 52M-group estimate.  A bounded
+estimate for such expressions (24 hours, 7 weekdays, the column's range in
+days) is the lever for the load-over-time analyses.

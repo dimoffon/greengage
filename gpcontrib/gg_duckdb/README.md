@@ -11,7 +11,9 @@ hashed and sorted aggregates (`count`, `sum`, `min`, `max`, `bool_and`,
 `bool_or`, with DISTINCT and FILTER) including the partial and final phases of
 a two-phase aggregate, projections, and top chains of `ORDER BY`, `DISTINCT`
 and `LIMIT/OFFSET` over a whitelist of types, operators and functions whose
-DuckDB semantics equal PostgreSQL's. Leaves (scans, Motion receivers, shared
+DuckDB semantics equal PostgreSQL's (arithmetic, comparisons, `LIKE`, `CASE`,
+`COALESCE`, widening casts, `abs`, `length`, and `date_trunc` and `extract`
+over timestamps for the units both engines truncate and count alike). Leaves (scans, Motion receivers, shared
 scans, subquery scans, joins DuckDB may not run, anything else) stay ordinary
 plan nodes pulled by DuckDB on the backend thread, and the subtree under a leaf
 gets regions of its own; a projection DuckDB cannot compute stays with the
@@ -292,8 +294,9 @@ cancellation by `statement_timeout`. `deparse` covers the pass and the
 deparser: EXPLAIN shapes and decision notices, nine differential comparisons
 (grouped aggregates with expressions, FILTER, DISTINCT, collated min, int8 and
 numeric sums; sort-limit chains with NULLS FIRST/LAST and OFFSET; DISTINCT;
-regions above Redistribute Motion leaves), division by zero, the auto-mode
-gate, and the collation and float-sum rejections. `joins` covers milestone M3
+regions above Redistribute Motion leaves; integer aggregate states; date_trunc
+and extract), division by zero, the auto-mode gate, and the collation,
+float-sum and date-unit rejections. `joins` covers milestone M3
 with 19 differential comparisons: every join kind with NULL keys, three-way
 joins, a nested loop with an inequality, `UNION ALL` under an aggregate,
 two-phase aggregates across a Redistribute Motion (forced and as the

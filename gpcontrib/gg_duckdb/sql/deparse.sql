@@ -136,6 +136,34 @@ SELECT d_check($q$ SELECT cust, sum(big) AS sb, count(*) AS n FROM d_orders GROU
 SELECT cust, sum(big), avg(big), avg(qty), sum(big) FILTER (WHERE flag), avg(qty) FILTER (WHERE qty > 12)
   FROM d_orders WHERE cust IN (0, 1, 96) OR cust IS NULL GROUP BY cust ORDER BY cust;
 RESET optimizer_force_multistage_agg;
+
+-- date_trunc and extract over timestamps, for the units both engines agree
+-- on, where a region evaluates them itself: aggregate arguments and join
+-- conditions (a grouping expression is computed below the region, in the
+-- scan); an integer cast of an extract is exact, its fields count whole units
+SET gg_duckdb.mode = force;
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF)
+SELECT cust, max(date_trunc('day', ts)), sum(extract(hour FROM ts)::int), count(*) FILTER (WHERE extract(dow FROM ts) = 0)
+  FROM d_orders GROUP BY cust;
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT cust, max(date_trunc('day', ts)) AS d, min(date_trunc('week', ts)) AS w, max(date_trunc('month', ts)) AS m,
+                          min(date_trunc('quarter', ts)) AS q, max(date_trunc('milliseconds', ts)) AS ms, max(date_trunc('year', d)) AS yd,
+                          sum(extract(hour FROM ts)::int) AS h, sum(extract(dow FROM ts)::int) AS dow, sum(extract(doy FROM ts)::int8) AS doy,
+                          sum(extract(week FROM ts)::int) AS wk, sum(extract(isoyear FROM ts)::int) AS iy, sum(extract(year FROM d)::int) AS y,
+                          sum(extract(month FROM d)::int) AS mo, sum(extract(quarter FROM ts)::int) AS qt, sum(extract(decade FROM ts)::int) AS dc,
+                          count(*) FILTER (WHERE extract(isodow FROM ts) = 7) AS sundays, count(*) FILTER (WHERE extract(minute FROM ts) = 0) AS onthehour
+                   FROM d_orders GROUP BY cust $q$);
+SELECT d_check($q$ SELECT count(*) AS n FROM d_orders a JOIN d_orders b ON a.id = b.id
+                   WHERE date_trunc('week', a.ts) = date_trunc('week', b.ts) AND extract(hour FROM a.ts) = extract(hour FROM b.ts) $q$);
+SELECT cust, max(date_trunc('week', ts)) AS w, sum(extract(dow FROM ts)::int) AS dow, min(extract(isoyear FROM ts)) AS iy, count(*)
+  FROM d_orders WHERE cust < 3 GROUP BY cust ORDER BY cust;
+-- units the engines compute differently stay with the executor
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF) SELECT cust, max(date_trunc('century', ts)) FROM d_orders GROUP BY cust;  -- centuries start at year 1 here, at year 0 in DuckDB
+EXPLAIN (COSTS OFF) SELECT cust, max(extract(second FROM ts)) FROM d_orders GROUP BY cust;    -- fractional here, whole in DuckDB
+EXPLAIN (COSTS OFF) SELECT cust, max(date_trunc('hours', ts)) FROM d_orders GROUP BY cust;    -- a spelling the list does not carry
+SET gg_duckdb.explain_decisions = off;
 SET gp_enable_multiphase_agg = off;
 DROP TABLE d_dim;
 

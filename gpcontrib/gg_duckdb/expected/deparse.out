@@ -214,10 +214,10 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=1158469)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2314811)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=1158469)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2314811)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -409,6 +409,118 @@ SELECT cust, sum(big), avg(big), avg(qty), sum(big) FILTER (WHERE flag), avg(qty
 (4 rows)
 
 RESET optimizer_force_multistage_agg;
+-- date_trunc and extract over timestamps, for the units both engines agree
+-- on, where a region evaluates them itself: aggregate arguments and join
+-- conditions (a grouping expression is computed below the region, in the
+-- scan); an integer cast of an extract is exact, its fields count whole units
+SET gg_duckdb.mode = force;
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF)
+SELECT cust, max(date_trunc('day', ts)), sum(extract(hour FROM ts)::int), count(*) FILTER (WHERE extract(dow FROM ts) = 0)
+  FROM d_orders GROUP BY cust;
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(max(n1.c2) AS TIMESTAMP) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(sum(n1.c4) AS BIGINT) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c2 AS c1, CAST(max(date_trunc('day', n1.c5)) AS TIMESTAMP) AS c2, CAST(sum(CAST(CAST(date_part('hour', n1.c5) AS DOUBLE) AS INTEGER)) AS BIGINT) AS c3, CAST(count(*) FILTER (WHERE ((CAST(date_part('dow', n1.c5) AS DOUBLE)) = (CAST($1 AS DOUBLE)))) AS BIGINT) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c2) AS n2
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region_1.c1
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(9 rows)
+
+SET gg_duckdb.explain_decisions = off;
+SELECT d_check($q$ SELECT cust, max(date_trunc('day', ts)) AS d, min(date_trunc('week', ts)) AS w, max(date_trunc('month', ts)) AS m,
+                          min(date_trunc('quarter', ts)) AS q, max(date_trunc('milliseconds', ts)) AS ms, max(date_trunc('year', d)) AS yd,
+                          sum(extract(hour FROM ts)::int) AS h, sum(extract(dow FROM ts)::int) AS dow, sum(extract(doy FROM ts)::int8) AS doy,
+                          sum(extract(week FROM ts)::int) AS wk, sum(extract(isoyear FROM ts)::int) AS iy, sum(extract(year FROM d)::int) AS y,
+                          sum(extract(month FROM d)::int) AS mo, sum(extract(quarter FROM ts)::int) AS qt, sum(extract(decade FROM ts)::int) AS dc,
+                          count(*) FILTER (WHERE extract(isodow FROM ts) = 7) AS sundays, count(*) FILTER (WHERE extract(minute FROM ts) = 0) AS onthehour
+                   FROM d_orders GROUP BY cust $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'cust' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'cust' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT d_check($q$ SELECT count(*) AS n FROM d_orders a JOIN d_orders b ON a.id = b.id
+                   WHERE date_trunc('week', a.ts) = date_trunc('week', b.ts) AND extract(hour FROM a.ts) = extract(hour FROM b.ts) $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'n' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'n' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ d_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT cust, max(date_trunc('week', ts)) AS w, sum(extract(dow FROM ts)::int) AS dow, min(extract(isoyear FROM ts)) AS iy, count(*)
+  FROM d_orders WHERE cust < 3 GROUP BY cust ORDER BY cust;
+ cust |            w             | dow  |  iy  | count 
+------+--------------------------+------+------+-------
+    0 | Mon Jan 15 00:00:00 2024 | 1867 | 2024 |   618
+    1 | Mon Jan 15 00:00:00 2024 | 1873 | 2024 |   619
+    2 | Mon Jan 15 00:00:00 2024 | 1878 | 2024 |   619
+(3 rows)
+
+-- units the engines compute differently stay with the executor
+SET gg_duckdb.explain_decisions = on;
+EXPLAIN (COSTS OFF) SELECT cust, max(date_trunc('century', ts)) FROM d_orders GROUP BY cust;  -- centuries start at year 1 here, at year 0 in DuckDB
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(max(n1.c2) AS TIMESTAMP) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 3): not eligible: date_trunc('century')
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d_orders.cust
+               ->  Partial HashAggregate
+                     Group Key: d_orders.cust
+                     ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(9 rows)
+
+EXPLAIN (COSTS OFF) SELECT cust, max(extract(second FROM ts)) FROM d_orders GROUP BY cust;    -- fractional here, whole in DuckDB
+NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: final max over a double precision partial
+NOTICE:  gg_duckdb: Agg (plan node 3): not eligible: date_part('second')
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: cust
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: cust
+               ->  Partial HashAggregate
+                     Group Key: cust
+                     ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(9 rows)
+
+EXPLAIN (COSTS OFF) SELECT cust, max(date_trunc('hours', ts)) FROM d_orders GROUP BY cust;    -- a spelling the list does not carry
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(max(n1.c2) AS TIMESTAMP) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 3): not eligible: date_trunc('hours')
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d_orders.cust
+               ->  Partial HashAggregate
+                     Group Key: d_orders.cust
+                     ->  Seq Scan on d_orders
+ Optimizer: Postgres-based planner
+(9 rows)
+
+SET gg_duckdb.explain_decisions = off;
 SET gp_enable_multiphase_agg = off;
 DROP TABLE d_dim;
 -- a bad query never leaves the planner: plan-time validation declines it

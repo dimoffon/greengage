@@ -49,6 +49,7 @@
 
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
+#include "parser/scansup.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -517,6 +518,85 @@ deparse_opexpr(DeparseCtx *ctx, OpExpr *op, StringInfo out, GGTypeInfo *type)
 	REJECT(ctx, "operator %s on %s and %s", name, format_type_be(ltype), format_type_be(rtype));
 }
 
+/*
+ * date_trunc and date_part (extract) over a timestamp without time zone,
+ * for the units both engines truncate or count alike.  The unit is a text
+ * constant matched against a fixed list and emitted as a literal: a unit
+ * DuckDB spells differently must not reach it, nor one it computes
+ * differently (centuries and millennia start at year 1 here and at year 0
+ * there; extract's second and its fractions are fractional here and whole
+ * there).  date_part returns a double here and a BIGINT there.
+ */
+static const char *const date_trunc_units[] = {
+	"microseconds", "milliseconds", "second", "minute", "hour", "day", "week",
+	"month", "quarter", "year", "decade", NULL
+};
+static const char *const date_part_fields[] = {
+	"year", "month", "day", "hour", "minute", "quarter", "week", "dow", "isodow",
+	"doy", "isoyear", "decade", "century", "millennium", NULL
+};
+
+static bool
+deparse_date_func(DeparseCtx *ctx, FuncExpr *f, const char *name, StringInfo out, GGTypeInfo *type)
+{
+	bool		trunc = strcmp(name, "date_trunc") == 0;
+	const char *const *units = trunc ? date_trunc_units : date_part_fields;
+	Node	   *unit = (Node *) linitial(f->args);
+	Node	   *arg = (Node *) lsecond(f->args);
+	text	   *t;
+	char	   *u;
+	StringInfoData a;
+	GGTypeInfo	ta;
+
+	if (!IsA(unit, Const) || ((Const *) unit)->constisnull || ((Const *) unit)->consttype != TEXTOID)
+		REJECT(ctx, "%s with a non-constant unit", name);
+	t = DatumGetTextPP(((Const *) unit)->constvalue);
+	u = downcase_truncate_identifier(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), false);
+	for (; *units != NULL; units++)
+		if (strcmp(*units, u) == 0)
+			break;
+	if (*units == NULL)
+		REJECT(ctx, "%s('%s')", name, u);
+	initStringInfo(&a);
+	if (!deparse_expr(ctx, arg, &a, &ta))
+		return false;
+	if (ta.typid != TIMESTAMPOID && ta.typid != DATEOID)
+		REJECT(ctx, "%s over %s", name, format_type_be(ta.typid));
+	if (trunc)
+	{
+		gg_duckdb_type_map(TIMESTAMPOID, -1, type);
+		appendStringInfo(out, "date_trunc('%s', ", u);
+	}
+	else
+	{
+		/* PostgreSQL's date_part is a double, DuckDB's a BIGINT */
+		gg_duckdb_type_map(FLOAT8OID, -1, type);
+		appendStringInfo(out, "CAST(date_part('%s', ", u);
+	}
+	if (ta.typid == DATEOID)
+		appendStringInfo(out, "CAST(%s AS TIMESTAMP)", a.data);	/* date_part(text, date) is the SQL function casting its date */
+	else
+		appendStringInfoString(out, a.data);
+	appendStringInfoString(out, trunc ? ")" : ") AS DOUBLE)");
+	return true;
+}
+
+/* Is this a date_part (extract) call the deparser carries?  Its fields count whole units. */
+static bool
+is_date_part(Node *node)
+{
+	FuncExpr   *f;
+	char	   *name;
+
+	if (!IsA(node, FuncExpr))
+		return false;
+	f = (FuncExpr *) node;
+	if (list_length(f->args) != 2 || f->funcresulttype != FLOAT8OID)
+		return false;
+	name = get_func_name(f->funcid);
+	return name != NULL && strcmp(name, "date_part") == 0;
+}
+
 /* Builtin functions and casts with equal semantics. */
 static bool
 deparse_funcexpr(DeparseCtx *ctx, FuncExpr *f, StringInfo out, GGTypeInfo *type)
@@ -546,18 +626,29 @@ deparse_funcexpr(DeparseCtx *ctx, FuncExpr *f, StringInfo out, GGTypeInfo *type)
 	if (!builtin)
 		REJECT(ctx, "function %s is not an immutable builtin", name);
 
+	if (nargs == 2 && (strcmp(name, "date_trunc") == 0 || strcmp(name, "date_part") == 0) &&
+		argtype == TEXTOID)
+		return deparse_date_func(ctx, f, name, out, type);
+
 	if (nargs == 1)
 	{
 		initStringInfo(&a);
 		if (!deparse_expr(ctx, (Node *) linitial(f->args), &a, &ta))
 			return false;
 
-		/* widening casts among integers and floats */
+		/*
+		 * Widening casts among integers and floats, a date to a timestamp, and
+		 * an integer cast of an extract, whose fields count whole units so
+		 * the double is integral.
+		 */
 		if ((strcmp(name, "int4") == 0 && argtype == INT2OID) ||
 			(strcmp(name, "int8") == 0 && (argtype == INT2OID || argtype == INT4OID)) ||
 			(strcmp(name, "float8") == 0 && (argtype == INT2OID || argtype == INT4OID ||
 											 argtype == INT8OID || argtype == FLOAT4OID)) ||
-			(strcmp(name, "float4") == 0 && (argtype == INT2OID || argtype == INT4OID)))
+			(strcmp(name, "float4") == 0 && (argtype == INT2OID || argtype == INT4OID)) ||
+			(strcmp(name, "timestamp") == 0 && argtype == DATEOID) ||
+			((strcmp(name, "int4") == 0 || strcmp(name, "int8") == 0) && argtype == FLOAT8OID &&
+			 is_date_part((Node *) linitial(f->args))))
 		{
 			appendStringInfo(out, "CAST(%s AS %s)", a.data, gg_duckdb_type_sql(type));
 			return true;
