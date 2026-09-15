@@ -22,7 +22,8 @@ heap or append-optimized table is the exception: when the region can compute
 its target list and filter, it reads the table itself through `gg_rel(i)` (the
 scan's snapshot and visibility, no scan node, only the attributes DuckDB asks
 for; heap pages directly, append-optimized row and column tables through their
-table AM's projected scan), and the scan's filter runs in DuckDB. Every region query is prepared on the coordinator
+table AM's projected scan, and the partitions under GPORCA's Dynamic Seq Scan
+in turn), and the scan's filter runs in DuckDB. Every region query is prepared on the coordinator
 before it is used, so an ineligible or unbindable subtree simply stays on the
 standard executor. Partial `sum` and `avg` phases over numerics and bigints,
 and partial `avg` phases over integers and smallints, run in DuckDB too: the

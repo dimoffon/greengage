@@ -351,5 +351,74 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entr
  0 | 0
 (1 row)
 
+-- a partitioned table, which GPORCA scans with one DynamicSeqScan (the planner
+-- with an Append of scans): the direct leaf reads the selected partitions in
+-- turn, each through its own table AM, matching columns by name, since a
+-- partition created after a column was dropped numbers them differently
+CREATE TABLE r_dyn (id int, gone int, k int, v numeric(10,2), note text) DISTRIBUTED BY (id)
+    PARTITION BY RANGE (k) (START (0) END (20) EVERY (10));
+ALTER TABLE r_dyn DROP COLUMN gone;
+CREATE TABLE r_dyn_co (id int, k int, v numeric(10,2), note text)
+    WITH (appendonly=true, orientation=column) DISTRIBUTED BY (id);
+ALTER TABLE r_dyn ATTACH PARTITION r_dyn_co FOR VALUES FROM (20) TO (30);
+CREATE TABLE r_dyn_ao PARTITION OF r_dyn FOR VALUES FROM (30) TO (40) WITH (appendonly=true);
+NOTICE:  table has parent, setting distribution columns to match parent table
+INSERT INTO r_dyn SELECT i, i % 40, i / 3.0, 'n' || (i % 7) FROM generate_series(1, 20000) i;
+DELETE FROM r_dyn WHERE id % 11 = 0;
+ANALYZE r_dyn;
+SET gg_duckdb.mode = force;
+EXPLAIN (COSTS OFF)
+SELECT k % 4, count(*), sum(v) FROM r_dyn WHERE k >= 5 GROUP BY 1;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Custom Scan (GGDuckDBRegion)
+         DuckDB: Agg over 1 leaf
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: gg_duckdb_region_1."?column?"
+               ->  Custom Scan (GGDuckDBRegion)
+                     DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: r_dyn
+                     ->  Dynamic Seq Scan on r_dyn
+                           Number of partitions to scan: 4 (out of 4)
+                           Filter: (k >= 5)
+ Optimizer: GPORCA
+(12 rows)
+
+RESET gg_duckdb.mode;
+SELECT r_check($q$ SELECT k % 4 AS g, count(*) AS n, sum(v) AS s, max(note COLLATE "C") AS m FROM r_dyn WHERE k >= 5 GROUP BY 1 $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column(s) named 'g' as the Greengage Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+ r_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT r_check($q$ SELECT count(*) AS n FROM r_dyn $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ r_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT r_check($q$ SELECT note, count(*) AS n, sum(v) AS s FROM r_dyn WHERE k BETWEEN 15 AND 35 GROUP BY note $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ r_check 
+---------
+ 0 | 0
+(1 row)
+
+SELECT r_check($q$ SELECT d.label, count(*) AS n FROM r_dyn t JOIN r_dim d ON t.k = d.k GROUP BY d.label $q$);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause. Creating a NULL policy entry.
+ r_check 
+---------
+ 0 | 0
+(1 row)
+
 DROP FUNCTION r_check(text);
-DROP TABLE r_t, r_dim, r_empty, r_part, r_ao, r_co;
+DROP TABLE r_t, r_dim, r_empty, r_part, r_ao, r_co, r_dyn;

@@ -2121,6 +2121,27 @@ executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut
 
 /* ---------- direct leaves ---------- */
 
+/* Can a direct leaf read this relation: a plain table of a heap or append-optimized AM? */
+static bool
+direct_table(Oid relid, double *reltuples, bool *is_heap)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Form_pg_class classform;
+	bool		ok;
+
+	if (!HeapTupleIsValid(tp))
+		return false;
+	classform = (Form_pg_class) GETSTRUCT(tp);
+	ok = classform->relkind == RELKIND_RELATION &&
+		(classform->relam == HEAP_TABLE_AM_OID ||
+		 classform->relam == AO_ROW_TABLE_AM_OID ||
+		 classform->relam == AO_COLUMN_TABLE_AM_OID);
+	*reltuples = classform->reltuples;
+	*is_heap = classform->relam == HEAP_TABLE_AM_OID;
+	ReleaseSysCache(tp);
+	return ok;
+}
+
 /*
  * A sequential scan over a heap table as a direct leaf: the region computes
  * the scan's target list and filter over gg_rel(i), which returns the
@@ -2138,10 +2159,7 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	int			x;
 	int			k;
 	GGRelScan  *rs;
-	HeapTuple	tp;
-	Form_pg_class classform;
-	bool		heap;
-	Oid			relam;
+	bool		all_heap;
 	double		row_saved;
 	double		reltuples;
 	double		rows_scanned;
@@ -2154,20 +2172,33 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	OpCounts	c;
 	int			leafno = list_length(ctx->spec->leaves);
 
-	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	if (!HeapTupleIsValid(tp))
-		REJECT(ctx, "relation %u not found", relid);
-	classform = (Form_pg_class) GETSTRUCT(tp);
-	heap = classform->relkind == RELKIND_RELATION &&
-		(classform->relam == HEAP_TABLE_AM_OID ||
-		 classform->relam == AO_ROW_TABLE_AM_OID ||
-		 classform->relam == AO_COLUMN_TABLE_AM_OID);
-	reltuples = classform->reltuples;
-	relam = classform->relam;
-	ReleaseSysCache(tp);
-	row_saved = relam == HEAP_TABLE_AM_OID ? SCAN_ROW_SAVED : SCAN_ROW_SAVED_AO;
-	if (!heap)
+	if (IsA(plan, DynamicSeqScan))
+	{
+		/* the partitions the node scans, each a table a direct leaf can read */
+		DynamicSeqScan *ds = (DynamicSeqScan *) plan;
+		ListCell   *plc;
+		int			i = 0;
+
+		reltuples = 0.0;
+		all_heap = true;
+		foreach(plc, ds->partOids)
+		{
+			double		t;
+			bool		h;
+
+			if (bms_is_member(i++, ds->selected_parts))
+			{
+				if (!direct_table(lfirst_oid(plc), &t, &h))
+					REJECT(ctx, "partition %s is not a heap or append-optimized table",
+						   get_rel_name(lfirst_oid(plc)));
+				reltuples += Max(t, 0.0);
+				all_heap = all_heap && h;
+			}
+		}
+	}
+	else if (!direct_table(relid, &reltuples, &all_heap))
 		REJECT(ctx, "not a heap or append-optimized table");
+	row_saved = all_heap ? SCAN_ROW_SAVED : SCAN_ROW_SAVED_AO;
 
 	pull_varattnos((Node *) plan->targetlist, scan->scanrelid, &tlattrs);
 	attrs = bms_copy(tlattrs);
@@ -2326,7 +2357,11 @@ deparse_rel_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 static bool
 deparse_leaf_or_rel(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 {
-	if (gg_duckdb_direct_scans && IsA(plan, SeqScan) && plan->initPlan == NIL)
+	if (gg_duckdb_direct_scans && plan->initPlan == NIL &&
+		(IsA(plan, SeqScan) ||
+		 (IsA(plan, DynamicSeqScan) &&
+		  ((DynamicSeqScan *) plan)->join_prune_paramids == NIL &&
+		  ((DynamicSeqScan *) plan)->part_prune_info == NULL)))
 	{
 		DeparseAttempt attempt;
 

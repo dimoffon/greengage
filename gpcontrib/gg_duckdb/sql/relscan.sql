@@ -130,5 +130,28 @@ SELECT r_check($q$ SELECT a.qty, count(*) AS n, sum(c.amount) AS s FROM r_ao a J
 SELECT r_check($q$ SELECT k, (SELECT count(*) FROM (SELECT id FROM r_co WHERE qty = r_dim.k AND flag GROUP BY id) s) AS n
                    FROM r_dim $q$);
 
+-- a partitioned table, which GPORCA scans with one DynamicSeqScan (the planner
+-- with an Append of scans): the direct leaf reads the selected partitions in
+-- turn, each through its own table AM, matching columns by name, since a
+-- partition created after a column was dropped numbers them differently
+CREATE TABLE r_dyn (id int, gone int, k int, v numeric(10,2), note text) DISTRIBUTED BY (id)
+    PARTITION BY RANGE (k) (START (0) END (20) EVERY (10));
+ALTER TABLE r_dyn DROP COLUMN gone;
+CREATE TABLE r_dyn_co (id int, k int, v numeric(10,2), note text)
+    WITH (appendonly=true, orientation=column) DISTRIBUTED BY (id);
+ALTER TABLE r_dyn ATTACH PARTITION r_dyn_co FOR VALUES FROM (20) TO (30);
+CREATE TABLE r_dyn_ao PARTITION OF r_dyn FOR VALUES FROM (30) TO (40) WITH (appendonly=true);
+INSERT INTO r_dyn SELECT i, i % 40, i / 3.0, 'n' || (i % 7) FROM generate_series(1, 20000) i;
+DELETE FROM r_dyn WHERE id % 11 = 0;
+ANALYZE r_dyn;
+SET gg_duckdb.mode = force;
+EXPLAIN (COSTS OFF)
+SELECT k % 4, count(*), sum(v) FROM r_dyn WHERE k >= 5 GROUP BY 1;
+RESET gg_duckdb.mode;
+SELECT r_check($q$ SELECT k % 4 AS g, count(*) AS n, sum(v) AS s, max(note COLLATE "C") AS m FROM r_dyn WHERE k >= 5 GROUP BY 1 $q$);
+SELECT r_check($q$ SELECT count(*) AS n FROM r_dyn $q$);
+SELECT r_check($q$ SELECT note, count(*) AS n, sum(v) AS s FROM r_dyn WHERE k BETWEEN 15 AND 35 GROUP BY note $q$);
+SELECT r_check($q$ SELECT d.label, count(*) AS n FROM r_dyn t JOIN r_dim d ON t.k = d.k GROUP BY d.label $q$);
+
 DROP FUNCTION r_check(text);
-DROP TABLE r_t, r_dim, r_empty, r_part, r_ao, r_co;
+DROP TABLE r_t, r_dim, r_empty, r_part, r_ao, r_co, r_dyn;

@@ -158,8 +158,8 @@ isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed
 deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree. Direct scans
 (2026-09-15): heap and append-optimized tables under a region's sequential scans are read
-directly; partitioned DynamicSeqScans (GPORCA's partitioned tables) and bulk AOCO block
-decoding are next.
+directly, GPORCA's Dynamic Seq Scans partition by partition; bulk AOCO block decoding is
+next.
 
 ## Direct scans findings (2026-09-15)
 
@@ -219,6 +219,19 @@ decoding are next.
   still fills a slot (`SCAN_ROW_SAVED_AO` 0.0014); values cost the same 8-9.5 ns net of
   the deform. AOCO's per-datum `aocs_getnext` stays: decoding whole blocks into vectors
   would couple the extension to `datumstream.h`.
+- **Partitioned tables.** GPORCA scans a partitioned table with one Dynamic Seq Scan. When it
+  has no run-time pruning (`join_prune_paramids` and `part_prune_info` empty: the partitions
+  were selected at plan time) and every selected partition is heap or append-optimized, it
+  is one direct leaf: `gg_rel` opens the partitions the node's state lists, in turn, with
+  `AccessShareLock` as the node would, matches each partition's attributes to the
+  partitioned table's by name (`convert_tuples_by_name_map_if_req`: a partition created or
+  attached after a column was dropped numbers them differently), and reads each through
+  its own AM, heap pages or a slot of its own. The planner's Append of partition scans needed
+  nothing: each child is a direct leaf of its own. Conversion is charged on the selected
+  partitions' `reltuples`, and the AO row credit applies when any of them is not heap. On
+  Redset's provisioned tier (AOCO zstd, 14 weekly partitions, 75M rows; `count(*)` and two
+  sums grouped by `instance_id % 16`, GPORCA, forced, five runs): standard executor 3.83 s,
+  region over `gg_leaf` 3.06 s, over the direct leaf 2.46 s.
 - **Measured** (lineitem SF1, ORCA, warm, force; standard executor / region over
   `gg_leaf` / region over `gg_rel`): q01 shape (filter keeps 98%) 528 / 454 / 384 ms;
   unfiltered `count(*)` over `GROUP BY l_orderkey` 425 / 206 / 145 ms; q06 shape (filter

@@ -134,7 +134,9 @@ leaf, which the cost model chooses under `auto`. Append-optimized row and column
 are direct leaves too, through their table AM's projected scan (`table_beginscan_es`)
 rather than page reading: the AM keeps the visibility map, compression and column files,
 and the direct leaf still skips the scan node (14-16% off a q01-shaped region over AOCO or
-AO row lineitem).
+AO row lineitem). A GPORCA Dynamic Seq Scan without run-time partition pruning is one direct
+leaf that reads its selected partitions in turn, each through its AM, with columns matched to
+the partitioned table's by name (20% off a region over Redset's partitioned AOCO table).
 
 ### D5 — A cost gate with measured constants decides, per node, what goes to DuckDB
 

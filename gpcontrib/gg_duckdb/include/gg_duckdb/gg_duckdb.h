@@ -204,8 +204,17 @@ typedef struct GGLeaf
 	bool		eof;
 	int64		rows;			/* pulled so far */
 
-	/* a direct leaf (gg_rel): its heap scan, opened on the first batch */
+	/*
+	 * A direct leaf (gg_rel): the scan of its table, or of the partition of a
+	 * DynamicSeqScan it has reached, opened on the first batch.
+	 */
 	struct TableScanDescData *rel_scan;
+	struct RelationData *rel_part;	/* that partition, opened here; NULL for a plain scan */
+	struct TupleTableSlot *rel_slot;	/* the slot the table AM fills; NULL: heap pages */
+	int			rel_next_part;	/* the next table to open: a partition index, or 1 once a plain scan's opened */
+	int		   *rel_cur_att;	/* per gg_rel column: its 0-based attribute in the table read */
+	int			rel_cur_maxatt;	/* attributes to deform there */
+	int			rel_values_n;	/* allocated length of rel_values and rel_isnull */
 	Datum	   *rel_values;		/* by attribute, the deformed tuple */
 	bool	   *rel_isnull;
 } GGLeaf;

@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
@@ -291,6 +292,7 @@ describe_rel_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 {
 	int			n = st->leaf_rel_n[leafno];
 	Relation	rel;
+	Relation	root = NULL;
 	TupleDesc	rdesc;
 	int			k;
 
@@ -299,13 +301,24 @@ describe_rel_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 	lf->desc.rel_cols = NULL;
 	if (n < 0)
 		return;
-	if (!IsA(ps, SeqScanState))
+	if (IsA(ps, SeqScanState))
+	{
+		rel = ((ScanState *) ps)->ss_currentRelation;
+		if (rel->rd_rel->relam != HEAP_TABLE_AM_OID &&
+			rel->rd_rel->relam != AO_ROW_TABLE_AM_OID &&
+			rel->rd_rel->relam != AO_COLUMN_TABLE_AM_OID)
+			elog(ERROR, "gg_duckdb: direct leaf %d is not a heap or append-optimized table", leafno);
+	}
+	else if (IsA(ps, DynamicSeqScanState))
+	{
+		/*
+		 * The partitioned table, which the node opened and locked; its
+		 * partitions are checked as the leaf opens them.
+		 */
+		root = rel = table_open(exec_rt_fetch(((Scan *) ps->plan)->scanrelid, ps->state)->relid, NoLock);
+	}
+	else
 		elog(ERROR, "gg_duckdb: direct leaf %d is not a sequential scan", leafno);
-	rel = ((ScanState *) ps)->ss_currentRelation;
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID &&
-		rel->rd_rel->relam != AO_ROW_TABLE_AM_OID &&
-		rel->rd_rel->relam != AO_COLUMN_TABLE_AM_OID)
-		elog(ERROR, "gg_duckdb: direct leaf %d is not a heap or append-optimized table", leafno);
 	rdesc = RelationGetDescr(rel);
 	lf->desc.rel_att = MemoryContextAlloc(st->q.query_cxt, sizeof(int) * Max(n, 1));
 	lf->desc.rel_cols = MemoryContextAllocZero(st->q.query_cxt, sizeof(GGLeafCol) * Max(n, 1));
@@ -334,6 +347,8 @@ describe_rel_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 				 gg_duckdb_type_name(ti->duck),
 				 format_type_with_typemod(att->atttypid, att->atttypmod));
 	}
+	if (root != NULL)
+		table_close(root, NoLock);
 }
 
 static void
@@ -613,8 +628,12 @@ region_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		initStringInfo(&buf);
 		for (i = 0; i < st->nleaves; i++)
 			if (st->leaves[i].desc.nrel >= 0)
-				appendStringInfo(&buf, "%s%s", buf.len > 0 ? ", " : "",
-								 RelationGetRelationName(((ScanState *) st->leaves[i].ps)->ss_currentRelation));
+			{
+				PlanState  *lps = st->leaves[i].ps;
+				char	   *name = get_rel_name(exec_rt_fetch(((Scan *) lps->plan)->scanrelid, lps->state)->relid);
+
+				appendStringInfo(&buf, "%s%s", buf.len > 0 ? ", " : "", name ? name : "?");
+			}
 		if (buf.len > 0)
 			ExplainPropertyText("DuckDB direct scans", buf.data, es);
 	}

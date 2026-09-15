@@ -24,9 +24,12 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
 #include "access/tupmacs.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -239,50 +242,144 @@ leaf_put_row(const GGLeafCol *cols, int ncols, LeafInitData *id,
 	}
 }
 
-/* ---------- gg_rel: the heap table under a sequential scan, read directly ---------- */
+/* ---------- gg_rel: the tables under a sequential scan, read directly ---------- */
 
 /*
- * The scan of a direct leaf: over the relation its sequential scan opened
- * and locked, under the executor's snapshot, so that it returns the rows the
- * scan would have looked at.  The region's query applies the scan's filter.
- * The table AM is told which attributes DuckDB asks for, so that an
- * append-optimized column table opens only their files (none asked for, as
- * for count(*), lets it pick one); its visibility map applies inside the AM.
+ * Open the next table of a direct leaf, false when none is left.  A
+ * sequential scan has one, the relation it opened and locked; a
+ * DynamicSeqScan has the partitions it selected, which are opened and locked
+ * here in turn as that node would, their attributes matched to the
+ * partitioned table's by name (a partition created after a column was
+ * dropped numbers them differently).  The scan runs under the executor's
+ * snapshot, so that it returns the rows the scan node would have looked at;
+ * the region's query applies the node's filter.  The table AM is told which
+ * attributes DuckDB asks for, so that an append-optimized column table opens
+ * only their files (none asked for, as for count(*), lets it pick one); its
+ * visibility map applies inside the AM.
  */
-static void
-leaf_rel_begin(GGRegionState *region, GGLeaf *lf, LeafInitData *id)
+static bool
+leaf_rel_open_next(GGRegionState *region, GGLeaf *lf, LeafInitData *id)
 {
-	Relation	rel = ((ScanState *) lf->ps)->ss_currentRelation;
-	int			natts = RelationGetDescr(rel)->natts;
-	MemoryContext oldcxt = MemoryContextSwitchTo(region->q.query_cxt);
+	EState	   *estate = lf->ps->state;
+	Relation	rel;
+	TupleDesc	tdesc;
+	AttrNumber *map = NULL;
+	MemoryContext oldcxt;
 	bool	   *proj = NULL;
 	int			j;
+	int			k;
 
-	if (lf->rel_values == NULL)
+	if (IsA(lf->ps, DynamicSeqScanState))
 	{
-		lf->rel_values = palloc(sizeof(Datum) * Max(natts, 1));
-		lf->rel_isnull = palloc(sizeof(bool) * Max(natts, 1));
+		DynamicSeqScanState *ds = (DynamicSeqScanState *) lf->ps;
+		Relation	root;
+
+		if (lf->rel_next_part >= ds->nOids)
+			return false;
+		rel = table_open(ds->partOids[lf->rel_next_part++], AccessShareLock);
+		if (rel->rd_rel->relkind != RELKIND_RELATION ||
+			(rel->rd_rel->relam != HEAP_TABLE_AM_OID &&
+			 rel->rd_rel->relam != AO_ROW_TABLE_AM_OID &&
+			 rel->rd_rel->relam != AO_COLUMN_TABLE_AM_OID))
+		{
+			const char *name = pstrdup(RelationGetRelationName(rel));
+
+			table_close(rel, NoLock);
+			elog(ERROR, "gg_duckdb: partition %s cannot be read directly", name);
+		}
+		lf->rel_part = rel;
+		root = table_open(exec_rt_fetch(ds->scanrelid, estate)->relid, NoLock);
+		map = convert_tuples_by_name_map_if_req(RelationGetDescr(rel), RelationGetDescr(root),
+												"gg_duckdb: could not match the partition's columns");
+		table_close(root, NoLock);
 	}
+	else
+	{
+		if (lf->rel_next_part > 0)
+			return false;
+		lf->rel_next_part = 1;
+		rel = ((ScanState *) lf->ps)->ss_currentRelation;
+	}
+	tdesc = RelationGetDescr(rel);
+
+	oldcxt = MemoryContextSwitchTo(region->q.query_cxt);
+	if (lf->rel_values_n < tdesc->natts || lf->rel_values == NULL)
+	{
+		lf->rel_values = palloc(sizeof(Datum) * Max(tdesc->natts, 1));
+		lf->rel_isnull = palloc(sizeof(bool) * Max(tdesc->natts, 1));
+		lf->rel_values_n = tdesc->natts;
+	}
+	if (lf->rel_cur_att == NULL)
+		lf->rel_cur_att = palloc(sizeof(int) * Max(lf->desc.nrel, 1));
+	for (k = 0; k < lf->desc.nrel; k++)
+	{
+		int			a = lf->desc.rel_att[k];
+
+		if (map != NULL)
+		{
+			if (map[a] <= 0)
+				elog(ERROR, "gg_duckdb: column %d of the partitioned table is not a column of partition %s",
+					 a + 1, RelationGetRelationName(rel));
+			a = map[a] - 1;
+		}
+		lf->rel_cur_att[k] = a;
+	}
+	lf->rel_cur_maxatt = 0;
 	for (j = 0; j < id->ncols; j++)
 	{
+		int			a;
+
 		if (id->col[j] >= lf->desc.nrel)
 			continue;			/* the placeholder column */
+		a = lf->rel_cur_att[id->col[j]];
 		if (proj == NULL)
-			proj = palloc0(sizeof(bool) * Max(natts, 1));
-		proj[lf->desc.rel_att[id->col[j]]] = true;
+			proj = palloc0(sizeof(bool) * Max(tdesc->natts, 1));
+		proj[a] = true;
+		lf->rel_cur_maxatt = Max(lf->rel_cur_maxatt, a + 1);
 	}
-	lf->rel_scan = table_beginscan_es(rel, lf->ps->state->es_snapshot, NIL, NIL, proj, NIL);
+	lf->rel_scan = table_beginscan_es(rel, estate->es_snapshot, NIL, NIL, proj, NIL);
+	if (rel->rd_rel->relam == HEAP_TABLE_AM_OID && (lf->rel_scan->rs_flags & SO_ALLOW_PAGEMODE))
+		lf->rel_slot = NULL;	/* heap pages, deformed in place */
+	else if (lf->rel_part != NULL)
+		lf->rel_slot = table_slot_create(rel, NULL);
+	else
+		lf->rel_slot = ((ScanState *) lf->ps)->ss_ScanTupleSlot;
 	MemoryContextSwitchTo(oldcxt);
+	if (map != NULL)
+		pfree(map);
+	return true;
 }
 
-void
-gg_duckdb_leaf_rel_close(GGLeaf *lf)
+/* End the scan of the table a direct leaf is reading, and close a partition. */
+static void
+leaf_rel_close_current(GGLeaf *lf)
 {
+	if (lf->rel_slot != NULL)
+	{
+		if (lf->rel_part != NULL)
+			ExecDropSingleTupleTableSlot(lf->rel_slot);
+		else
+			ExecClearTuple(lf->rel_slot);
+		lf->rel_slot = NULL;
+	}
 	if (lf->rel_scan != NULL)
 	{
 		table_endscan(lf->rel_scan);
 		lf->rel_scan = NULL;
 	}
+	if (lf->rel_part != NULL)
+	{
+		table_close(lf->rel_part, NoLock);	/* the lock stays, as the scan node's would */
+		lf->rel_part = NULL;
+	}
+}
+
+/* At the end of the region or before a rescan: the next batch starts over. */
+void
+gg_duckdb_leaf_rel_close(GGLeaf *lf)
+{
+	leaf_rel_close_current(lf);
+	lf->rel_next_part = 0;
 }
 
 /* The first `natts` attributes of a heap tuple: slot_deform_heap_tuple without the slot. */
@@ -343,11 +440,12 @@ leaf_rel_deform(TupleDesc tdesc, HeapTupleHeader tup, int natts, Datum *values, 
 }
 
 /*
- * Up to `capacity` rows of a direct leaf.  A heap table under an MVCC
- * snapshot (what a query has) is read a page at a time: heapgetpage prunes
- * the page and lists its visible tuples, which are deformed in place while
- * the page stays pinned.  Otherwise, an append-optimized table typically,
- * the table AM's scan fills the sequential scan's own slot.
+ * Up to `capacity` rows of a direct leaf, moving on to the next table when
+ * one is done.  A heap table under an MVCC snapshot (what a query has) is
+ * read a page at a time: heapgetpage prunes the page and lists its visible
+ * tuples, which are deformed in place while the page stays pinned.
+ * Otherwise, an append-optimized table typically, the table AM's scan fills
+ * a slot.
  */
 static idx_t
 leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
@@ -356,17 +454,17 @@ leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
 {
 	idx_t		n = 0;
 
-	if (lf->rel_scan == NULL)
-		leaf_rel_begin(region, lf, id);
-
-	if (lf->rel_scan->rs_rd->rd_rel->relam == HEAP_TABLE_AM_OID &&
-		(lf->rel_scan->rs_flags & SO_ALLOW_PAGEMODE))
+	while (n < capacity)
 	{
-		HeapScanDesc hs = (HeapScanDesc) lf->rel_scan;
-		TupleDesc	tdesc = RelationGetDescr(lf->rel_scan->rs_rd);
-
-		while (n < capacity)
+		if (lf->rel_scan == NULL && !leaf_rel_open_next(region, lf, id))
 		{
+			lf->eof = true;
+			break;
+		}
+
+		if (lf->rel_slot == NULL)
+		{
+			HeapScanDesc hs = (HeapScanDesc) lf->rel_scan;
 			Page		page;
 			HeapTupleHeader tup;
 
@@ -376,8 +474,8 @@ leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
 
 				if (blk >= hs->rs_nblocks)
 				{
-					lf->eof = true;
-					break;
+					leaf_rel_close_current(lf);
+					continue;
 				}
 				heapgetpage(lf->rel_scan, blk); /* checks for interrupts */
 				hs->rs_inited = true;
@@ -388,34 +486,32 @@ leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
 			tup = (HeapTupleHeader) PageGetItem(page,
 												PageGetItemId(page, hs->rs_vistuples[hs->rs_cindex]));
 			hs->rs_cindex++;
-			leaf_rel_deform(tdesc, tup, id->maxatt, lf->rel_values, lf->rel_isnull);
+			leaf_rel_deform(RelationGetDescr(lf->rel_scan->rs_rd), tup, lf->rel_cur_maxatt,
+							lf->rel_values, lf->rel_isnull);
 			MemoryContextSwitchTo(region->q.batch_cxt);
 			leaf_put_row(cols, ncols, id, targets, staged, buf, n,
-						 lf->rel_values, lf->rel_isnull, lf->desc.rel_att);
+						 lf->rel_values, lf->rel_isnull, lf->rel_cur_att);
 			MemoryContextSwitchTo(oldcxt);
-			n++;
 		}
-	}
-	else
-	{
-		TupleTableSlot *slot = ((ScanState *) lf->ps)->ss_ScanTupleSlot;
-
-		while (n < capacity)
+		else
 		{
+			TupleTableSlot *slot = lf->rel_slot;
+
 			if (!table_scan_getnextslot(lf->rel_scan, ForwardScanDirection, slot))
 			{
-				lf->eof = true;
-				break;
+				leaf_rel_close_current(lf);
+				continue;
 			}
-			if (id->maxatt > 0)
-				slot_getsomeattrs(slot, id->maxatt);
+			if (lf->rel_cur_maxatt > 0)
+				slot_getsomeattrs(slot, lf->rel_cur_maxatt);
 			MemoryContextSwitchTo(region->q.batch_cxt);
 			leaf_put_row(cols, ncols, id, targets, staged, buf, n,
-						 slot->tts_values, slot->tts_isnull, lf->desc.rel_att);
+						 slot->tts_values, slot->tts_isnull, lf->rel_cur_att);
 			MemoryContextSwitchTo(oldcxt);
-			n++;
-			CHECK_FOR_INTERRUPTS();
+			if ((n & 1023) == 0)
+				CHECK_FOR_INTERRUPTS();
 		}
+		n++;
 	}
 	return n;
 }
