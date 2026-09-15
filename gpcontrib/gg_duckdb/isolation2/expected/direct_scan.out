@@ -80,3 +80,61 @@ SET
 
 DROP TABLE iso_ds;
 DROP TABLE
+
+-- the same for an append-optimized column table: its visibility map
+CREATE TABLE iso_dsco (id int, v int) WITH (appendonly=true, orientation=column) DISTRIBUTED BY (id);
+CREATE TABLE
+INSERT INTO iso_dsco SELECT i, i % 10 FROM generate_series(1, 100000) i;
+INSERT 0 100000
+
+1: SET gg_duckdb.mode = force;
+SET
+1: BEGIN ISOLATION LEVEL REPEATABLE READ;
+BEGIN
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 10000 
+ 1 | 10000 
+ 2 | 10000 
+(3 rows)
+DELETE FROM iso_dsco WHERE v = 1;
+DELETE 10000
+UPDATE iso_dsco SET v = 2 WHERE v = 0 AND id < 5000;
+UPDATE 499
+2: BEGIN;
+BEGIN
+2: INSERT INTO iso_dsco SELECT i, 0 FROM generate_series(1, 1000) i;
+INSERT 0 1000
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 10000 
+ 1 | 10000 
+ 2 | 10000 
+(3 rows)
+1: COMMIT;
+COMMIT
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 9501  
+ 2 | 10499 
+ 3 | 10000 
+(3 rows)
+2: ABORT;
+ROLLBACK
+1: SET gg_duckdb.mode = off;
+SET
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 9501  
+ 2 | 10499 
+ 3 | 10000 
+(3 rows)
+1q: ... <quitting>
+2q: ... <quitting>
+
+DROP TABLE iso_dsco;
+DROP TABLE

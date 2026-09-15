@@ -30,3 +30,25 @@ UPDATE iso_ds SET v = 2 WHERE v = 0 AND id < 5000;
 2q:
 
 DROP TABLE iso_ds;
+
+-- the same for an append-optimized column table: its visibility map
+CREATE TABLE iso_dsco (id int, v int) WITH (appendonly=true, orientation=column) DISTRIBUTED BY (id);
+INSERT INTO iso_dsco SELECT i, i % 10 FROM generate_series(1, 100000) i;
+
+1: SET gg_duckdb.mode = force;
+1: BEGIN ISOLATION LEVEL REPEATABLE READ;
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+DELETE FROM iso_dsco WHERE v = 1;
+UPDATE iso_dsco SET v = 2 WHERE v = 0 AND id < 5000;
+2: BEGIN;
+2: INSERT INTO iso_dsco SELECT i, 0 FROM generate_series(1, 1000) i;
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+1: COMMIT;
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+2: ABORT;
+1: SET gg_duckdb.mode = off;
+1: SELECT v, count(*) FROM iso_dsco GROUP BY v ORDER BY v LIMIT 3;
+1q:
+2q:
+
+DROP TABLE iso_dsco;

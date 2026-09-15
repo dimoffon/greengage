@@ -65,6 +65,7 @@ typedef struct NodeCols
 	Plan	   *leaf;			/* the node when it is a converted leaf, else NULL */
 	bool	   *used;			/* of a leaf: columns the parent's expressions reference */
 	bool		direct;			/* of a leaf: read directly (gg_rel) */
+	double		row_saved;		/* of a direct leaf: SCAN_ROW_SAVED of its table AM */
 	double		leaf_rows;		/* of a direct leaf: rows converted, those the scan visits */
 } NodeCols;
 
@@ -1916,6 +1917,14 @@ value_conv_cost(const GGTypeInfo *ti, bool in)
  * its transition), a string its copy as for any leaf.
  */
 #define SCAN_ROW_SAVED		0.002
+/*
+ * An append-optimized table's AM fills the scan's slot for the direct leaf as
+ * well, so less is saved: count(*) over lineitem copies read directly /
+ * through gg_leaf / by the executor, 82 / 167 / 121 ms column-oriented and
+ * 248 / 333 / 293 ms row-oriented, 13.5-16.5 ns a row below the executor's
+ * scan; their values cost the direct leaf the same 8-9.5 ns.
+ */
+#define SCAN_ROW_SAVED_AO	0.0014
 #define CONV_DIRECT_FIXED_IN 0.0006
 
 static double
@@ -1947,7 +1956,7 @@ charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
 				value_conv_cost(&cols->types[k], true);
 	if (cols->direct)
 	{
-		per_row -= SCAN_ROW_SAVED;
+		per_row -= cols->row_saved;
 		ctx->spec->conv_in += cols->leaf_rows * per_row;
 	}
 	else
@@ -2132,6 +2141,8 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	HeapTuple	tp;
 	Form_pg_class classform;
 	bool		heap;
+	Oid			relam;
+	double		row_saved;
 	double		reltuples;
 	double		rows_scanned;
 	double		filter_conv = 0.0;
@@ -2147,11 +2158,16 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	if (!HeapTupleIsValid(tp))
 		REJECT(ctx, "relation %u not found", relid);
 	classform = (Form_pg_class) GETSTRUCT(tp);
-	heap = classform->relkind == RELKIND_RELATION && classform->relam == HEAP_TABLE_AM_OID;
+	heap = classform->relkind == RELKIND_RELATION &&
+		(classform->relam == HEAP_TABLE_AM_OID ||
+		 classform->relam == AO_ROW_TABLE_AM_OID ||
+		 classform->relam == AO_COLUMN_TABLE_AM_OID);
 	reltuples = classform->reltuples;
+	relam = classform->relam;
 	ReleaseSysCache(tp);
+	row_saved = relam == HEAP_TABLE_AM_OID ? SCAN_ROW_SAVED : SCAN_ROW_SAVED_AO;
 	if (!heap)
-		REJECT(ctx, "not a heap table");
+		REJECT(ctx, "not a heap or append-optimized table");
 
 	pull_varattnos((Node *) plan->targetlist, scan->scanrelid, &tlattrs);
 	attrs = bms_copy(tlattrs);
@@ -2261,7 +2277,7 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	{
 		double		leaf_conv = plan_conv_cost(plan);
 		double		direct_conv = rows_scanned *
-			(CONV_ROW_IN * gg_duckdb_cost_convert_factor - SCAN_ROW_SAVED + all_conv);
+			(CONV_ROW_IN * gg_duckdb_cost_convert_factor - row_saved + all_conv);
 
 		if (leaf_conv >= 0.0 && leaf_conv <= direct_conv)
 			REJECT(ctx, "reading the table directly converts more than the scan's output");
@@ -2276,6 +2292,7 @@ deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCol
 	cols->leaf = plan;
 	cols->used = palloc0(sizeof(bool) * Max(cols->ncols, 1));
 	cols->direct = true;
+	cols->row_saved = row_saved;
 	cols->leaf_rows = rows_scanned;
 	appendBinaryStringInfo(out, sql.data, sql.len);
 	return true;

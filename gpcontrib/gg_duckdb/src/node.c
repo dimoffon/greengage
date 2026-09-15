@@ -302,8 +302,10 @@ describe_rel_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 	if (!IsA(ps, SeqScanState))
 		elog(ERROR, "gg_duckdb: direct leaf %d is not a sequential scan", leafno);
 	rel = ((ScanState *) ps)->ss_currentRelation;
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
-		elog(ERROR, "gg_duckdb: direct leaf %d is not a heap table", leafno);
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID &&
+		rel->rd_rel->relam != AO_ROW_TABLE_AM_OID &&
+		rel->rd_rel->relam != AO_COLUMN_TABLE_AM_OID)
+		elog(ERROR, "gg_duckdb: direct leaf %d is not a heap or append-optimized table", leafno);
 	rdesc = RelationGetDescr(rel);
 	lf->desc.rel_att = MemoryContextAlloc(st->q.query_cxt, sizeof(int) * Max(n, 1));
 	lf->desc.rel_cols = MemoryContextAllocZero(st->q.query_cxt, sizeof(GGLeafCol) * Max(n, 1));

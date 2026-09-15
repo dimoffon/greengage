@@ -157,8 +157,9 @@ Motion/ShareInputScan leaves — M4 hints, cost calibration, benchmarks — M5 n
 isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed and
 deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Out of scope: DuckDB tables, DDL or writes
 through DuckDB, MotherDuck, runtime fallback to the original subtree. Direct scans
-(2026-09-15): heap tables under a region's sequential scans are read directly; AO/AOCO
-page reading and partitioned DynamicSeqScans are next.
+(2026-09-15): heap and append-optimized tables under a region's sequential scans are read
+directly; partitioned DynamicSeqScans (GPORCA's partitioned tables) and bulk AOCO block
+decoding are next.
 
 ## Direct scans findings (2026-09-15)
 
@@ -206,6 +207,18 @@ page reading and partitioned DynamicSeqScans are next.
   (it converts only what it keeps). A first version credited the filter at DuckDB's
   operator factor, and that credit outweighed the conversion of a selective scan: TPC-H
   q19 ran at 0.58x under `auto` (1.02x with direct scans off), q12 at 0.86x, q06 at 0.93x.
+- **Append-optimized tables.** A direct leaf over an AO row or AOCO table opens the table
+  AM's scan with `table_beginscan_es`, passing the attributes DuckDB's projection asks for
+  (none for `count(*)`: AOCO picks one column), and pulls rows through the AM into the
+  sequential scan's own virtual slot; the visibility map applies inside the AM. The heap
+  page loop is used only when the table is heap. Measured on SF1 lineitem copies (ORCA,
+  medians of 5; standard executor / direct / `gg_leaf`): AOCO (zstd) `count(*)` 121 / 82
+  / 167 ms, three columns 264 / 246 / 347, the q01 shape 1193 / 588 / 685; AO row
+  `count(*)` 293 / 248 / 333, three columns 326 / 310 / 406, q01 727 / 526 / 626. A row
+  read directly saves 13.5-16.5 ns against the executor's scan (heap: 23.5), since the AM
+  still fills a slot (`SCAN_ROW_SAVED_AO` 0.0014); values cost the same 8-9.5 ns net of
+  the deform. AOCO's per-datum `aocs_getnext` stays: decoding whole blocks into vectors
+  would couple the extension to `datumstream.h`.
 - **Measured** (lineitem SF1, ORCA, warm, force; standard executor / region over
   `gg_leaf` / region over `gg_rel`): q01 shape (filter keeps 98%) 528 / 454 / 384 ms;
   unfiltered `count(*)` over `GROUP BY l_orderkey` 425 / 206 / 145 ms; q06 shape (filter

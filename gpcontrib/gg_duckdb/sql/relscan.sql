@@ -91,5 +91,44 @@ EXECUTE r_p(0);
 RESET gg_duckdb.mode;
 DEALLOCATE r_p;
 
+-- append-optimized tables: the table AM's own scan, told which attributes
+-- DuckDB asks for; deleted and updated rows through the visibility map
+CREATE TABLE r_ao (id int, qty int, amount numeric(12,2), note text, d date, flag bool)
+    WITH (appendonly=true) DISTRIBUTED BY (id);
+CREATE TABLE r_co (id int, qty int, amount numeric(12,2), note text, d date, flag bool)
+    WITH (appendonly=true, orientation=column, compresstype=zstd) DISTRIBUTED BY (id);
+INSERT INTO r_ao
+    SELECT i, i % 50, (i % 997) / 8.0, CASE WHEN i % 13 = 0 THEN NULL ELSE 'note ' || (i % 101) END,
+           date '2024-01-01' + i % 400, i % 3 = 0
+    FROM generate_series(1, 30000) i;
+INSERT INTO r_co SELECT * FROM r_ao;
+DELETE FROM r_ao WHERE id % 10 = 0;
+DELETE FROM r_co WHERE id % 10 = 0;
+UPDATE r_ao SET qty = qty + 1, note = note || '*' WHERE id % 7 = 0;
+UPDATE r_co SET qty = qty + 1, note = note || '*' WHERE id % 7 = 0;
+ALTER TABLE r_ao ADD COLUMN extra int DEFAULT 7;
+ALTER TABLE r_co ADD COLUMN extra int DEFAULT 7;
+INSERT INTO r_ao (id, qty, amount, note, d, flag, extra) SELECT i, i % 50, i / 4.0, 'late ' || i, date '2025-01-01', true, i % 5 FROM generate_series(30001, 32000) i;
+INSERT INTO r_co (id, qty, amount, note, d, flag, extra) SELECT i, i % 50, i / 4.0, 'late ' || i, date '2025-01-01', true, i % 5 FROM generate_series(30001, 32000) i;
+ANALYZE r_ao;
+ANALYZE r_co;
+SET gg_duckdb.mode = force;
+EXPLAIN (COSTS OFF)
+SELECT qty, count(*), sum(amount) FROM r_co WHERE flag AND qty > 3 GROUP BY qty;
+EXPLAIN (COSTS OFF)
+SELECT qty, count(*), sum(amount) FROM r_ao WHERE flag AND qty > 3 GROUP BY qty;
+RESET gg_duckdb.mode;
+SELECT r_check($q$ SELECT qty, count(*) AS n, sum(amount) AS s, count(note) AS cn, min(d) AS md
+                   FROM r_ao WHERE flag AND qty > 3 GROUP BY qty $q$);
+SELECT r_check($q$ SELECT qty, count(*) AS n, sum(amount) AS s, count(note) AS cn, min(d) AS md
+                   FROM r_co WHERE flag AND qty > 3 GROUP BY qty $q$);
+SELECT r_check($q$ SELECT extra, count(*) AS n, sum(qty) AS s FROM r_ao GROUP BY extra $q$);
+SELECT r_check($q$ SELECT extra, count(*) AS n, sum(qty) AS s FROM r_co GROUP BY extra $q$);
+SELECT r_check($q$ SELECT count(*) AS n FROM r_co $q$);
+SELECT r_check($q$ SELECT a.qty, count(*) AS n, sum(c.amount) AS s FROM r_ao a JOIN r_co c ON a.id = c.id
+                   WHERE c.note LIKE 'note 1%' GROUP BY a.qty $q$);
+SELECT r_check($q$ SELECT k, (SELECT count(*) FROM (SELECT id FROM r_co WHERE qty = r_dim.k AND flag GROUP BY id) s) AS n
+                   FROM r_dim $q$);
+
 DROP FUNCTION r_check(text);
-DROP TABLE r_t, r_dim, r_empty, r_part;
+DROP TABLE r_t, r_dim, r_empty, r_part, r_ao, r_co;

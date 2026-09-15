@@ -130,7 +130,11 @@ in the region's SQL. A profile of the `gg_leaf` path put the scan node and slot 
 (`heapgetpage`, `HeapScanDescData.rs_vistuples`, the deforming loop copied from
 `slot_deform_heap_tuple`), and since the C API gives table functions no filter pushdown,
 every row visited is converted: a selective filter makes the executor's scan the cheaper
-leaf, which the cost model chooses under `auto`.
+leaf, which the cost model chooses under `auto`. Append-optimized row and column tables
+are direct leaves too, through their table AM's projected scan (`table_beginscan_es`)
+rather than page reading: the AM keeps the visibility map, compression and column files,
+and the direct leaf still skips the scan node (14-16% off a q01-shaped region over AOCO or
+AO row lineitem).
 
 ### D5 — A cost gate with measured constants decides, per node, what goes to DuckDB
 
@@ -194,8 +198,9 @@ DuckDB's Iceberg commits do not detect concurrent writers.
 ### D8 — What stays out
 
 DuckDB tables, DDL or writes through DuckDB, MotherDuck, runtime fallback to the original
-subtree once a region has started, reading append-optimized pages (heap tables are read
-directly since 2026-09-15, see D4), DuckDB worker threads (`threads > 1` is designed, not built), and ORCA memo-level
+subtree once a region has started, decoding append-optimized column blocks outside the
+table AM (heap and append-optimized tables are read directly since 2026-09-15, see D4),
+DuckDB worker threads (`threads > 1` is designed, not built), and ORCA memo-level
 operators (gated on a measured ≥2x from the pass and one documented query where a
 different shape would win).
 

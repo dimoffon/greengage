@@ -26,6 +26,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/tupmacs.h"
+#include "catalog/pg_am_d.h"
 #include "executor/executor.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -241,24 +242,36 @@ leaf_put_row(const GGLeafCol *cols, int ncols, LeafInitData *id,
 /* ---------- gg_rel: the heap table under a sequential scan, read directly ---------- */
 
 /*
- * The heap scan of a direct leaf: over the relation its sequential scan
- * opened and locked, under the executor's snapshot, so that it returns the
- * rows the scan would have looked at.  The region's query applies the scan's
- * filter.
+ * The scan of a direct leaf: over the relation its sequential scan opened
+ * and locked, under the executor's snapshot, so that it returns the rows the
+ * scan would have looked at.  The region's query applies the scan's filter.
+ * The table AM is told which attributes DuckDB asks for, so that an
+ * append-optimized column table opens only their files (none asked for, as
+ * for count(*), lets it pick one); its visibility map applies inside the AM.
  */
 static void
-leaf_rel_begin(GGRegionState *region, GGLeaf *lf)
+leaf_rel_begin(GGRegionState *region, GGLeaf *lf, LeafInitData *id)
 {
 	Relation	rel = ((ScanState *) lf->ps)->ss_currentRelation;
 	int			natts = RelationGetDescr(rel)->natts;
 	MemoryContext oldcxt = MemoryContextSwitchTo(region->q.query_cxt);
+	bool	   *proj = NULL;
+	int			j;
 
 	if (lf->rel_values == NULL)
 	{
 		lf->rel_values = palloc(sizeof(Datum) * Max(natts, 1));
 		lf->rel_isnull = palloc(sizeof(bool) * Max(natts, 1));
 	}
-	lf->rel_scan = table_beginscan(rel, lf->ps->state->es_snapshot, 0, NULL);
+	for (j = 0; j < id->ncols; j++)
+	{
+		if (id->col[j] >= lf->desc.nrel)
+			continue;			/* the placeholder column */
+		if (proj == NULL)
+			proj = palloc0(sizeof(bool) * Max(natts, 1));
+		proj[lf->desc.rel_att[id->col[j]]] = true;
+	}
+	lf->rel_scan = table_beginscan_es(rel, lf->ps->state->es_snapshot, NIL, NIL, proj, NIL);
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -330,10 +343,11 @@ leaf_rel_deform(TupleDesc tdesc, HeapTupleHeader tup, int natts, Datum *values, 
 }
 
 /*
- * Up to `capacity` rows of a direct leaf.  With an MVCC snapshot (what a
- * query has) the scan works a page at a time: heapgetpage prunes the page
- * and lists its visible tuples, which are deformed in place while the page
- * stays pinned.  Otherwise the scan fills the sequential scan's own slot.
+ * Up to `capacity` rows of a direct leaf.  A heap table under an MVCC
+ * snapshot (what a query has) is read a page at a time: heapgetpage prunes
+ * the page and lists its visible tuples, which are deformed in place while
+ * the page stays pinned.  Otherwise, an append-optimized table typically,
+ * the table AM's scan fills the sequential scan's own slot.
  */
 static idx_t
 leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
@@ -343,9 +357,10 @@ leaf_rel_rows(GGRegionState *region, GGLeaf *lf, LeafInitData *id,
 	idx_t		n = 0;
 
 	if (lf->rel_scan == NULL)
-		leaf_rel_begin(region, lf);
+		leaf_rel_begin(region, lf, id);
 
-	if (lf->rel_scan->rs_flags & SO_ALLOW_PAGEMODE)
+	if (lf->rel_scan->rs_rd->rd_rel->relam == HEAP_TABLE_AM_OID &&
+		(lf->rel_scan->rs_flags & SO_ALLOW_PAGEMODE))
 	{
 		HeapScanDesc hs = (HeapScanDesc) lf->rel_scan;
 		TupleDesc	tdesc = RelationGetDescr(lf->rel_scan->rs_rd);
