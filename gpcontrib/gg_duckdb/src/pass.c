@@ -358,7 +358,8 @@ make_region(PassContext *ctx, Plan *root, GGRegionSpec *spec)
 	cs->custom_exprs = NIL;
 	cs->custom_private = gg_duckdb_make_private(spec->sql, spec->flags, spec->leaves,
 												spec->label, spec->params,
-												spec->ncols, spec->outtypes, spec->natives);
+												spec->ncols, spec->outtypes, spec->natives,
+												spec->rels);
 	cs->custom_scan_tlist = scan_tlist;
 	cs->custom_relids = bms_make_singleton(rteidx);
 	cs->methods = &gg_duckdb_scan_methods;
@@ -405,6 +406,12 @@ validate_region(GGRegionSpec *spec, char **why)
 		descs[i] = palloc0(sizeof(GGLeafDesc));
 		gg_duckdb_describe_leaf_plan(descs[i], (Plan *) lfirst(lc));
 		i++;
+	}
+	foreach(lc, spec->rels)
+	{
+		GGRelScan  *rs = (GGRelScan *) lfirst(lc);
+
+		gg_duckdb_describe_rel_leaf(descs[rs->leaf], rs);
 	}
 	bctx.region = NULL;
 	bctx.nleaves = spec->nleaves;

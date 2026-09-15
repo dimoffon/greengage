@@ -21,39 +21,41 @@ SET gp_enable_multiphase_agg = off;
 EXPLAIN (COSTS OFF)
 SELECT id, count(*), sum(qty), min(amount), max(ts), bool_and(flag)
   FROM d_orders WHERE id < 3000 GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c4) AS DECIMAL(12,2)) AS c4, CAST(max(n1.c5) AS TIMESTAMP) AS c5, CAST(bool_and(n1.c8) AS BOOLEAN) AS c6 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c4) AS DECIMAL(12,2)) AS c4, CAST(max(n1.c5) AS TIMESTAMP) AS c5, CAST(bool_and(n1.c8) AS BOOLEAN) AS c6 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3, r0.c4 AS c4, r0.c5 AS c5, r0.c6 AS c6, r0.c7 AS c7, r0.c8 AS c8, r0.c9 AS c9, r0.c10 AS c10 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 GROUP BY n1.c1) AS n2
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Agg over 1 leaf
+         DuckDB direct scans: d_orders
          ->  Seq Scan on d_orders
                Filter: (id < 3000)
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT id, count(*) AS n FROM d_orders WHERE id < 30 GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
-                                                                                  QUERY PLAN                                                                                  
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT r0.c1 AS c1 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Output: gg_duckdb_region.id, (count(*))
    ->  Custom Scan (GGDuckDBRegion)
          Output: gg_duckdb_region.id, (count(*))
          DuckDB: Agg over 1 leaf
-         DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
+         DuckDB direct scans: d_orders
+         DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT r0.c1 AS c1 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 GROUP BY n1.c1) AS n2 ORDER BY c1 ASC NULLS LAST
          ->  Seq Scan on public.d_orders
                Output: d_orders.id
                Filter: (d_orders.id < 30)
  Optimizer: Postgres-based planner
  Settings: effective_cache_size = '512MB', gp_enable_multiphase_agg = 'off', optimizer = 'off'
-(11 rows)
+(12 rows)
 
 -- ORDER BY + LIMIT pushed to the segments
 EXPLAIN (COSTS OFF)
 SELECT id, amount FROM d_orders ORDER BY amount DESC, id LIMIT 5;
-NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT * FROM gg_leaf(0)) AS n1 ORDER BY c2 DESC NULLS FIRST, c1 ASC NULLS LAST LIMIT 5
+NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT r0.c1 AS c1, r0.c4 AS c2 FROM gg_rel(0) AS r0) AS n1 ORDER BY c2 DESC NULLS FIRST, c1 ASC NULLS LAST LIMIT 5
                            QUERY PLAN                            
 -----------------------------------------------------------------
  Limit
@@ -61,9 +63,10 @@ NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT
          Merge Key: gg_duckdb_region.amount, gg_duckdb_region.id
          ->  Custom Scan (GGDuckDBRegion)
                DuckDB: Limit Sort over 1 leaf
+               DuckDB direct scans: d_orders
                ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(7 rows)
+(8 rows)
 
 -- text ordering is refused under the database collation, accepted under "C"
 EXPLAIN (COSTS OFF)
@@ -84,7 +87,7 @@ NOTICE:  gg_duckdb: Sort (plan node 3): not eligible: sorting text under a non-C
 
 EXPLAIN (COSTS OFF)
 SELECT note, id FROM d_orders ORDER BY note COLLATE "C", id LIMIT 3;
-NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT * FROM gg_leaf(0)) AS n1 ORDER BY c1 ASC NULLS LAST, c2 ASC NULLS LAST LIMIT 3
+NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT * FROM (SELECT r0.c7 AS c1, r0.c1 AS c2, r0.c7 AS c3 FROM gg_rel(0) AS r0) AS n1 ORDER BY c1 ASC NULLS LAST, c2 ASC NULLS LAST LIMIT 3
                           QUERY PLAN                           
 ---------------------------------------------------------------
  Limit
@@ -92,9 +95,10 @@ NOTICE:  gg_duckdb: Limit (plan node 2): region [Limit Sort over 1 leaf]: SELECT
          Merge Key: gg_duckdb_region.note, gg_duckdb_region.id
          ->  Custom Scan (GGDuckDBRegion)
                DuckDB: Limit Sort over 1 leaf
+               DuckDB direct scans: d_orders
                ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(7 rows)
+(8 rows)
 
 SET gg_duckdb.explain_decisions = off;
 -- results equal the plain plan: materialise both and compare both ways
@@ -214,10 +218,10 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 -- division by zero is an error in both executors
 SET gg_duckdb.mode = force;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2314811)
+ERROR:  gg_duckdb: region query failed: Invalid Input Error: division by zero  (seg0 slice1 127.0.1.1:9002 pid=2248237)
 SET gg_duckdb.mode = off;
 SELECT id, sum(qty / (id - 7)) FROM d_orders WHERE id < 10 GROUP BY id ORDER BY id;
-ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2314811)
+ERROR:  division by zero  (seg0 slice1 127.0.1.1:9002 pid=2248237)
 -- the gate: auto mode needs gg_duckdb.min_rows estimated input rows
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 1000000;
@@ -253,9 +257,10 @@ EXPLAIN (COSTS OFF) SELECT id, count(*) FROM d_orders GROUP BY id;
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Agg over 1 leaf
+         DuckDB direct scans: d_orders
          ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(5 rows)
+(6 rows)
 
 RESET gg_duckdb.min_rows;
 RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_factor;
@@ -264,11 +269,14 @@ RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_factor;
 -- through a small one stays with the executor and the aggregates above it
 -- are the region; with the boundary off the maximal region (join and
 -- aggregates) is judged as a whole and declined.  The costs are the
--- measured defaults but for a small fixed cost.
+-- measured defaults but for a small fixed cost.  The leaves are pulled
+-- through the executor here (direct scans off): the direct scan's credit is
+-- tested in relscan.
 CREATE TABLE d_dim (id int, grp int, name text) DISTRIBUTED BY (id);
 INSERT INTO d_dim SELECT i, i % 5, 'dim ' || i FROM generate_series(0, 96) i;
 ANALYZE d_dim;
 SET gp_enable_multiphase_agg = on;
+SET gg_duckdb.direct_scans = off;
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 0;
 SET gg_duckdb.cost_fixed = 5;
@@ -340,6 +348,7 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 (1 row)
 
 RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.direct_scans;
 -- integer aggregate states: a partial sum/avg(bigint) or avg(integer/smallint)
 -- hands its final phase the executor's own transition state, so the phases
 -- split between DuckDB and the executor either way round (the final avg
@@ -357,9 +366,10 @@ SELECT cust, sum(big), avg(big), avg(qty), count(*) FROM d_orders GROUP BY cust;
                Hash Key: gg_duckdb_region.c1
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: d_orders
                      ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(9 rows)
+(10 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT cust, sum(big), count(*) FROM d_orders GROUP BY cust;
@@ -372,9 +382,10 @@ SELECT cust, sum(big), count(*) FROM d_orders GROUP BY cust;
                Hash Key: gg_duckdb_region_1.c1
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: d_orders
                      ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(9 rows)
+(10 rows)
 
 SELECT d_check($q$ SELECT cust, sum(big) AS sb, avg(big) AS ab, avg(qty) AS aq,
                           sum(big) FILTER (WHERE flag) AS sbf, avg(qty) FILTER (WHERE qty > 5) AS aqf, count(*) AS n
@@ -419,7 +430,7 @@ EXPLAIN (COSTS OFF)
 SELECT cust, max(date_trunc('day', ts)), sum(extract(hour FROM ts)::int), count(*) FILTER (WHERE extract(dow FROM ts) = 0)
   FROM d_orders GROUP BY cust;
 NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(max(n1.c2) AS TIMESTAMP) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(sum(n1.c4) AS BIGINT) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
-NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c2 AS c1, CAST(max(date_trunc('day', n1.c5)) AS TIMESTAMP) AS c2, CAST(sum(CAST(CAST(date_part('hour', n1.c5) AS DOUBLE) AS INTEGER)) AS BIGINT) AS c3, CAST(count(*) FILTER (WHERE ((CAST(date_part('dow', n1.c5) AS DOUBLE)) = (CAST($1 AS DOUBLE)))) AS BIGINT) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c2) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c2 AS c1, CAST(max(date_trunc('day', n1.c5)) AS TIMESTAMP) AS c2, CAST(sum(CAST(CAST(date_part('hour', n1.c5) AS DOUBLE) AS INTEGER)) AS BIGINT) AS c3, CAST(count(*) FILTER (WHERE ((CAST(date_part('dow', n1.c5) AS DOUBLE)) = (CAST($1 AS DOUBLE)))) AS BIGINT) AS c4 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3, r0.c4 AS c4, r0.c5 AS c5, r0.c6 AS c6, r0.c7 AS c7, r0.c8 AS c8, r0.c9 AS c9, r0.c10 AS c10 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c2) AS n2
                          QUERY PLAN                         
 ------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -429,9 +440,10 @@ NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (
                Hash Key: gg_duckdb_region_1.c1
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: d_orders
                      ->  Seq Scan on d_orders
  Optimizer: Postgres-based planner
-(9 rows)
+(10 rows)
 
 SET gg_duckdb.explain_decisions = off;
 SELECT d_check($q$ SELECT cust, max(date_trunc('day', ts)) AS d, min(date_trunc('week', ts)) AS w, max(date_trunc('month', ts)) AS m,
@@ -570,26 +582,28 @@ HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sur
 SET gg_duckdb.explain_decisions = on;
 EXPLAIN (COSTS OFF)
 SELECT id, cast(0 as decimal(12,2)) AS z, count(*) FROM d_orders WHERE id < 3000 GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST($1 AS DECIMAL(12,2)) AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST($2 AS DECIMAL(12,2)) AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3, r0.c4 AS c4, r0.c5 AS c5, r0.c6 AS c6, r0.c7 AS c7, r0.c8 AS c8, r0.c9 AS c9, r0.c10 AS c10 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 GROUP BY n1.c1) AS n2
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Agg over 1 leaf
+         DuckDB direct scans: d_orders
          ->  Seq Scan on d_orders
                Filter: (id < 3000)
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT id, sum(z), count(*) FROM (SELECT o.id, cast(0 as decimal(12,2)) AS z FROM d_orders o JOIN d_orders p ON o.id = p.id WHERE o.id < 100
                                   UNION ALL SELECT id, amount FROM d_orders WHERE id < 200) u GROUP BY id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 3 leaves]: SELECT * FROM (SELECT n4.c1 AS c1, CAST(sum(n4.c2) AS DECIMAL(38,2)) AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT n3.c1 AS c1, n3.c2 AS c2 FROM ((SELECT n1.c1 AS c1, CAST($1 AS DECIMAL(12,2)) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c1) = (n2.c1))) UNION ALL (SELECT * FROM gg_leaf(2))) AS n3) AS n4 GROUP BY n4.c1) AS n5 ORDER BY c1 ASC NULLS LAST
-                QUERY PLAN                
-------------------------------------------
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 3 leaves]: SELECT * FROM (SELECT n4.c1 AS c1, CAST(sum(n4.c2) AS DECIMAL(38,2)) AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT n3.c1 AS c1, n3.c2 AS c2 FROM ((SELECT n1.c1 AS c1, CAST($3 AS DECIMAL(12,2)) AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3, r0.c4 AS c4, r0.c5 AS c5, r0.c6 AS c6, r0.c7 AS c7, r0.c8 AS c8, r0.c9 AS c9, r0.c10 AS c10 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 JOIN (SELECT r0.c1 AS c1 FROM gg_rel(1) AS r0 WHERE (((r0.c1) < (CAST($2 AS INTEGER))))) AS n2 ON ((n1.c1) = (n2.c1))) UNION ALL (SELECT r0.c1 AS c1, r0.c4 AS c2 FROM gg_rel(2) AS r0 WHERE (((r0.c1) < (CAST($4 AS INTEGER)))))) AS n3) AS n4 GROUP BY n4.c1) AS n5 ORDER BY c1 ASC NULLS LAST
+                        QUERY PLAN                         
+-----------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 3 leaves
+         DuckDB direct scans: d_orders, d_orders, d_orders
          ->  Seq Scan on d_orders o
                Filter: (id < 100)
          ->  Seq Scan on d_orders p
@@ -597,7 +611,7 @@ NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 3 leaves]: SELECT *
          ->  Seq Scan on d_orders
                Filter: (id < 200)
  Optimizer: Postgres-based planner
-(10 rows)
+(11 rows)
 
 SET gg_duckdb.explain_decisions = off;
 SELECT d_check($q$ SELECT id, cast(0 as decimal(12,2)) AS z, count(*) AS n FROM d_orders WHERE id < 3000 GROUP BY id $q$);
@@ -677,28 +691,30 @@ RESET gg_duckdb.min_memory;
 RESET gg_duckdb.max_memory;
 EXPLAIN (COSTS OFF)
 SELECT a.id, count(*), sum(length(a.pad) + length(b.pad)) FROM d_wide a JOIN d_wide b ON a.id = b.id GROUP BY a.id;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(CAST((CAST(length(n3.c2) AS INTEGER)) + (CAST(length(n3.c3) AS INTEGER)) AS INTEGER)) AS BIGINT) AS c3 FROM (SELECT n1.c1 AS c1, n1.c3 AS c2, n2.c1 AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c1) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
-                QUERY PLAN                
-------------------------------------------
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(CAST((CAST(length(n3.c2) AS INTEGER)) + (CAST(length(n3.c3) AS INTEGER)) AS INTEGER)) AS BIGINT) AS c3 FROM (SELECT n1.c1 AS c1, n1.c3 AS c2, n2.c1 AS c3 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3 FROM gg_rel(0) AS r0) AS n1 JOIN (SELECT r0.c3 AS c1, r0.c1 AS c2 FROM gg_rel(1) AS r0) AS n2 ON ((n1.c1) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
+                 QUERY PLAN                  
+---------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 2 leaves
+         DuckDB direct scans: d_wide, d_wide
          ->  Seq Scan on d_wide a
          ->  Seq Scan on d_wide b
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT id, pad, count(*) FROM d_wide GROUP BY id, pad;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, n1.c3 AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1, n1.c3) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, n1.c3 AS c2, CAST(count(*) AS BIGINT) AS c3 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1, n1.c3) AS n2
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Agg over 1 leaf
+         DuckDB direct scans: d_wide
          ->  Seq Scan on d_wide
  Optimizer: Postgres-based planner
-(5 rows)
+(6 rows)
 
 SET gg_duckdb.explain_decisions = off;
 SET gg_duckdb.min_memory = '8MB';

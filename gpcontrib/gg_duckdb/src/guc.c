@@ -40,6 +40,7 @@ double		gg_duckdb_cost_convert_factor = 1.0;
 double		gg_duckdb_cost_op_factor = 0.25;
 double		gg_duckdb_cost_margin = 0.25;
 bool		gg_duckdb_cost_boundary = true;
+bool		gg_duckdb_direct_scans = true;
 
 static const struct config_enum_entry gg_duckdb_debug_wrap_options[] =
 {
@@ -149,6 +150,15 @@ gg_duckdb_define_gucs(void)
 							 false,
 							 PGC_USERSET,
 							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("gg_duckdb.direct_scans",
+							 "Let a region read the heap tables it scans directly, computing their scans' target lists and filters itself.",
+							 NULL,
+							 &gg_duckdb_direct_scans,
+							 true,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("gg_duckdb.validate_at_plan_time",

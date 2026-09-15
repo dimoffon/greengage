@@ -5,4 +5,5 @@ test: squelch
 test: memory
 test: leaf_error
 test: nested
+test: direct_scan
 test: teardown

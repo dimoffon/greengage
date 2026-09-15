@@ -119,6 +119,19 @@ foreign table (D7) without local quals: the deparser inlines it as a DuckDB read
 (`read_parquet(...)`, `read_csv(...)`, `read_json(...)`, `iceberg_scan(...)`) over the
 files the executing segment owns, so such leaves convert nothing.
 
+**Revised 2026-09-15 — direct leaves.** A sequential scan over a heap table whose target
+list and filter the deparser can compute is read through `gg_rel(i)` instead: the SeqScan
+stays in `custom_plans` (the executor opens and locks the table, EXPLAIN shows it) but is
+never executed; the table function scans the table under the executor's snapshot with
+`heapgetpage` and deforms only the attributes DuckDB asks for, and the scan's filter runs
+in the region's SQL. A profile of the `gg_leaf` path put the scan node and slot at about
+15% of a scan-heavy region's segment CPU; measured on TPC-H lineitem the direct leaf takes
+15–30% off such regions. **Accepted cost:** the extension now depends on heap internals
+(`heapgetpage`, `HeapScanDescData.rs_vistuples`, the deforming loop copied from
+`slot_deform_heap_tuple`), and since the C API gives table functions no filter pushdown,
+every row visited is converted: a selective filter makes the executor's scan the cheaper
+leaf, which the cost model chooses under `auto`.
+
 ### D5 — A cost gate with measured constants decides, per node, what goes to DuckDB
 
 `gg_duckdb.mode` is `off` (the pass does nothing), `force` (every eligible region, whole —
@@ -181,8 +194,8 @@ DuckDB's Iceberg commits do not detect concurrent writers.
 ### D8 — What stays out
 
 DuckDB tables, DDL or writes through DuckDB, MotherDuck, runtime fallback to the original
-subtree once a region has started, direct reading of heap or append-optimized pages by
-DuckDB, DuckDB worker threads (`threads > 1` is designed, not built), and ORCA memo-level
+subtree once a region has started, reading append-optimized pages (heap tables are read
+directly since 2026-09-15, see D4), DuckDB worker threads (`threads > 1` is designed, not built), and ORCA memo-level
 operators (gated on a measured ≥2x from the pass and one documented query where a
 different shape would win).
 

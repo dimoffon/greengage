@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
 #include "lib/stringinfo.h"
@@ -22,6 +23,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 #include "gg_duckdb/gg_duckdb.h"
 
@@ -57,6 +59,21 @@ static CustomExecMethods region_exec_methods = {
 
 /* ---------- custom_private ---------- */
 
+static GGRelScan *
+find_rel(List *rels, int leaf)
+{
+	ListCell   *lc;
+
+	foreach(lc, rels)
+	{
+		GGRelScan  *rs = (GGRelScan *) lfirst(lc);
+
+		if (rs->leaf == leaf)
+			return rs;
+	}
+	return NULL;
+}
+
 static Const *
 make_int_const(int v)
 {
@@ -79,11 +96,13 @@ make_text_const(const char *s)
  */
 List *
 gg_duckdb_make_private(const char *sql, int flags, List *leaves, const char *label,
-					   List *params, int nout, const GGTypeInfo *outtypes, List *natives)
+					   List *params, int nout, const GGTypeInfo *outtypes, List *natives,
+					   List *rels)
 {
 	List	   *priv = NIL;
 	ListCell   *lc;
 	int			i;
+	int			leafno = 0;
 
 	priv = lappend(priv, make_int_const(GG_DUCKDB_PRIVATE_VERSION));
 	priv = lappend(priv, make_text_const(sql));
@@ -104,6 +123,16 @@ gg_duckdb_make_private(const char *sql, int flags, List *leaves, const char *lab
 		priv = lappend(priv, make_int_const(desc.ncols));
 		for (i = 0; i < desc.ncols; i++)
 			priv = lappend(priv, make_int_const(GG_OUTDESC(&desc.cols[i].type)));
+		{
+			GGRelScan  *rs = find_rel(rels, leafno++);
+
+			priv = lappend(priv, make_int_const(rs ? rs->ncols : -1));
+			for (i = 0; rs && i < rs->ncols; i++)
+			{
+				priv = lappend(priv, make_int_const((int) rs->attnos[i]));
+				priv = lappend(priv, make_int_const(GG_OUTDESC(&rs->types[i])));
+			}
+		}
 	}
 	priv = lappend(priv, make_int_const(list_length(natives)));
 	foreach(lc, natives)
@@ -183,6 +212,9 @@ region_create_state(CustomScan *cscan)
 	pos += nout;
 	st->leaf_shapes = palloc0(sizeof(GGTypeInfo *) * Max(st->nleaves, 1));
 	st->leaf_ncols = palloc0(sizeof(int) * Max(st->nleaves, 1));
+	st->leaf_rel_n = palloc0(sizeof(int) * Max(st->nleaves, 1));
+	st->leaf_rel_attno = palloc0(sizeof(int *) * Max(st->nleaves, 1));
+	st->leaf_rel_shapes = palloc0(sizeof(GGTypeInfo *) * Max(st->nleaves, 1));
 	for (i = 0; i < st->nleaves; i++)
 	{
 		int			ncols,
@@ -205,6 +237,30 @@ region_create_state(CustomScan *cscan)
 			st->leaf_shapes[i][k].scale = (uint8) (d & 0xff);
 		}
 		pos += ncols;
+
+		/* the attributes gg_rel returns when the leaf is read directly */
+		if (list_length(priv) < pos + 1)
+			elog(ERROR, "gg_duckdb: malformed region node");
+		ncols = private_int(priv, pos);
+		pos++;
+		st->leaf_rel_n[i] = ncols;
+		if (ncols >= 0)
+		{
+			if (list_length(priv) < pos + 2 * ncols)
+				elog(ERROR, "gg_duckdb: malformed region node");
+			st->leaf_rel_attno[i] = palloc0(sizeof(int) * Max(ncols, 1));
+			st->leaf_rel_shapes[i] = palloc0(sizeof(GGTypeInfo) * Max(ncols, 1));
+			for (k = 0; k < ncols; k++)
+			{
+				int			d = private_int(priv, pos + 2 * k + 1);
+
+				st->leaf_rel_attno[i][k] = private_int(priv, pos + 2 * k);
+				st->leaf_rel_shapes[i][k].duck = (duckdb_type) (d >> 16);
+				st->leaf_rel_shapes[i][k].width = (uint8) ((d >> 8) & 0xff);
+				st->leaf_rel_shapes[i][k].scale = (uint8) (d & 0xff);
+			}
+			pos += 2 * ncols;
+		}
 	}
 	if (list_length(priv) < pos + 1)
 		elog(ERROR, "gg_duckdb: malformed region node");
@@ -224,6 +280,58 @@ region_create_state(CustomScan *cscan)
 	}
 
 	return (Node *) st;
+}
+
+/*
+ * A leaf read directly: the heap table its sequential scan opened, and the
+ * attributes gg_rel returns, checked against the shapes the planner recorded.
+ */
+static void
+describe_rel_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
+{
+	int			n = st->leaf_rel_n[leafno];
+	Relation	rel;
+	TupleDesc	rdesc;
+	int			k;
+
+	lf->desc.nrel = n;
+	lf->desc.rel_att = NULL;
+	lf->desc.rel_cols = NULL;
+	if (n < 0)
+		return;
+	if (!IsA(ps, SeqScanState))
+		elog(ERROR, "gg_duckdb: direct leaf %d is not a sequential scan", leafno);
+	rel = ((ScanState *) ps)->ss_currentRelation;
+	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		elog(ERROR, "gg_duckdb: direct leaf %d is not a heap table", leafno);
+	rdesc = RelationGetDescr(rel);
+	lf->desc.rel_att = MemoryContextAlloc(st->q.query_cxt, sizeof(int) * Max(n, 1));
+	lf->desc.rel_cols = MemoryContextAllocZero(st->q.query_cxt, sizeof(GGLeafCol) * Max(n, 1));
+	for (k = 0; k < n; k++)
+	{
+		int			attno = st->leaf_rel_attno[leafno][k];
+		GGTypeInfo *ti = &lf->desc.rel_cols[k].type;
+		Form_pg_attribute att;
+		GGTypeInfo	pgside;
+
+		if (attno < 1 || attno > rdesc->natts || TupleDescAttr(rdesc, attno - 1)->attisdropped)
+			elog(ERROR, "gg_duckdb: direct leaf %d: attribute %d is not a column of %s",
+				 leafno, attno, RelationGetRelationName(rel));
+		att = TupleDescAttr(rdesc, attno - 1);
+		snprintf(lf->desc.rel_cols[k].name, sizeof(lf->desc.rel_cols[k].name), "c%d", attno);
+		lf->desc.rel_att[k] = attno - 1;
+		*ti = st->leaf_rel_shapes[leafno][k];
+		ti->typid = att->atttypid;
+		ti->typmod = att->atttypmod;
+		if (!gg_duckdb_type_map(att->atttypid, att->atttypmod, &pgside) ||
+			pgside.duck != ti->duck ||
+			(pgside.duck == DUCKDB_TYPE_DECIMAL &&
+			 (pgside.width != ti->width || pgside.scale != ti->scale)))
+			elog(ERROR, "gg_duckdb: direct leaf %d column %s.%s: the planner recorded %s for type %s",
+				 leafno, RelationGetRelationName(rel), NameStr(att->attname),
+				 gg_duckdb_type_name(ti->duck),
+				 format_type_with_typemod(att->atttypid, att->atttypmod));
+	}
 }
 
 static void
@@ -265,6 +373,7 @@ describe_leaf(GGRegionState *st, GGLeaf *lf, PlanState *ps, int leafno)
 				 format_type_with_typemod(att->atttypid, att->atttypmod),
 				 gg_duckdb_type_name(pgside.duck));
 	}
+	describe_rel_leaf(st, lf, ps, leafno);
 }
 
 static void
@@ -409,6 +518,13 @@ region_end(CustomScanState *node)
 	ListCell   *lc;
 
 	gg_duckdb_query_release(&st->q);
+	if (st->leaves != NULL)
+	{
+		int			i;
+
+		for (i = 0; i < st->nleaves; i++)
+			gg_duckdb_leaf_rel_close(&st->leaves[i]);
+	}
 	foreach(lc, node->custom_ps)
 		ExecEndNode((PlanState *) lfirst(lc));
 	if (gg_duckdb_release_instance_at_end)
@@ -432,6 +548,7 @@ region_rescan(CustomScanState *node)
 		if (node->ss.ps.chgParam != NULL)
 			UpdateChangedParamSet(child, node->ss.ps.chgParam);
 		ExecReScan(child);
+		gg_duckdb_leaf_rel_close(&st->leaves[i]);
 		st->leaves[i].eof = false;
 		st->leaves[i].rows = 0;
 		i++;
@@ -485,6 +602,19 @@ region_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							 name ? name : "?", gg_duckdb_native_location_text(nl->relid));
 		}
 		ExplainPropertyText("DuckDB readers", buf.data, es);
+	}
+	if (st->leaves != NULL)
+	{
+		StringInfoData buf;
+		int			i;
+
+		initStringInfo(&buf);
+		for (i = 0; i < st->nleaves; i++)
+			if (st->leaves[i].desc.nrel >= 0)
+				appendStringInfo(&buf, "%s%s", buf.len > 0 ? ", " : "",
+								 RelationGetRelationName(((ScanState *) st->leaves[i].ps)->ss_currentRelation));
+		if (buf.len > 0)
+			ExplainPropertyText("DuckDB direct scans", buf.data, es);
 	}
 	if (es->verbose)
 		ExplainPropertyText("DuckDB SQL", st->sql, es);

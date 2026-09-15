@@ -30,28 +30,30 @@ SET gg_duckdb.explain_decisions = on;
 -- a co-located hash join with an aggregate above it: one region per segment
 EXPLAIN (COSTS OFF)
 SELECT a.k, count(*), sum(b.w) FROM j_a a JOIN j_b b ON a.k = b.k GROUP BY a.k;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n2.c1 AS c1, n1.c2 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c1) = (n2.c1))) AS n3 GROUP BY n3.c1) AS n4
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n2.c1 AS c1, n1.c2 AS c2 FROM (SELECT r0.c2 AS c1, r0.c3 AS c2 FROM gg_rel(0) AS r0) AS n1 JOIN (SELECT r0.c2 AS c1 FROM gg_rel(1) AS r0) AS n2 ON ((n1.c1) = (n2.c1))) AS n3 GROUP BY n3.c1) AS n4
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 2 leaves
+         DuckDB direct scans: j_b, j_a
          ->  Seq Scan on j_b b
          ->  Seq Scan on j_a a
  Optimizer: GPORCA
-(6 rows)
+(7 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT a.id, b.id FROM j_a a LEFT JOIN j_b b ON a.k = b.k AND b.id < 100 WHERE a.id < 10;
-NOTICE:  gg_duckdb: HashJoin (plan node 1): region [Join over 2 leaves]: SELECT * FROM (SELECT n2.c1 AS c1, n1.c1 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 RIGHT JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c2) = (n2.c2))) AS n3
-                                                                                     QUERY PLAN                                                                                     
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+NOTICE:  gg_duckdb: HashJoin (plan node 1): region [Join over 2 leaves]: SELECT * FROM (SELECT n2.c1 AS c1, n1.c1 AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 RIGHT JOIN (SELECT r0.c1 AS c1, r0.c2 AS c2 FROM gg_rel(1) AS r0 WHERE (((r0.c1) < (CAST($2 AS INTEGER))))) AS n2 ON ((n1.c2) = (n2.c2))) AS n3
+                                                                                                                                                           QUERY PLAN                                                                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Output: gg_duckdb_region.id, gg_duckdb_region.id_1
    ->  Custom Scan (GGDuckDBRegion)
          Output: gg_duckdb_region.id, gg_duckdb_region.id_1
          DuckDB: Join over 2 leaves
-         DuckDB SQL: SELECT * FROM (SELECT n2.c1 AS c1, n1.c1 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 RIGHT JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c2) = (n2.c2))) AS n3
+         DuckDB direct scans: j_b, j_a
+         DuckDB SQL: SELECT * FROM (SELECT n2.c1 AS c1, n1.c1 AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2 FROM gg_rel(0) AS r0 WHERE (((r0.c1) < (CAST($1 AS INTEGER))))) AS n1 RIGHT JOIN (SELECT r0.c1 AS c1, r0.c2 AS c2 FROM gg_rel(1) AS r0 WHERE (((r0.c1) < (CAST($2 AS INTEGER))))) AS n2 ON ((n1.c2) = (n2.c2))) AS n3
          ->  Seq Scan on public.j_b b
                Output: b.id, b.k
                Filter: (b.id < 100)
@@ -60,14 +62,14 @@ NOTICE:  gg_duckdb: HashJoin (plan node 1): region [Join over 2 leaves]: SELECT 
                Filter: (a.id < 10)
  Optimizer: GPORCA
  Settings: effective_cache_size = '512MB'
-(14 rows)
+(15 rows)
 
 -- two-phase aggregate: the partial Agg on the segments and the final Agg above the Redistribute
 SET optimizer_force_multistage_agg = on; SET gp_eager_two_phase_agg = on;
 EXPLAIN (COSTS OFF)
 SELECT id % 7 AS g, count(*), sum(k), min(id), bool_and(flag) FROM j_a GROUP BY id % 7;
 NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(sum(n1.c2) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c4) AS INTEGER) AS c4, CAST(bool_and(n1.c5) AS BOOLEAN) AS c5 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
-NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c2) AS INTEGER) AS c4, CAST(bool_and(n1.c4) AS BOOLEAN) AS c5 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n1.c3) AS BIGINT) AS c3, CAST(min(n1.c2) AS INTEGER) AS c4, CAST(bool_and(n1.c4) AS BOOLEAN) AS c5 FROM (SELECT CAST((CASE WHEN (CAST($1 AS INTEGER)) = 0 THEN error('division by zero') ELSE (r0.c1) % (CAST($1 AS INTEGER)) END) AS INTEGER) AS c1, r0.c1 AS c2, r0.c2 AS c3, r0.c5 AS c4 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1) AS n2
                          QUERY PLAN                         
 ------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -77,29 +79,31 @@ NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (
                Hash Key: gg_duckdb_region_1.g
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: j_a
                      ->  Seq Scan on j_a
  Optimizer: GPORCA
-(9 rows)
+(10 rows)
 
 -- a scalar aggregate: the partial Agg on the segments is a region, the final one on the coordinator is not
 EXPLAIN (COSTS OFF)
 SELECT count(*), max(k) FROM j_a;
-NOTICE:  gg_duckdb: Agg (plan node 2): region [Agg over 1 leaf]: SELECT * FROM (SELECT CAST(count(*) AS BIGINT) AS c1, CAST(max(n1.c1) AS INTEGER) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 2): region [Agg over 1 leaf]: SELECT * FROM (SELECT CAST(count(*) AS BIGINT) AS c1, CAST(max(n1.c1) AS INTEGER) AS c2 FROM (SELECT r0.c2 AS c1 FROM gg_rel(0) AS r0) AS n1) AS n2
                    QUERY PLAN                   
 ------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Custom Scan (GGDuckDBRegion)
                DuckDB: Agg over 1 leaf
+               DuckDB direct scans: j_a
                ->  Seq Scan on j_a
  Optimizer: GPORCA
-(6 rows)
+(7 rows)
 
 -- sum(int8) packs its transition state as the numeric sums do: both phases are regions
 EXPLAIN (COSTS OFF)
 SELECT id % 7 AS g, sum(w) FROM j_b GROUP BY id % 7;
 NOTICE:  gg_duckdb: Agg (plan node 1): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(sum(struct_extract(n1.c2, 's')) AS DECIMAL(38,0)) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
-NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,0)), n := count(n1.c2)) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,0)), n := count(n1.c2)) AS c2 FROM (SELECT CAST((CASE WHEN (CAST($1 AS INTEGER)) = 0 THEN error('division by zero') ELSE (r0.c1) % (CAST($1 AS INTEGER)) END) AS INTEGER) AS c1, r0.c3 AS c2 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1) AS n2
                          QUERY PLAN                         
 ------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -109,18 +113,19 @@ NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (
                Hash Key: gg_duckdb_region_1.g
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: j_b
                      ->  Seq Scan on j_b
  Optimizer: GPORCA
-(9 rows)
+(10 rows)
 
 -- sum(numeric) and avg(numeric) too, but DuckDB packs their state: the partial
 -- phase sums exactly and counts, the final phase adds the packed sums up
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT id % 7 AS g, sum(n), sum(n * 2 - 1), avg(n) FROM j_a GROUP BY id % 7;
 NOTICE:  gg_duckdb: Agg (plan node 1): not eligible: final avg over a bytea partial
-NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
-                                                                                                                                                                                                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                              
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($3 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($3 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT CAST((CASE WHEN (CAST($1 AS INTEGER)) = 0 THEN error('division by zero') ELSE (r0.c1) % (CAST($1 AS INTEGER)) END) AS INTEGER) AS c1, r0.c4 AS c2 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1) AS n2
+                                                                                                                                                                                                                                                                                                                                                                                                                                                        QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Output: gg_duckdb_region.g, (sum(gg_duckdb_region.n)), (sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric))), (avg(gg_duckdb_region.n_2))
    ->  Finalize HashAggregate
@@ -132,12 +137,13 @@ NOTICE:  gg_duckdb: Agg (plan node 4): region [Agg over 1 leaf]: SELECT * FROM (
                ->  Custom Scan (GGDuckDBRegion)
                      Output: gg_duckdb_region.g, (PARTIAL sum(gg_duckdb_region.n)), (PARTIAL sum(((gg_duckdb_region.n_1 * '2'::numeric) - '1'::numeric))), (PARTIAL avg(gg_duckdb_region.n_2))
                      DuckDB: Agg over 1 leaf
-                     DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($1 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+                     DuckDB direct scans: j_a
+                     DuckDB SQL: SELECT * FROM (SELECT n1.c1 AS c1, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c2, struct_pack(s := CAST(sum(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($3 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2))) AS DECIMAL(38,2)), n := count(CAST(CAST(CAST(CAST(n1.c2 AS DECIMAL(10,2)) * CAST(CAST($2 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(11,2)) AS DECIMAL(11,2)) - CAST(CAST($3 AS DECIMAL(1,0)) AS DECIMAL(1,0)) AS DECIMAL(12,2)))) AS c3, struct_pack(s := CAST(sum(n1.c2) AS DECIMAL(38,2)), n := count(n1.c2)) AS c4 FROM (SELECT CAST((CASE WHEN (CAST($1 AS INTEGER)) = 0 THEN error('division by zero') ELSE (r0.c1) % (CAST($1 AS INTEGER)) END) AS INTEGER) AS c1, r0.c4 AS c2 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1) AS n2
                      ->  Seq Scan on public.j_a
                            Output: (j_a.id % 7), j_a.n
  Optimizer: GPORCA
  Settings: effective_cache_size = '512MB', gp_eager_two_phase_agg = 'on', optimizer_force_multistage_agg = 'on'
-(16 rows)
+(17 rows)
 
 RESET optimizer_force_multistage_agg; RESET gp_eager_two_phase_agg;
 SET gg_duckdb.explain_decisions = off;
@@ -374,7 +380,7 @@ SET gg_duckdb.explain_decisions = on;
 EXPLAIN (COSTS OFF)
 WITH c AS (SELECT k, count(*) AS n FROM j_a GROUP BY k)
 SELECT c1.k, c1.n + c2.n AS s FROM c c1 JOIN c c2 ON c1.k = c2.k WHERE c1.n > 50;
-NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 GROUP BY n1.c1) AS n2
+NOTICE:  gg_duckdb: Agg (plan node 3): region [Agg over 1 leaf]: SELECT * FROM (SELECT n1.c1 AS c1, CAST(count(*) AS BIGINT) AS c2 FROM (SELECT r0.c2 AS c1 FROM gg_rel(0) AS r0) AS n1 GROUP BY n1.c1) AS n2
 NOTICE:  gg_duckdb: HashJoin (plan node 6): region [Join over 2 leaves]: SELECT * FROM (SELECT n3.c1 AS c1, CAST((n3.c2) + (n2.c2) AS BIGINT) AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n2 JOIN (SELECT n1.c1 AS c1, n1.c2 AS c2 FROM (SELECT * FROM gg_leaf(1)) AS n1 WHERE ((n1.c2) > (CAST($1 AS INTEGER)))) AS n3 ON ((n2.c1) = (n3.c1))) AS n4
                      QUERY PLAN                     
 ----------------------------------------------------
@@ -383,13 +389,14 @@ NOTICE:  gg_duckdb: HashJoin (plan node 6): region [Join over 2 leaves]: SELECT 
          ->  Shared Scan (share slice:id 1:0)
                ->  Custom Scan (GGDuckDBRegion)
                      DuckDB: Agg over 1 leaf
+                     DuckDB direct scans: j_a
                      ->  Seq Scan on j_a
          ->  Custom Scan (GGDuckDBRegion)
                DuckDB: Join over 2 leaves
                ->  Shared Scan (share slice:id 1:0)
                ->  Shared Scan (share slice:id 1:0)
  Optimizer: GPORCA
-(11 rows)
+(12 rows)
 
 SET gg_duckdb.explain_decisions = off;
 SELECT j_check($q$ WITH c AS (SELECT k, count(*) AS n FROM j_a GROUP BY k)

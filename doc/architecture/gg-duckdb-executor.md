@@ -156,8 +156,47 @@ Motion/ShareInputScan leaves — M4 hints, cost calibration, benchmarks — M5 n
 (FDW) — M6 hardening and opt-ins (executor parameters, subplans, float aggregates, the
 isolation2 suite; threads > 1, per-allocation accounting and DuckDB 2.0 assessed and
 deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Out of scope: DuckDB tables, DDL or writes
-through DuckDB, MotherDuck, runtime fallback to the original subtree, direct heap/AO
-page reading.
+through DuckDB, MotherDuck, runtime fallback to the original subtree. Direct scans
+(2026-09-15): heap tables under a region's sequential scans are read directly; AO/AOCO
+page reading and partitioned DynamicSeqScans are next.
+
+## Direct scans findings (2026-09-15)
+
+- **Why.** A region used to pull every scan through `ExecProcNode`. A perf profile of a
+  forced region over heap TPC-H lineitem (SF1, 3 segments, ORCA, `sum(l_quantity),
+  sum(l_discount) WHERE l_shipdate <= ...`) split a segment's CPU into conversion into
+  DuckDB 22%, tuple deforming 18%, the scan node and slot (`ExecScan`,
+  `ExecStoreBufferHeapTuple`, `ExecProcNodeGPDB`, instrumentation) 15%, kernel page copies
+  and `pg_checksum_page` 21% (125 MB `shared_buffers` against an 897 MB table), the filter
+  9%, heap page access and visibility 7%. Only the scan node's share, and the filter's
+  interpretation, can go.
+- **What.** `deparse_leaf_or_rel` tries a sequential scan over a heap table as a direct
+  leaf: its target list and filter are deparsed over `gg_rel(i) AS r0`, whose columns are
+  the table's attributes they use (`c<attno>`), and the filter becomes the subquery's
+  `WHERE`. The SeqScan stays in `custom_plans`, so the executor still opens and locks the
+  table and EXPLAIN still shows it, but it is never executed: `gg_rel` opens
+  `table_beginscan` under the executor's snapshot, walks pages with the exported
+  `heapgetpage` (pruning, the all-visible shortcut, visibility into `rs_vistuples`) and
+  deforms only the attributes DuckDB's projection pushdown asks for, missing attributes
+  through `getmissingattr`. A non-MVCC snapshot falls back to `table_scan_getnextslot` into
+  the scan's slot. `custom_private` v5 carries per leaf the attribute numbers and shapes;
+  the QE checks them against the relation. System columns, whole-row references, non-heap
+  tables, initPlans on the scan and filters the deparser cannot compute keep the leaf with
+  the executor. GUC `gg_duckdb.direct_scans`, on.
+- **Cost.** DuckDB filters above a C-API table function (the C API has projection
+  pushdown but no filter pushdown), so every visited row is converted: conversion is
+  charged on `reltuples / numsegments` (replicated: `reltuples`), filter-only attributes
+  at the leaf, the columns the parent uses by the parent; the skipped scan node is credited
+  `SCAN_ROW_SAVED` 0.001 a row (14 ns measured); the filter runs on every visited row in
+  either engine and is credited to neither. When the cost model draws the boundary it
+  also picks the leaf kind: a filter keeping few rows makes the executor's scan cheaper
+  (it converts only what it keeps). A first version credited the filter at DuckDB's
+  operator factor, and that credit outweighed the conversion of a selective scan: TPC-H
+  q19 ran at 0.58x under `auto` (1.02x with direct scans off), q12 at 0.86x, q06 at 0.93x.
+- **Measured** (lineitem SF1, ORCA, warm, force; standard executor / region over
+  `gg_leaf` / region over `gg_rel`): q01 shape (filter keeps 98%) 528 / 454 / 384 ms;
+  unfiltered `count(*)` over `GROUP BY l_orderkey` 425 / 206 / 145 ms; q06 shape (filter
+  keeps ~2%) 222 / 217 / 237 ms, the case the cost choice exists for.
 
 ## Boundary and calibration findings (2026-09-11)
 

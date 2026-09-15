@@ -38,46 +38,49 @@ NOTICE:  gg_duckdb: HashJoin (plan node 2): estimated input rows below gg_duckdb
 /*+ DuckDB(a b) */
 EXPLAIN (COSTS OFF)
 SELECT a.k, count(*), sum(b.w) FROM h_a a JOIN h_b b ON a.k = b.k GROUP BY a.k;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3 FROM gg_rel(0) AS r0) AS n1 JOIN (SELECT r0.c3 AS c1, r0.c2 AS c2 FROM gg_rel(1) AS r0) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 2 leaves
+         DuckDB direct scans: h_a, h_b
          ->  Seq Scan on h_a a
          ->  Seq Scan on h_b b
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 -- naming one relation is enough: the region rooted at the Agg covers it
 /*+ DuckDB(b) */
 EXPLAIN (COSTS OFF)
 SELECT a.k, count(*), sum(b.w) FROM h_a a JOIN h_b b ON a.k = b.k GROUP BY a.k;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3 FROM gg_rel(0) AS r0) AS n1 JOIN (SELECT r0.c3 AS c1, r0.c2 AS c2 FROM gg_rel(1) AS r0) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 2 leaves
+         DuckDB direct scans: h_a, h_b
          ->  Seq Scan on h_a a
          ->  Seq Scan on h_b b
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 -- DuckDB() addresses the whole query
 /*+ DuckDB() */
 EXPLAIN (COSTS OFF)
 SELECT a.k, count(*), sum(b.w) FROM h_a a JOIN h_b b ON a.k = b.k GROUP BY a.k;
-NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT * FROM gg_leaf(0)) AS n1 JOIN (SELECT * FROM gg_leaf(1)) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
+NOTICE:  gg_duckdb: Agg (plan node 1): region [Join Agg over 2 leaves] forced by a DuckDB hint: SELECT * FROM (SELECT n3.c1 AS c1, CAST(count(*) AS BIGINT) AS c2, CAST(sum(n3.c2) AS DECIMAL(38,0)) AS c3 FROM (SELECT n1.c2 AS c1, n2.c1 AS c2 FROM (SELECT r0.c1 AS c1, r0.c2 AS c2, r0.c3 AS c3 FROM gg_rel(0) AS r0) AS n1 JOIN (SELECT r0.c3 AS c1, r0.c2 AS c2 FROM gg_rel(1) AS r0) AS n2 ON ((n1.c2) = (n2.c2))) AS n3 GROUP BY n3.c1) AS n4
                 QUERY PLAN                
 ------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Custom Scan (GGDuckDBRegion)
          DuckDB: Join Agg over 2 leaves
+         DuckDB direct scans: h_a, h_b
          ->  Seq Scan on h_a a
          ->  Seq Scan on h_b b
  Optimizer: Postgres-based planner
-(6 rows)
+(7 rows)
 
 -- NoDuckDB wins over DuckDB and over gg_duckdb.mode = force
 SET gg_duckdb.mode = force;

@@ -33,6 +33,10 @@
 #include <locale.h>
 
 #include "access/htup_details.h"
+#include "access/sysattr.h"
+#include "catalog/gp_distribution_policy.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
@@ -60,6 +64,8 @@ typedef struct NodeCols
 	GGTypeInfo *types;
 	Plan	   *leaf;			/* the node when it is a converted leaf, else NULL */
 	bool	   *used;			/* of a leaf: columns the parent's expressions reference */
+	bool		direct;			/* of a leaf: read directly (gg_rel) */
+	double		leaf_rows;		/* of a direct leaf: rows converted, those the scan visits */
 } NodeCols;
 
 typedef struct DeparseCtx
@@ -1596,6 +1602,8 @@ deparse_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 		k++;
 	}
 	/* the conversion is charged by the parent, for the columns it uses */
+	cols->direct = false;
+	cols->leaf_rows = 0;
 	cols->leaf = plan;
 	cols->used = palloc0(sizeof(bool) * Max(cols->ncols, 1));
 	ctx->spec->leaves = lappend(ctx->spec->leaves, plan);
@@ -1897,6 +1905,13 @@ value_conv_cost(const GGTypeInfo *ti, bool in)
  * expressions referenced (DuckDB projects only those into gg_leaf), or all
  * of them when the parent takes the child's columns positionally.
  */
+/*
+ * A direct leaf skips the executor's scan node and slot for every row the
+ * scan visits: 14 ns a row measured on TPC-H lineitem, cost the executor
+ * would have spent whether or not the region runs.
+ */
+#define SCAN_ROW_SAVED		0.001
+
 static void
 charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
 {
@@ -1908,7 +1923,13 @@ charge_leaf(DeparseCtx *ctx, NodeCols *cols, bool all)
 	for (k = 0; k < cols->ncols; k++)
 		if (all || cols->used[k])
 			per_row += value_conv_cost(&cols->types[k], true);
-	ctx->spec->conv_in += rows_of(cols->leaf) * per_row;
+	if (cols->direct)
+	{
+		per_row -= SCAN_ROW_SAVED;
+		ctx->spec->conv_in += cols->leaf_rows * per_row;
+	}
+	else
+		ctx->spec->conv_in += rows_of(cols->leaf) * per_row;
 	cols->leaf = NULL;			/* charged once */
 }
 
@@ -1990,6 +2011,7 @@ typedef struct DeparseAttempt
 	int			nparams;
 	int			nnatives;
 	int			ncuts;
+	int			nrels;
 } DeparseAttempt;
 
 static void
@@ -2001,6 +2023,7 @@ attempt_begin(DeparseCtx *ctx, DeparseAttempt *a)
 	a->nparams = list_length(ctx->spec->params);
 	a->nnatives = list_length(ctx->spec->natives);
 	a->ncuts = list_length(ctx->spec->cuts);
+	a->nrels = list_length(ctx->spec->rels);
 }
 
 static void
@@ -2014,6 +2037,7 @@ attempt_undo(DeparseCtx *ctx, DeparseAttempt *a)
 	spec->params = list_truncate(spec->params, a->nparams);
 	spec->natives = list_truncate(spec->natives, a->nnatives);
 	spec->cuts = list_truncate(spec->cuts, a->ncuts);
+	spec->rels = list_truncate(spec->rels, a->nrels);
 	spec->reject = NULL;
 }
 
@@ -2062,6 +2086,217 @@ executor_keeps(DeparseCtx *ctx, DeparseAttempt *a, Plan *plan, GGRegionCut **cut
 	c->budget_kb = budget;
 	*cut = c;
 	return true;
+}
+
+/* ---------- direct leaves ---------- */
+
+/*
+ * A sequential scan over a heap table as a direct leaf: the region computes
+ * the scan's target list and filter over gg_rel(i), which returns the
+ * attributes they use.  Every row the scan visits is converted, not only the
+ * rows its filter keeps, so conversion is charged on the table's rows.
+ */
+static bool
+deparse_rel_body(DeparseCtx *ctx, Plan *plan, Oid relid, StringInfo out, NodeCols *cols)
+{
+	Scan	   *scan = (Scan *) plan;
+	Bitmapset  *attrs = NULL;
+	Bitmapset  *tlattrs = NULL;
+	int			natts = 0;
+	int			nused;
+	int			x;
+	int			k;
+	GGRelScan  *rs;
+	HeapTuple	tp;
+	Form_pg_class classform;
+	bool		heap;
+	double		reltuples;
+	double		rows_scanned;
+	double		filter_conv = 0.0;
+	double		all_conv = 0.0;
+	double		qual_op_before;
+	GpPolicy   *policy;
+	StringInfoData sql;
+	ListCell   *lc;
+	OpCounts	c;
+	int			leafno = list_length(ctx->spec->leaves);
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		REJECT(ctx, "relation %u not found", relid);
+	classform = (Form_pg_class) GETSTRUCT(tp);
+	heap = classform->relkind == RELKIND_RELATION && classform->relam == HEAP_TABLE_AM_OID;
+	reltuples = classform->reltuples;
+	ReleaseSysCache(tp);
+	if (!heap)
+		REJECT(ctx, "not a heap table");
+
+	pull_varattnos((Node *) plan->targetlist, scan->scanrelid, &tlattrs);
+	attrs = bms_copy(tlattrs);
+	pull_varattnos((Node *) plan->qual, scan->scanrelid, &attrs);
+	x = -1;
+	while ((x = bms_next_member(attrs, x)) >= 0)
+	{
+		AttrNumber	a = x + FirstLowInvalidHeapAttributeNumber;
+
+		if (a <= 0)
+			REJECT(ctx, "system column or whole-row reference");
+		natts = Max(natts, a);
+	}
+	nused = bms_num_members(attrs);
+
+	rs = palloc0(sizeof(GGRelScan));
+	rs->leaf = leafno;
+	rs->ncols = nused;
+	rs->attnos = palloc0(sizeof(AttrNumber) * Max(nused, 1));
+	rs->types = palloc0(sizeof(GGTypeInfo) * Max(nused, 1));
+	ctx->scan_relid = scan->scanrelid;
+	ctx->scan_alias = "r0";
+	ctx->scan_types = palloc0(sizeof(GGTypeInfo) * Max(natts, 1));
+	ctx->scan_natts = natts;
+	k = 0;
+	x = -1;
+	while ((x = bms_next_member(attrs, x)) >= 0)
+	{
+		AttrNumber	a = x + FirstLowInvalidHeapAttributeNumber;
+		Oid			typid;
+		int32		typmod;
+		Oid			collid;
+
+		get_atttypetypmodcoll(relid, a, &typid, &typmod, &collid);
+		if (!gg_duckdb_type_map(typid, typmod, &rs->types[k]))
+			REJECT(ctx, "type %s is not carried", format_type_with_typemod(typid, typmod));
+		rs->types[k].typid = typid;
+		rs->types[k].typmod = typmod;
+		rs->attnos[k] = a;
+		ctx->scan_types[a - 1] = rs->types[k];
+		all_conv += value_conv_cost(&rs->types[k], true);
+		if (!bms_is_member(x, tlattrs))
+			filter_conv += value_conv_cost(&rs->types[k], true);
+		k++;
+	}
+
+	/* the rows the scan visits: the table's share on a segment */
+	rows_scanned = rows_of(plan);
+	policy = GpPolicyFetch(relid);
+	if (reltuples > 0 && policy != NULL && policy->numsegments > 0)
+		rows_scanned = Max(rows_scanned, policy->ptype == POLICYTYPE_REPLICATED ?
+						   reltuples : reltuples / policy->numsegments);
+
+	initStringInfo(&sql);
+	appendStringInfoString(&sql, "SELECT ");
+	cols->ncols = list_length(plan->targetlist);
+	cols->types = palloc0(sizeof(GGTypeInfo) * Max(cols->ncols, 1));
+	ops_begin(ctx, &c);
+	k = 0;
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+
+		if (k > 0)
+			appendStringInfoString(&sql, ", ");
+		if (!deparse_expr(ctx, (Node *) te->expr, &sql, &cols->types[k]))
+			return false;
+		appendStringInfo(&sql, " AS c%d", k + 1);
+		k++;
+	}
+	if (k == 0)
+		appendStringInfoString(&sql, "1 AS c1");
+	ops_charge(ctx, &c, rows_of(plan), rows_of(plan));
+	appendStringInfo(&sql, " FROM %s(%d) AS r0", GG_DUCKDB_REL_FUNCTION, leafno);
+	k = 0;
+	foreach(lc, plan->qual)
+	{
+		GGTypeInfo	qt;
+
+		appendStringInfoString(&sql, k == 0 ? " WHERE (" : " AND (");
+		if (!deparse_expr(ctx, (Node *) lfirst(lc), &sql, &qt))
+			return false;
+		if (qt.duck != DUCKDB_TYPE_BOOLEAN)
+			REJECT(ctx, "the scan's filter is not a boolean");
+		appendStringInfoChar(&sql, ')');
+		k++;
+	}
+	/*
+	 * The filter runs on every row visited in either engine, so it is
+	 * credited to neither: counted and dropped.  (Credited at DuckDB's
+	 * operator factor it outweighed converting every row of a selective
+	 * scan: TPC-H q19 ran at 0.58x.)
+	 */
+	qual_op_before = ctx->spec->op_cost;
+	ops_charge(ctx, &c, rows_scanned, rows_scanned);
+	ctx->spec->op_cost = qual_op_before;
+
+	/*
+	 * When the cost model draws the boundary, a filter that keeps few rows
+	 * makes the executor's scan the cheaper leaf: it converts only the rows it
+	 * keeps, where the direct leaf converts every row it visits, less the scan
+	 * node it skips.  The columns the target list and filter use stand for
+	 * the parent's.  A forced region, or one a hint takes whole, reads
+	 * directly whenever it can.
+	 */
+	if (ctx->spec->cost_boundary)
+	{
+		double		leaf_conv = plan_conv_cost(plan);
+		double		direct_conv = rows_scanned *
+			(CONV_ROW_IN * gg_duckdb_cost_convert_factor - SCAN_ROW_SAVED + all_conv);
+
+		if (leaf_conv >= 0.0 && leaf_conv <= direct_conv)
+			REJECT(ctx, "reading the table directly converts more than the scan's output");
+	}
+
+	ctx->spec->conv_in += rows_scanned * filter_conv;
+	ctx->spec->rels = lappend(ctx->spec->rels, rs);
+	ctx->spec->leaves = lappend(ctx->spec->leaves, plan);
+	ctx->spec->rows_in += rows_scanned;
+	ctx->spec->bytes_in += rows_scanned * Max(plan->plan_width, 1);
+	/* the columns the parent uses are charged by the parent, on the rows visited */
+	cols->leaf = plan;
+	cols->used = palloc0(sizeof(bool) * Max(cols->ncols, 1));
+	cols->direct = true;
+	cols->leaf_rows = rows_scanned;
+	appendBinaryStringInfo(out, sql.data, sql.len);
+	return true;
+}
+
+static bool
+deparse_rel_leaf(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
+{
+	Index		saved_relid = ctx->scan_relid;
+	const char *saved_alias = ctx->scan_alias;
+	GGTypeInfo *saved_types = ctx->scan_types;
+	int			saved_natts = ctx->scan_natts;
+	RangeTblEntry *rte = rt_fetch(((Scan *) plan)->scanrelid, ctx->spec->rtable);
+	bool		ok;
+
+	if (rte->rtekind != RTE_RELATION)
+		return false;
+	ok = deparse_rel_body(ctx, plan, rte->relid, out, cols);
+	ctx->scan_relid = saved_relid;
+	ctx->scan_alias = saved_alias;
+	ctx->scan_types = saved_types;
+	ctx->scan_natts = saved_natts;
+	return ok;
+}
+
+/*
+ * A leaf: read directly when it is a sequential scan over a heap table whose
+ * target list and filter the region can compute, else pulled through the
+ * executor.
+ */
+static bool
+deparse_leaf_or_rel(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
+{
+	if (gg_duckdb_direct_scans && IsA(plan, SeqScan) && plan->initPlan == NIL)
+	{
+		DeparseAttempt attempt;
+
+		attempt_begin(ctx, &attempt);
+		if (deparse_rel_leaf(ctx, plan, out, cols))
+			return true;
+		attempt_undo(ctx, &attempt);
+	}
+	return deparse_leaf(ctx, plan, out, cols);
 }
 
 typedef struct AggWeight
@@ -2424,7 +2659,7 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 	bool		ok;
 
 	if (!node_is_interior_base(ctx, plan))
-		return deparse_leaf(ctx, plan, out, cols);
+		return deparse_leaf_or_rel(ctx, plan, out, cols);
 
 	/*
 	 * An interior node is tried first and undone when it does not pay: a
@@ -2453,7 +2688,7 @@ deparse_base(DeparseCtx *ctx, Plan *plan, StringInfo out, NodeCols *cols)
 		ctx->spec->ncuts++;
 		ctx->spec->cuts = lappend(ctx->spec->cuts, cut);
 	}
-	return deparse_leaf(ctx, plan, out, cols);
+	return deparse_leaf_or_rel(ctx, plan, out, cols);
 }
 
 static bool

@@ -96,11 +96,14 @@ RESET gg_duckdb.cost_fixed; RESET gg_duckdb.cost_convert_factor;
 -- through a small one stays with the executor and the aggregates above it
 -- are the region; with the boundary off the maximal region (join and
 -- aggregates) is judged as a whole and declined.  The costs are the
--- measured defaults but for a small fixed cost.
+-- measured defaults but for a small fixed cost.  The leaves are pulled
+-- through the executor here (direct scans off): the direct scan's credit is
+-- tested in relscan.
 CREATE TABLE d_dim (id int, grp int, name text) DISTRIBUTED BY (id);
 INSERT INTO d_dim SELECT i, i % 5, 'dim ' || i FROM generate_series(0, 96) i;
 ANALYZE d_dim;
 SET gp_enable_multiphase_agg = on;
+SET gg_duckdb.direct_scans = off;
 SET gg_duckdb.mode = auto;
 SET gg_duckdb.min_rows = 0;
 SET gg_duckdb.cost_fixed = 5;
@@ -118,6 +121,7 @@ SET gg_duckdb.explain_decisions = off;
 SELECT d_check($q$ SELECT d.id, count(*) AS n, sum(o.qty) AS s1, sum(o.amount) AS s2, min(o.id) AS mn, max(o.id) AS mx, max(o.big) AS mb, max(o.ts) AS mt
                    FROM d_orders o JOIN d_dim d ON o.cust = d.id WHERE d.grp = 1 GROUP BY d.id $q$, 'auto');
 RESET gg_duckdb.min_rows; RESET gg_duckdb.cost_fixed;
+RESET gg_duckdb.direct_scans;
 
 -- integer aggregate states: a partial sum/avg(bigint) or avg(integer/smallint)
 -- hands its final phase the executor's own transition state, so the phases

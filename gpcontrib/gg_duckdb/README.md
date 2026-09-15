@@ -17,7 +17,11 @@ over timestamps for the units both engines truncate and count alike). Leaves (sc
 scans, subquery scans, joins DuckDB may not run, anything else) stay ordinary
 plan nodes pulled by DuckDB on the backend thread, and the subtree under a leaf
 gets regions of its own; a projection DuckDB cannot compute stays with the
-executor as a leaf and the region goes on above it. Every region query is prepared on the coordinator
+executor as a leaf and the region goes on above it. A sequential scan over a
+heap table is the exception: when the region can compute its target list and
+filter, it reads the table's pages itself through `gg_rel(i)` (the scan's
+snapshot and visibility, no scan node, only the attributes DuckDB asks for),
+and the scan's filter runs in DuckDB. Every region query is prepared on the coordinator
 before it is used, so an ineligible or unbindable subtree simply stays on the
 standard executor. Partial `sum` and `avg` phases over numerics and bigints,
 and partial `avg` phases over integers and smallints, run in DuckDB too: the
@@ -106,7 +110,10 @@ either direction, 21/130 ns for a text in/out, 25/20 ns for a numeric in/out,
 standard executor's, 0.25) and `cost_margin` (DuckDB must win by this fraction,
 0.25), `cost_boundary` (let the gate end a region above a subtree whose output
 is cheaper to convert than its inputs, on; off judges every eligible region
-whole), `explain_decisions` (NOTICE per candidate subtree with the reason it was
+whole), `direct_scans` (let a region read the heap tables under its sequential
+scans itself, computing their target lists and filters, on; every row the scan
+visits is converted, so the gate charges conversion on the table's rows and
+credits the skipped scan node), `explain_decisions` (NOTICE per candidate subtree with the reason it was
 declined, or its DuckDB query and the subtrees the executor keeps under it; the
 gate's estimates go to the DEBUG1 log).  The gate is also memory-aware: a
 region's hash tables (the groups of an aggregate, the build side of a join,

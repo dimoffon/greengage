@@ -1,0 +1,82 @@
+-- A region reading a heap table directly sees what the executor's scan
+-- sees: its transaction's snapshot, not rows committed later nor rows of a
+-- transaction still in progress.
+CREATE TABLE iso_ds (id int, v int) DISTRIBUTED BY (id);
+CREATE TABLE
+INSERT INTO iso_ds SELECT i, i % 10 FROM generate_series(1, 100000) i;
+INSERT 0 100000
+
+1: SET gg_duckdb.mode = force;
+SET
+1: BEGIN ISOLATION LEVEL REPEATABLE READ;
+BEGIN
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 10000 
+ 1 | 10000 
+ 2 | 10000 
+(3 rows)
+-- committed after the snapshot (without the global deadlock detector a
+-- delete or an update locks the table exclusively, so they come first)
+DELETE FROM iso_ds WHERE v = 1;
+DELETE 10000
+UPDATE iso_ds SET v = 2 WHERE v = 0 AND id < 5000;
+UPDATE 499
+-- and a transaction still in progress
+2: BEGIN;
+BEGIN
+2: INSERT INTO iso_ds SELECT i, 0 FROM generate_series(1, 1000) i;
+INSERT 0 1000
+-- the snapshot of the transaction: unchanged, as the executor sees it
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 10000 
+ 1 | 10000 
+ 2 | 10000 
+(3 rows)
+1: SET gg_duckdb.mode = off;
+SET
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 10000 
+ 1 | 10000 
+ 2 | 10000 
+(3 rows)
+1: COMMIT;
+COMMIT
+-- a new snapshot: the delete and the update, not the uncommitted insert
+1: SET gg_duckdb.mode = force;
+SET
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 9501  
+ 2 | 10499 
+ 3 | 10000 
+(3 rows)
+2: ABORT;
+ROLLBACK
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 9501  
+ 2 | 10499 
+ 3 | 10000 
+(3 rows)
+1: SET gg_duckdb.mode = off;
+SET
+1: SELECT v, count(*) FROM iso_ds GROUP BY v ORDER BY v LIMIT 3;
+ v | count 
+---+-------
+ 0 | 9501  
+ 2 | 10499 
+ 3 | 10000 
+(3 rows)
+1q: ... <quitting>
+2q: ... <quitting>
+
+DROP TABLE iso_ds;
+DROP TABLE

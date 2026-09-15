@@ -10,5 +10,7 @@
 1: SELECT count(*) FROM (SELECT id, k, count(*) FROM iso_t GROUP BY 1, 2) x;
 1: SET gg_duckdb.max_memory = '64MB';
 1: SELECT count(*) FROM (SELECT id, repeat(v, 40) AS w, count(*) FROM iso_t GROUP BY 1, 2) x;
-1: SELECT gp_segment_id, (gg_duckdb.status()).errors, (gg_duckdb.status()).reopens FROM gp_dist_random('gp_id') ORDER BY 1;
+-- which segments reach the limit before the coordinator cancels the others
+-- varies from run to run: at least one recorded the error, none reopened
+1: SELECT count(*) FILTER (WHERE errors > 0) > 0 AS errored, sum(reopens) AS reopens FROM (SELECT (gg_duckdb.status()).errors, (gg_duckdb.status()).reopens FROM gp_dist_random('gp_id')) s;
 1q:

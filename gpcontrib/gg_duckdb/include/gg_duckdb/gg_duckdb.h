@@ -61,6 +61,7 @@ extern double gg_duckdb_cost_convert_factor;
 extern double gg_duckdb_cost_op_factor;
 extern double gg_duckdb_cost_margin;
 extern bool gg_duckdb_cost_boundary;
+extern bool gg_duckdb_direct_scans;
 
 extern void gg_duckdb_define_gucs(void);
 
@@ -156,7 +157,8 @@ extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int widt
 #define GG_DUCKDB_REGION_NAME		"GGDuckDBRegion"
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
 #define GG_DUCKDB_LEAF_PLACEHOLDER "_gg_row"
-#define GG_DUCKDB_PRIVATE_VERSION	4
+#define GG_DUCKDB_REL_FUNCTION		"gg_rel"
+#define GG_DUCKDB_PRIVATE_VERSION	5
 
 /*
  * Positions in CustomScan.custom_private, a flat List of Const (the only
@@ -190,6 +192,9 @@ typedef struct GGLeafDesc
 	int			ncols;
 	GGLeafCol  *cols;			/* one per result column of the leaf */
 	double		plan_rows;
+	int			nrel;			/* gg_rel columns; -1 when the leaf is not read directly */
+	int		   *rel_att;		/* per gg_rel column: its 0-based attribute */
+	GGLeafCol  *rel_cols;		/* named c<attribute number> */
 } GGLeafDesc;
 
 typedef struct GGLeaf
@@ -198,7 +203,14 @@ typedef struct GGLeaf
 	PlanState  *ps;
 	bool		eof;
 	int64		rows;			/* pulled so far */
+
+	/* a direct leaf (gg_rel): its heap scan, opened on the first batch */
+	struct TableScanDescData *rel_scan;
+	Datum	   *rel_values;		/* by attribute, the deformed tuple */
+	bool	   *rel_isnull;
 } GGLeaf;
+
+extern void gg_duckdb_leaf_rel_close(GGLeaf *lf);
 
 struct GGRegionState;
 
@@ -302,6 +314,9 @@ typedef struct GGRegionState
 
 	GGLeaf	   *leaves;
 	GGTypeInfo **leaf_shapes;	/* DuckDB shape of every leaf column, from the plan */
+	int		   *leaf_rel_n;		/* gg_rel columns per leaf, -1: not direct */
+	int		  **leaf_rel_attno; /* their attribute numbers */
+	GGTypeInfo **leaf_rel_shapes;	/* and DuckDB shapes */
 	int		   *leaf_ncols;
 } GGRegionState;
 
@@ -311,13 +326,28 @@ extern char *gg_duckdb_region_sql(const char *sql, List *natives, int nconst_par
 								  bool resolve, List **file_lists);
 extern List *gg_duckdb_make_private(const char *sql, int flags, List *leaves,
 									const char *label, List *params, int nout,
-									const GGTypeInfo *outtypes, List *natives);
+									const GGTypeInfo *outtypes, List *natives, List *rels);
 extern void gg_duckdb_register_leaf_function(duckdb_connection conn);
 extern duckdb_prepared_statement gg_duckdb_prepare_with(GGBindContext *bctx,
 														duckdb_connection conn,
 														const char *sql,
 														char **errmsg);
 extern void gg_duckdb_describe_leaf_plan(GGLeafDesc *desc, Plan *plan);
+
+/*
+ * A leaf the region reads directly: a sequential scan over a heap table
+ * whose target list and filter the region's query computes over gg_rel(i),
+ * which returns the attributes they use.
+ */
+typedef struct GGRelScan
+{
+	int			leaf;			/* its leaf index */
+	int			ncols;
+	AttrNumber *attnos;			/* ascending */
+	GGTypeInfo *types;
+} GGRelScan;
+
+extern void gg_duckdb_describe_rel_leaf(GGLeafDesc *desc, const GGRelScan *rs);
 extern GGBindContext *gg_duckdb_bind_context_push(GGBindContext *bctx);
 extern void gg_duckdb_bind_context_pop(GGBindContext *saved);
 
@@ -352,6 +382,7 @@ typedef struct GGRegionSpec
 	char	   *agg_order;		/* ORDER BY restoring a sorted Agg's output order, or NULL */
 	List	   *natives;		/* of GGNativeLeaf: foreign tables DuckDB reads itself */
 	double		rows_native;	/* of rows_in, the rows DuckDB reads natively */
+	List	   *rels;			/* of GGRelScan: heap tables read through gg_rel */
 	List	   *rtable;			/* in: the statement's range table */
 	bool		cost_boundary;	/* in: the cost model may end the region above a subtree */
 	int			ncuts;			/* out: subtrees the executor keeps as leaves */
