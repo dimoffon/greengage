@@ -64,6 +64,9 @@ after GetForeignPlan (q09 failed on Parquet before it).
 | Column tables, GPORCA | fixed | 224.8 s | 205.8 s | 1.09x | 15 of 19 | 1.12x |
 | Parquet via the wrapper, GPORCA | fixed | 218.3 s | 163.6 s | 1.33x | 16 of 19 | 1.43x |
 | Column tables, planner | fixed | 224.0 s | 215.6 s | 1.04x | 13 of 19 | 1.07x |
+| Column tables, GPORCA | direct scans | 222.2 s | 200.0 s | 1.11x | 15 of 19 | 1.16x |
+| Parquet via the wrapper, GPORCA | direct scans | 220.5 s | 168.3 s | 1.31x | 16 of 19 | 1.39x |
+| Column tables, planner | direct scans | 238.6 s | 221.7 s | 1.08x | 13 of 19 | 1.16x |
 
 On the column tables the wins are the self-join (q12 1.7x), the statement
 types (q01 1.6x) and the wide profiles (q07 1.25x, q16 1.18x, q14 1.15x);
@@ -97,3 +100,20 @@ runs at 2.10x on the column tables (12.1 s to 5.8 s); on Parquet its native
 partial aggregate is still declined on a 52M-group estimate.  A bounded
 estimate for such expressions (24 hours, 7 weekdays, the column's range in
 days) is the lever for the load-over-time analyses.
+
+With direct scans (15 September, commit aa091e2b73c: regions read heap,
+append-optimized and partitioned tables themselves instead of pulling their
+scans through the executor), the column-table queries whose regions sit on
+the partition scans gain, alike under both optimizers: q02 3.7 to 1.9 s
+(0.99x to 1.97x), q15 7.1 to 5.1 s, q13 5.2 to 3.8 s, q01 5.7 to 4.9 s, q16
+5.0 to 4.3 s, q07 4.1 to 3.6 s.  The totals move less, from 1.09x to 1.11x
+under GPORCA and 1.04x to 1.08x under the planner (1.12x to 1.16x and 1.07x
+to 1.16x over the queries with regions), because the queries that take most
+of the time (q04, q05, q08-q12, q18, q19) have no region or one above a
+Motion, whose leaf is not a scan.  The planner pass ran while the host was
+slower (its `off` total 6.5% up, queries without regions 7-15% slower under
+`auto` too), so its ratios rather than its times compare.  q06's 0.92x is the
+same sort-only region above the redistribution as before, its plan identical
+with direct scans off.  The Parquet pass is the control: its scans already
+were DuckDB's own readers, and it stays within noise (1.33x to 1.31x).  All
+57 result sets equal.
