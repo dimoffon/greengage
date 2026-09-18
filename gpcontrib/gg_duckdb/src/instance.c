@@ -138,6 +138,58 @@ set_config(duckdb_config cfg, const char *name, const char *value)
 
 static void run_setting(duckdb_connection conn, const char *sql);
 
+/*
+ * What the JVM libhdfs starts inside this backend reads when it starts.
+ *
+ * The JVM is created lazily, at the first hdfs:// or Hive Metastore access,
+ * once per process and never destroyed, and libhdfs reads its options, the
+ * Hadoop configuration directory and the Kerberos ticket cache from the
+ * environment at that moment.  So they are set here, before the instance
+ * exists and therefore before any DuckDB call could reach HDFS -- and after
+ * the fork, since a JVM must never exist in the postmaster (open_instance
+ * refuses to run there at all).
+ *
+ * A variable already in the environment wins: an operator who exported one
+ * for the whole cluster meant it.
+ *
+ * _JAVA_SR_SIGNUM moves HotSpot's thread suspend signal off SIGUSR2, which a
+ * Greengage backend ignores and the postmaster sends its children; the JVM
+ * would otherwise take it over.  MALLOC_ARENA_MAX keeps glibc from reserving
+ * a per-thread arena for every thread the JVM starts, which counts against
+ * the commit limit on a host with strict overcommit.
+ */
+static void
+set_env_default(const char *name, const char *value)
+{
+	if (value == NULL || value[0] == '\0')
+		return;
+	if (getenv(name) != NULL)
+		return;
+	if (setenv(name, value, 0) != 0)
+		elog(WARNING, "gg_duckdb: could not set %s for the embedded JVM: %m", name);
+}
+
+static void
+prepare_jvm_environment(void)
+{
+	const char *ccache = gg_duckdb_kerberos_ccache;
+
+	set_env_default("LIBHDFS_OPTS", gg_duckdb_jvm_options);
+	set_env_default("HADOOP_CONF_DIR", gg_duckdb_hadoop_conf_dir);
+	if (ccache != NULL && ccache[0] != '\0')
+	{
+		/*
+		 * The client accepts a FILE cache only; a bare path is one.  Nothing
+		 * here creates or refreshes it: kinit outside the server does.
+		 */
+		if (strchr(ccache, ':') == NULL)
+			ccache = psprintf("FILE:%s", ccache);
+		set_env_default("KRB5CCNAME", ccache);
+	}
+	set_env_default("_JAVA_SR_SIGNUM", "40");
+	set_env_default("MALLOC_ARENA_MAX", "2");
+}
+
 static void
 open_instance(void)
 {
@@ -152,6 +204,7 @@ open_instance(void)
 
 	instance_temp_dir = temp_directory_path();
 	ensure_directory(instance_temp_dir);
+	prepare_jvm_environment();
 
 	if (duckdb_create_config(&cfg) == DuckDBError)
 		elog(ERROR, "gg_duckdb: could not create a DuckDB configuration");
@@ -281,6 +334,33 @@ open_instance(void)
 				(void) duckdb_query(conn, psql.data, &pres);
 				duckdb_destroy_result(&pres);
 				pfree(psql.data);
+			}
+
+			/*
+			 * The same directory the JVM got, as the hdfs extension's own
+			 * setting: it reads core-site.xml and hdfs-site.xml per
+			 * connection from there, and a Hive Metastore ATTACH without a
+			 * config_dir option falls back to it.  Without the extension the
+			 * setting does not exist: ignored, as with http_proxy.
+			 */
+			if (gg_duckdb_hadoop_conf_dir != NULL && gg_duckdb_hadoop_conf_dir[0] != '\0')
+			{
+				StringInfoData hsql;
+				duckdb_result hres;
+				const char *p;
+
+				initStringInfo(&hsql);
+				appendStringInfoString(&hsql, "SET hdfs_config_dir = '");
+				for (p = gg_duckdb_hadoop_conf_dir; *p; p++)
+				{
+					if (*p == '\'')
+						appendStringInfoChar(&hsql, '\'');
+					appendStringInfoChar(&hsql, *p);
+				}
+				appendStringInfoChar(&hsql, '\'');
+				(void) duckdb_query(conn, hsql.data, &hres);
+				duckdb_destroy_result(&hres);
+				pfree(hsql.data);
 			}
 
 			gg_duckdb_register_leaf_function(conn);

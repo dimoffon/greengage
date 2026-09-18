@@ -34,6 +34,9 @@ bool		gg_duckdb_reserve_memory = true;
 bool		gg_duckdb_strict = false;
 char	   *gg_duckdb_data_directories = NULL;
 char	   *gg_duckdb_http_proxy = NULL;
+char	   *gg_duckdb_jvm_options = NULL;
+char	   *gg_duckdb_hadoop_conf_dir = NULL;
+char	   *gg_duckdb_kerberos_ccache = NULL;
 bool		gg_duckdb_allow_float_aggregates = false;
 double		gg_duckdb_cost_fixed = 200.0;
 double		gg_duckdb_cost_convert_factor = 1.0;
@@ -255,6 +258,44 @@ gg_duckdb_define_gucs(void)
 							   "HTTP proxy (host:port) DuckDB uses for remote files; empty for none.",
 							   "The environment's http_proxy is not used: a database server rarely wants it, and DuckDB rejects some of its spellings.",
 							   &gg_duckdb_http_proxy,
+							   "",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
+
+	/*
+	 * Reading HDFS goes through a JVM that libhdfs starts inside the backend,
+	 * once per process and never again: these three are read when it starts,
+	 * so changing them takes effect in backends that have not read HDFS yet.
+	 * The defaults keep a JVM small, since every segment backend that touches
+	 * HDFS gets one of its own, and a host under strict overcommit charges
+	 * what they reserve.  -Xrs keeps the JVM's hands off the signals
+	 * PostgreSQL uses to cancel, terminate and quickdie.
+	 */
+	DefineCustomStringVariable("gg_duckdb.jvm_options",
+							   "Options for the JVM that libhdfs starts in a backend reading HDFS.",
+							   "Read once per process, when the first HDFS or Hive Metastore access starts the JVM. A backend that already has one keeps it.",
+							   &gg_duckdb_jvm_options,
+							   "-Xrs -Xms16m -Xmx256m -Xss1m -XX:+UseSerialGC "
+							   "-XX:ReservedCodeCacheSize=32m -XX:MaxMetaspaceSize=128m "
+							   "-XX:TieredStopAtLevel=1 -XX:CICompilerCount=1",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("gg_duckdb.hadoop_conf_dir",
+							   "Directory with core-site.xml and hdfs-site.xml for HDFS and the Hive Metastore; empty for none.",
+							   "Every node reads its own copy. The Hive Metastore ATTACH falls back to this directory when the server has no hms_config_dir option.",
+							   &gg_duckdb_hadoop_conf_dir,
+							   "",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("gg_duckdb.kerberos_ccache",
+							   "Kerberos ticket cache file for HDFS and the Hive Metastore; empty for the ambient one.",
+							   "A file cache (the path alone, or FILE:path) readable by the server's OS user: the client reads tickets and cannot log in from a keytab, so something outside the server must keep the cache fresh.",
+							   &gg_duckdb_kerberos_ccache,
 							   "",
 							   PGC_SUSET,
 							   GUC_GPDB_NEED_SYNC,
