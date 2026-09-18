@@ -1,0 +1,74 @@
+# An override for the ADH demo stand (~/ws/adh-show) that runs only what a
+# Greengage backend needs to read Iceberg tables on HDFS through the Hive
+# Metastore: the KDC, the secret store the entrypoints wait for, the metastore's
+# database, HDFS and the metastore itself.  Everything else in that stand
+# (YARN, HiveServer2, Ozone, Trino, Impala, Spark, Hue, Knox, Ranger, the
+# notebooks) stays down.
+#
+# Used only through up.sh, which knows the service list and the seeding.
+#
+# What this file changes, and why:
+#  - Fixed addresses.  A backend on the host reaches the containers directly on
+#    the bridge network, and the Kerberos service principals are tied to
+#    nn/dn1/ms.adh.local, so those names must resolve to the same addresses on
+#    the host (up.sh prints the /etc/hosts lines).
+#  - namenode waits for openbao.  The stand does not declare it, but every
+#    entrypoint blocks in vault_env() until the secret store hands out a token.
+#  - The KDC's TCP port is published, so the host can kinit.
+#  - The NameNode reads a conf tree without the Ranger authorizer, which up.sh
+#    derives from the stand's own conf (GG_HDFS_KEEP_RANGER=1 keeps it).
+services:
+  kdc:
+    ports:
+      - "127.0.0.1:1088:88/tcp"
+    networks:
+      default:
+        ipv4_address: 172.30.77.10
+
+  openbao:
+    networks:
+      default:
+        ipv4_address: 172.30.77.11
+
+  pg:
+    networks:
+      default:
+        ipv4_address: 172.30.77.12
+
+  namenode:
+    depends_on:
+      kdc:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+    volumes:
+      - secrets:/secrets
+      # Absolute, from up.sh: a relative path here would resolve against the
+      # stand's directory (compose takes the project directory from the first
+      # -f file), not this one.
+      - ${GG_HDFS_CONF_NN:?run up.sh, which sets this}:/opt/adh/conf-templates:ro
+      - ${GG_HDFS_CONF_NN:?}/krb5.conf:/etc/krb5.conf:ro
+      - nndata:/data/nn
+    networks:
+      default:
+        ipv4_address: 172.30.77.20
+        aliases: [nn.adh.local]
+
+  datanode:
+    networks:
+      default:
+        ipv4_address: 172.30.77.21
+        aliases: [dn1.adh.local]
+
+  metastore:
+    networks:
+      default:
+        ipv4_address: 172.30.77.22
+        aliases: [ms.adh.local]
+
+networks:
+  default:
+    name: adh.local
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24

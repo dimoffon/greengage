@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  The client half of the stand's hdfs-site.xml: the principals a client must
+  expect and the protection level it must offer.  The NameNode and DataNode
+  settings, the Ranger authorizer and the HTTPS keystores stay on the server
+  side.
+-->
+<configuration>
+    <property>
+        <name>dfs.namenode.kerberos.principal</name>
+        <value>hdfs/_HOST@ADH.LOCAL</value>
+    </property>
+    <property>
+        <name>dfs.datanode.kerberos.principal</name>
+        <value>hdfs/_HOST@ADH.LOCAL</value>
+    </property>
+    <!-- The DataNode does not run on a privileged port: SASL protects the data. -->
+    <property>
+        <name>dfs.data.transfer.protection</name>
+        <value>privacy</value>
+    </property>
+    <property>
+        <name>dfs.http.policy</name>
+        <value>HTTPS_ONLY</value>
+    </property>
+    <!--
+      The NameNode hands out the DataNode's address on the bridge network, and
+      the host reaches it there directly (up.sh fixes the addresses).  Set this
+      to true instead if the containers are reached through published ports on
+      127.0.0.1, in which case dn1.adh.local must resolve to 127.0.0.1.
+    -->
+    <property>
+        <name>dfs.client.use.datanode.hostname</name>
+        <value>false</value>
+    </property>
+    <property>
+        <name>dfs.client.socket-timeout</name>
+        <value>15000</value>
+    </property>
+</configuration>

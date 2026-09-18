@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!--
+  What a Greengage backend needs to talk to the ADH stand's HDFS, and nothing
+  more.  The stand's own core-site.xml cannot be used here: it resolves
+  passwords through a vault:// credential provider and registers Ozone file
+  systems whose classes the client bundle does not carry.
+
+  gg_duckdb.hadoop_conf_dir points a backend at this directory.
+-->
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://nn.adh.local:8020</value>
+    </property>
+    <property>
+        <name>hadoop.security.authentication</name>
+        <value>kerberos</value>
+    </property>
+    <property>
+        <name>hadoop.security.authorization</name>
+        <value>true</value>
+    </property>
+    <!-- The stand encrypts RPC; a client that offers less is refused. -->
+    <property>
+        <name>hadoop.rpc.protection</name>
+        <value>privacy</value>
+    </property>
+    <!--
+      A backend cannot be interrupted while it waits on Hadoop, so the waits
+      are short: a query cancelled during a read returns no sooner than these.
+    -->
+    <property>
+        <name>ipc.client.connect.timeout</name>
+        <value>5000</value>
+    </property>
+    <property>
+        <name>ipc.client.connect.max.retries</name>
+        <value>2</value>
+    </property>
+    <property>
+        <name>ipc.client.connect.max.retries.on.timeouts</name>
+        <value>2</value>
+    </property>
+</configuration>
