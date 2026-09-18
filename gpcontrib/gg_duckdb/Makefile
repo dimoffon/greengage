@@ -50,6 +50,16 @@ REGRESS_OPTS += --init-file=$(top_srcdir)/src/test/regress/init_file --init-file
 install: install-duckdb-lib
 
 .PHONY: install-duckdb-lib
+# hdfs-runtime/ (Hadoop client jars, libhdfs.so, the jlinked JRE) is present only
+# in a prefix built with DUCKDB_HDFS_DIR.  The duckdb-hdfs extension finds it by
+# dladdr() on its own code, which is inside libduckdb.so, so it must stay a
+# sibling of the library, and libhdfs.so's patched runpath must survive the copy
+# (cp -a, not INSTALL_SHLIB, which would strip it).
 install-duckdb-lib:
 	$(MKDIR_P) '$(DESTDIR)$(libdir)'
 	$(INSTALL_SHLIB) '$(with_duckdb)/lib/libduckdb.so' '$(DESTDIR)$(libdir)/libduckdb.so'
+	@if test -d '$(with_duckdb)/lib/hdfs-runtime'; then \
+		echo "cp -a $(with_duckdb)/lib/hdfs-runtime $(DESTDIR)$(libdir)/"; \
+		rm -rf '$(DESTDIR)$(libdir)/hdfs-runtime'; \
+		cp -a '$(with_duckdb)/lib/hdfs-runtime' '$(DESTDIR)$(libdir)/'; \
+	fi

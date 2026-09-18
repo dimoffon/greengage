@@ -17,3 +17,7 @@
 /bench/tpcds/queries/
 /bench/tpcds/results/
 /bench/redset/results/
+
+# The root .gitignore has a bare "build.sh" pattern, which would swallow the
+# recipe that produces the DuckDB prefix this directory is built against.
+!duckdb/build.sh
