@@ -138,7 +138,9 @@ each node's data directory), `max_temp_directory_size`,
 `release_instance_at_end`, `allow_float_aggregates` (`sum`/`avg`/`min`/`max`
 over float4/float8 inside regions, off: DuckDB's summation order differs, so
 the last digits of a float sum can differ from the standard executor's),
-`data_directories` and `http_proxy` (see the foreign data wrapper), and the
+`data_directories` and `http_proxy` (see the foreign data wrapper),
+`jvm_options`, `hadoop_conf_dir` and `kerberos_ccache` (the embedded JVM that
+reads HDFS, see Iceberg in a Hive Metastore), and the
 development aids `debug_wrap` and `debug_region_sql`.
 
 ## Hints
@@ -240,6 +242,55 @@ FROM SERVER s` creates one foreign table per table of the namespace. The
 data files are wherever the catalog says, so `gg_duckdb.data_directories`
 must hold a remote prefix, and the S3 secret of such a table has no bucket
 scope.
+
+### Iceberg in a Hive Metastore, on HDFS
+
+A server with `hms_uri` reaches a Hive Metastore, and a table whose
+`location` is `database.table` with `format 'iceberg'` is that metastore's
+table. `hms_conf` passes settings to the metastore client verbatim
+(`'metastore.sasl.enabled=true;metastore.kerberos.principal=hive/_HOST@REALM'`),
+`hms_config_dir` overrides `gg_duckdb.hadoop_conf_dir` for that server, and
+`hdfs_user`, `hdfs_authentication` (`simple` or `kerberos`) and `hdfs_conf`
+become the HDFS identity, as a DuckDB secret scoped to the name node.
+`IMPORT FOREIGN SCHEMA "database" FROM SERVER s` creates one foreign table
+per **Iceberg** table and skips the rest with a notice: only Iceberg tables
+are carried, not Hive Parquet, CSV or ORC ones. `gg_duckdb.data_directories`
+must hold the name node's prefix (`hdfs://nn:8020/`). A metastore table is
+read only; its row estimate comes from the current snapshot's manifests, not
+from a scan. The metastore catalog caches for five seconds, so a table
+committed elsewhere can take that long to appear.
+
+```sql
+CREATE SERVER hms FOREIGN DATA WRAPPER gg_duckdb
+    OPTIONS (hms_uri 'thrift://ms.example:9083', hdfs_authentication 'kerberos',
+             hms_conf 'metastore.sasl.enabled=true;metastore.kerberos.principal=hive/_HOST@EXAMPLE');
+SET gg_duckdb.hadoop_conf_dir = '/etc/hadoop/conf';   -- core-site.xml, hdfs-site.xml
+SET gg_duckdb.kerberos_ccache = '/tmp/krb5cc_gpadmin';
+SET gg_duckdb.data_directories = 'hdfs://nn.example:8020/';
+IMPORT FOREIGN SCHEMA "warehouse" FROM SERVER hms INTO lake;
+```
+
+HDFS is reached through JNI libhdfs, which starts a **JVM inside the
+backend**: one per process, at the first HDFS or metastore access, never
+destroyed, and every segment backend that reads HDFS gets one of its own.
+It reads `gg_duckdb.jvm_options`, `gg_duckdb.hadoop_conf_dir` and
+`gg_duckdb.kerberos_ccache` at that moment, so changing them affects
+backends that have not read HDFS yet, not the ones that have. The default
+`jvm_options` keep a JVM small (`-Xmx256m`, serial GC, one compiler thread)
+and hand the signals PostgreSQL needs back to it (`-Xrs`); raise the heap
+for large reads, and count it as memory outside `gg_duckdb.max_memory`,
+which only bounds DuckDB. Kerberos works from a **ticket cache file** owned
+by the server's OS user: the client cannot log in from a keytab, so
+something outside the server has to keep the cache fresh. A backend waiting
+on HDFS or the metastore cannot be interrupted, so a cancelled query returns
+only when the client's own timeouts expire; set them in the Hadoop
+configuration.
+
+This needs a build with `DUCKDB_HDFS_DIR` (see `duckdb/build.sh`), which
+links duckdb-hdfs into `libduckdb.so`, packages its JNI runtime beside it,
+and replaces the upstream Iceberg extension with the fork that carries the
+metastore catalog. `test/hdfs/` runs the checks against a cut-down ADH
+stand.
 
 ## Writing: INSERT into foreign tables
 

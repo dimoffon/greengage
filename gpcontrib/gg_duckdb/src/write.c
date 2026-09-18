@@ -49,7 +49,7 @@ typedef struct GGWriter
 	Oid			relid;
 	char	   *relname;
 	char	   *format;
-	bool		catalog;		/* target is an Iceberg catalog table, not a file */
+	GGCatalogKind catalog;		/* target is a catalog table, not a file */
 	Oid			serverid;
 	char	   *target;			/* the file written at commit, or the catalog table */
 	List	   *copy_opts;		/* DefElems: header, delim, compression, ... */
@@ -101,6 +101,17 @@ gg_duckdb_write_target(GGForeignOptions *o, const char *unique, const char **rea
 	const char *star;
 
 	*reason = NULL;
+	if (o->catalog == GG_CATALOG_HMS)
+	{
+		/*
+		 * Writes through a Hive Metastore are not carried yet.  DuckDB's
+		 * metastore Iceberg commit does take the metastore's exclusive table
+		 * lock, so several writers would be safe here -- unlike the REST
+		 * catalog, whose single-writer rule forces mpp_execute 'coordinator'.
+		 */
+		*reason = "a Hive Metastore table is read only in this version";
+		return NULL;
+	}
 	if (o->catalog)
 		return pstrdup(o->catalog_ref);
 	if (strcmp(o->format, "iceberg") == 0)
@@ -344,7 +355,7 @@ open_writer(Relation rel, PlanState *ps)
 	oldcxt = MemoryContextSwitchTo(writers_cxt);
 
 	gg_duckdb_foreign_options(relid, &o);
-	if (o.catalog)
+	if (o.catalog == GG_CATALOG_ICEBERG_REST)
 	{
 		/*
 		 * One writer at a time: DuckDB's Iceberg commits do not detect each
@@ -363,7 +374,7 @@ open_writer(Relation rel, PlanState *ps)
 							 RelationGetRelationName(rel))));
 		LockRelationOid(relid, ExclusiveLock);
 	}
-	else
+	else if (o.catalog == GG_CATALOG_NONE)
 		gg_duckdb_check_locations(o.locations);
 	w = palloc0(sizeof(GGWriter));
 	w->catalog = o.catalog;
@@ -422,10 +433,10 @@ open_writer(Relation rel, PlanState *ps)
 				 errmsg("gg_duckdb: cannot insert into foreign table \"%s\": it has no columns", w->relname)));
 
 	/* the buffer: a table of this backend's instance, under the memory budget */
-	gg_duckdb_ensure_s3_secrets(relid, &o);
+	gg_duckdb_ensure_secrets(relid, &o);
 	w->conn = gg_duckdb_connect();
 	if (w->catalog)
-		gg_duckdb_iceberg_attach(w->conn, w->serverid);
+		gg_duckdb_catalog_attach(w->conn, w->serverid, w->catalog);
 	/* COPY FROM brings a ModifyTableState without a plan: no operator budget */
 	kb = (ps != NULL && ps->plan != NULL) ? (int64) PlanStateOperatorMemKB(ps) : 0;
 	if (kb <= 0)

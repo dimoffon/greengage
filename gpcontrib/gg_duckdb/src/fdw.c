@@ -93,6 +93,14 @@ static const GGOptionDef valid_options[] =
 	{"iceberg_token", UserMappingRelationId},
 	{"iceberg_client_id", UserMappingRelationId},
 	{"iceberg_client_secret", UserMappingRelationId},
+	/* a Hive Metastore catalog: tables named database.table in `location` */
+	{"hms_uri", ForeignServerRelationId},
+	{"hms_conf", ForeignServerRelationId},
+	{"hms_config_dir", ForeignServerRelationId},
+	/* HDFS: who the client is, and how it authenticates */
+	{"hdfs_user", ForeignServerRelationId},
+	{"hdfs_authentication", ForeignServerRelationId},
+	{"hdfs_conf", ForeignServerRelationId},
 	{"location", ForeignTableRelationId},
 	{"hive_partitioning", ForeignServerRelationId},
 	{"hive_partitioning", ForeignTableRelationId},
@@ -275,11 +283,44 @@ apply_options(List *options, GGForeignOptions *o)
 	}
 }
 
+static const char *server_option(ForeignServer *server, const char *name);
+
 /* A catalog table name: namespace.table, neither a path nor a URL. */
 static bool
 is_catalog_name(const char *loc)
 {
 	return strchr(loc, '/') == NULL && !is_remote(loc) && strchr(loc, '.') != NULL;
+}
+
+/*
+ * Which catalog a server attaches, from its options: an Iceberg REST endpoint
+ * or a Hive Metastore URI.  A server may name only one of them -- one alias
+ * per server carries the attached database.
+ */
+static GGCatalogKind
+catalog_kind(ForeignServer *server)
+{
+	bool		rest = server_option(server, "iceberg_endpoint") != NULL;
+	bool		hms = server_option(server, "hms_uri") != NULL;
+
+	if (rest && hms)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				 errmsg("gg_duckdb: server \"%s\" has both iceberg_endpoint and hms_uri options",
+						server->servername),
+				 errhint("A server attaches one catalog; use a server for each.")));
+	if (rest)
+		return GG_CATALOG_ICEBERG_REST;
+	if (hms)
+		return GG_CATALOG_HMS;
+	return GG_CATALOG_NONE;
+}
+
+/* The name the server's catalog is attached under in this backend. */
+char *
+gg_duckdb_catalog_alias(Oid serverid, GGCatalogKind kind)
+{
+	return psprintf(kind == GG_CATALOG_HMS ? "gg_hms_%u" : "gg_ice_%u", serverid);
 }
 
 static const char *
@@ -332,14 +373,15 @@ get_options(Oid relid, GGForeignOptions *o)
 	{
 		const char *name = (const char *) linitial(o->locations);
 		const char *dot = strrchr(name, '.');
+		GGCatalogKind kind = catalog_kind(server);
 
-		if (server_option(server, "iceberg_endpoint") == NULL)
+		if (kind == GG_CATALOG_NONE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
-					 errmsg("gg_duckdb: foreign table \"%s\" names the catalog table \"%s\", but server \"%s\" has no iceberg_endpoint option",
+					 errmsg("gg_duckdb: foreign table \"%s\" names the catalog table \"%s\", but server \"%s\" has neither an iceberg_endpoint nor an hms_uri option",
 							get_rel_name(relid), name, server->servername)));
-		o->catalog = true;
-		o->catalog_ref = psprintf("gg_ice_%u.%s.%s", server->serverid,
+		o->catalog = kind;
+		o->catalog_ref = psprintf("%s.%s.%s", gg_duckdb_catalog_alias(server->serverid, kind),
 								  duck_ident(pnstrdup(name, dot - name)), duck_ident(dot + 1));
 	}
 }
@@ -348,8 +390,8 @@ get_options(Oid relid, GGForeignOptions *o)
  * The ATTACH of a server's Iceberg REST catalog, credentials from the
  * caller's user mapping: none, a bearer token, or an OAuth2 client.
  */
-char *
-gg_duckdb_iceberg_attach_sql(Oid serverid)
+static char *
+iceberg_attach_sql(Oid serverid)
 {
 	ForeignServer *server = GetForeignServer(serverid);
 	UserMapping *um = NULL;
@@ -411,11 +453,78 @@ gg_duckdb_iceberg_attach_sql(Oid serverid)
 }
 
 /*
+ * The ATTACH of a server's Hive Metastore.  The metastore itself carries no
+ * credentials: the JNI client authenticates with the backend's Kerberos
+ * ticket cache, and hms_conf passes the client's own settings through
+ * ("metastore.sasl.enabled=true;metastore.kerberos.principal=hive/_HOST@REALM").
+ * Read only: writes to a metastore table are not supported yet.
+ */
+static char *
+hms_attach_sql(Oid serverid)
+{
+	ForeignServer *server = GetForeignServer(serverid);
+	const char *uri = server_option(server, "hms_uri");
+	const char *conf = server_option(server, "hms_conf");
+	const char *config_dir = server_option(server, "hms_config_dir");
+	StringInfoData sql;
+
+	if (uri == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+				 errmsg("gg_duckdb: server \"%s\" has no hms_uri option", server->servername)));
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "ATTACH IF NOT EXISTS %s AS gg_hms_%u (TYPE hive_metastore, READ_ONLY",
+					 duck_literal(uri), serverid);
+	if (conf)
+		appendStringInfo(&sql, ", CONF %s", duck_literal(conf));
+	if (config_dir)
+		appendStringInfo(&sql, ", CONFIG_DIR %s", duck_literal(config_dir));
+	appendStringInfoChar(&sql, ')');
+	return sql.data;
+}
+
+char *
+gg_duckdb_catalog_attach_sql(Oid serverid, GGCatalogKind kind)
+{
+	switch (kind)
+	{
+		case GG_CATALOG_ICEBERG_REST:
+			return iceberg_attach_sql(serverid);
+		case GG_CATALOG_HMS:
+			return hms_attach_sql(serverid);
+		case GG_CATALOG_NONE:
+			break;
+	}
+	elog(ERROR, "gg_duckdb: server %u attaches no catalog", serverid);
+	return NULL;				/* keep the compiler quiet */
+}
+
+/*
+ * Where a Hive Metastore table's Iceberg metadata JSON lives, as the
+ * metastore reports it (the extension repoints an Iceberg table's storage
+ * location at the exact metadata file, since a metastore-written table
+ * carries no version hint).  NULL when the metastore does not say.
+ */
+static char *
+hms_metadata_location(Oid serverid, const char *db, const char *tab)
+{
+	List	   *rows;
+
+	rows = duck_text_column(psprintf("SELECT list_extract(map_extract(tags, 'hms_storage_location'), 1) FROM duckdb_tables() WHERE database_name = %s AND schema_name = %s AND table_name = %s",
+									 duck_literal(gg_duckdb_catalog_alias(serverid, GG_CATALOG_HMS)),
+									 duck_literal(db), duck_literal(tab)),
+							"could not read the metastore table's location");
+	if (rows == NIL)
+		return NULL;
+	return (char *) linitial(rows);
+}
+
+/*
  * Attached catalogs are the instance's: one ATTACH per server and backend,
  * done again (after a DETACH) when the server's or the mapping's options
  * changed, and forgotten with the instance.
  */
-static List *attached = NIL;	/* of (serverid Oid as int, ATTACH text), TopMemoryContext */
+static List *attached = NIL;	/* of (serverid Oid as int, kind as int, ATTACH text), TopMemoryContext */
 
 void
 gg_duckdb_fdw_instance_closed(void)
@@ -424,9 +533,10 @@ gg_duckdb_fdw_instance_closed(void)
 }
 
 void
-gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid)
+gg_duckdb_catalog_attach(duckdb_connection conn, Oid serverid, GGCatalogKind kind)
 {
-	char	   *sql = gg_duckdb_iceberg_attach_sql(serverid);
+	char	   *sql = gg_duckdb_catalog_attach_sql(serverid, kind);
+	char	   *alias = gg_duckdb_catalog_alias(serverid, kind);
 	ListCell   *lc;
 	List	   *entry = NIL;
 	MemoryContext oldcxt;
@@ -436,17 +546,17 @@ gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid)
 	{
 		List	   *e = (List *) lfirst(lc);
 
-		if ((Oid) intVal(linitial(e)) == serverid)
+		if ((Oid) intVal(linitial(e)) == serverid && intVal(lsecond(e)) == (int) kind)
 		{
 			entry = e;
 			break;
 		}
 	}
-	if (entry != NULL && strcmp((const char *) lsecond(entry), sql) == 0)
+	if (entry != NULL && strcmp((const char *) lthird(entry), sql) == 0)
 		return;
 	if (entry != NULL)
 	{
-		char	   *detach = psprintf("DETACH gg_ice_%u", serverid);
+		char	   *detach = psprintf("DETACH %s", alias);
 
 		if (duckdb_query(conn, detach, &res) == DuckDBError)
 		{
@@ -464,12 +574,14 @@ gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid)
 		gg_duckdb_note_error(copy);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("gg_duckdb: could not attach the Iceberg catalog of server \"%s\": %s",
+				 errmsg("gg_duckdb: could not attach the %s catalog of server \"%s\": %s",
+						kind == GG_CATALOG_HMS ? "Hive Metastore" : "Iceberg",
 						GetForeignServer(serverid)->servername, copy)));
 	}
 	duckdb_destroy_result(&res);
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	attached = lappend(attached, list_make2(makeInteger((int) serverid), pstrdup(sql)));
+	attached = lappend(attached, list_make3(makeInteger((int) serverid),
+											makeInteger((int) kind), pstrdup(sql)));
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -562,28 +674,104 @@ gg_duckdb_fdw_validator(PG_FUNCTION_ARGS)
 }
 
 /*
- * The S3 credentials of a server: the endpoint and style from the server,
- * the keys from the caller's user mapping, as a DuckDB secret scoped to the
- * buckets of the table's locations.  Temporary secrets live in the backend's
- * DuckDB instance; creating them again is cheap and picks up changes.
+ * The credentials of a server, as DuckDB secrets: for S3 the endpoint and
+ * style from the server and the keys from the caller's user mapping, scoped
+ * to the buckets of the table's locations; for HDFS the identity below.
+ * Temporary secrets live in the backend's DuckDB instance; creating them
+ * again is cheap and picks up changes.
  */
-static void ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o);
+static void ensure_secrets_for_server(Oid serverid, GGForeignOptions *o);
 
 static void
-ensure_s3_secrets(Oid relid, GGForeignOptions *o)
+ensure_secrets(Oid relid, GGForeignOptions *o)
 {
-	ensure_s3_secrets_for_server(GetForeignTable(relid)->serverid, o);
+	ensure_secrets_for_server(GetForeignTable(relid)->serverid, o);
 }
 
 void
-gg_duckdb_ensure_s3_secrets(Oid relid, GGForeignOptions *o)
+gg_duckdb_ensure_secrets(Oid relid, GGForeignOptions *o)
 {
-	ensure_s3_secrets(relid, o);
+	ensure_secrets(relid, o);
+}
+
+/*
+ * The HDFS identity of a server, as a DuckDB secret scoped to the name nodes
+ * of the table's locations (a catalog table's files are wherever the catalog
+ * says, so its secret has no scope).  There are no credentials to carry:
+ * Kerberos comes from the backend's ticket cache, which gg_duckdb.kerberos_ccache
+ * names and something outside the server keeps fresh.
+ */
+static void
+ensure_hdfs_secret_for_server(Oid serverid, GGForeignOptions *o)
+{
+	ForeignServer *server = GetForeignServer(serverid);
+	const char *user = server_option(server, "hdfs_user");
+	const char *auth = server_option(server, "hdfs_authentication");
+	const char *conf = server_option(server, "hdfs_conf");
+	ListCell   *lc;
+	List	   *scopes = NIL;
+
+	if (user == NULL && auth == NULL && conf == NULL)
+		return;					/* the settings and the ambient identity do */
+	if (auth != NULL && strcmp(auth, "simple") != 0 && strcmp(auth, "kerberos") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+				 errmsg("gg_duckdb: hdfs_authentication must be simple or kerberos")));
+	if (o->catalog)
+		scopes = list_make1(pstrdup(""));
+	foreach(lc, o->locations)
+	{
+		const char *loc = (const char *) lfirst(lc);
+
+		if (strncmp(loc, "hdfs://", 7) == 0)
+		{
+			const char *b = strstr(loc, "://") + 3;
+			const char *e = strchr(b, '/');
+			char	   *scope = e ? psprintf("hdfs://%.*s", (int) (e - b), b) : psprintf("hdfs://%s", b);
+			bool		dup = false;
+			ListCell   *sc;
+
+			foreach(sc, scopes)
+				if (strcmp((char *) lfirst(sc), scope) == 0)
+					dup = true;
+			if (!dup)
+				scopes = lappend(scopes, scope);
+		}
+	}
+	if (scopes == NIL)
+		return;
+
+	foreach(lc, scopes)
+	{
+		const char *scope = (const char *) lfirst(lc);
+		StringInfoData sql;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "CREATE OR REPLACE TEMPORARY SECRET gg_%u_hdfs%s (TYPE hdfs",
+						 serverid, scope[0] == '\0' ? "_catalog" : "");
+		if (scope[0] != '\0')
+			appendStringInfo(&sql, ", SCOPE %s", duck_literal(scope));
+		if (user)
+			appendStringInfo(&sql, ", USER %s", duck_literal(user));
+		if (auth)
+			appendStringInfo(&sql, ", AUTHENTICATION %s", duck_literal(auth));
+		if (conf)
+			appendStringInfo(&sql, ", CONF %s", duck_literal(conf));
+		if (gg_duckdb_kerberos_ccache != NULL && gg_duckdb_kerberos_ccache[0] != '\0')
+			appendStringInfo(&sql, ", KERBEROS_TICKET_CACHE_PATH %s",
+							 duck_literal(gg_duckdb_kerberos_ccache));
+		if (gg_duckdb_hadoop_conf_dir != NULL && gg_duckdb_hadoop_conf_dir[0] != '\0')
+			appendStringInfo(&sql, ", CONFIG_DIR %s", duck_literal(gg_duckdb_hadoop_conf_dir));
+		appendStringInfoChar(&sql, ')');
+		(void) duck_text_column(sql.data, "could not create the HDFS secret");
+	}
 }
 
 static void
-ensure_s3_secrets_for_server(Oid serverid, GGForeignOptions *o)
+ensure_secrets_for_server(Oid serverid, GGForeignOptions *o)
 {
+	ensure_hdfs_secret_for_server(serverid, o);
+
 	ForeignServer *server = GetForeignServer(serverid);
 	UserMapping *um = NULL;
 	const char *endpoint = NULL,
@@ -862,13 +1050,13 @@ gg_duckdb_native_files(Oid relid)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("gg_duckdb: catalog table \"%s\" needs a remote prefix in gg_duckdb.data_directories",
 							get_rel_name(relid))));
-		ensure_s3_secrets(relid, &o);
+		ensure_secrets(relid, &o);
 		{
 			duckdb_connection conn = gg_duckdb_connect();
 
 			PG_TRY();
 			{
-				gg_duckdb_iceberg_attach(conn, o.serverid);
+				gg_duckdb_catalog_attach(conn, o.serverid, o.catalog);
 			}
 			PG_CATCH();
 			{
@@ -882,7 +1070,7 @@ gg_duckdb_native_files(Oid relid)
 	else
 	{
 		check_locations(o.locations);
-		ensure_s3_secrets(relid, &o);
+		ensure_secrets(relid, &o);
 	}
 	if (table->exec_location == FTEXECLOCATION_ALL_SEGMENTS &&
 		Gp_role == GP_ROLE_EXECUTE && GpIdentity.segindex >= 0 && getgpsegmentCount() > 1)
@@ -1088,8 +1276,17 @@ gg_duckdb_native_pre_sql(List *natives)
 			result = lappend(result, "SET unsafe_enable_version_guessing = true");
 			guessing = true;
 		}
-		else if (strncmp(nl->reader, "gg_ice_", 7) == 0)
-			result = lappend(result, gg_duckdb_iceberg_attach_sql(GetForeignTable(nl->relid)->serverid));
+		else if (strchr(nl->reader, '(') == NULL)
+		{
+			/* not a reader call but an attached catalog's table name */
+			GGForeignOptions o;
+
+			get_options(nl->relid, &o);
+			if (o.catalog != GG_CATALOG_NONE)
+				result = lappend(result,
+								 gg_duckdb_catalog_attach_sql(GetForeignTable(nl->relid)->serverid,
+															  o.catalog));
+		}
 	}
 	return result;
 }
@@ -1171,7 +1368,53 @@ fdw_get_rel_size(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 		GGForeignOptions o;
 
 		get_options(foreigntableid, &o);
-		if (strcmp(o.format, "parquet") == 0)
+		if (o.catalog == GG_CATALOG_HMS)
+		{
+			/*
+			 * A metastore Iceberg table counts its rows in the manifests of
+			 * its current snapshot: the data files' record counts, without
+			 * reading a data file.  Delete files are ignored, so a
+			 * merge-on-read table reads a little high.
+			 */
+			MemoryContext oldcxt = CurrentMemoryContext;
+			const char *name = (const char *) linitial(o.locations);
+			const char *dot = strrchr(name, '.');
+
+			PG_TRY();
+			{
+				duckdb_connection conn = gg_duckdb_connect();
+				char	   *loc;
+
+				PG_TRY();
+				{
+					gg_duckdb_catalog_attach(conn, o.serverid, o.catalog);
+				}
+				PG_CATCH();
+				{
+					gg_duckdb_disconnect(&conn);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+				gg_duckdb_disconnect(&conn);
+				loc = hms_metadata_location(o.serverid, pnstrdup(name, dot - name), dot + 1);
+				if (loc != NULL)
+				{
+					List	   *rows = duck_text_column(psprintf("SELECT CAST(sum(record_count) AS VARCHAR) FROM iceberg_metadata(%s) WHERE content = 'DATA'",
+																 duck_literal(loc)),
+														"could not read the Iceberg manifests");
+
+					if (rows != NIL && linitial(rows) != NULL)
+						baserel->tuples = strtod((const char *) linitial(rows), NULL);
+				}
+			}
+			PG_CATCH();
+			{
+				MemoryContextSwitchTo(oldcxt);
+				FlushErrorState();
+			}
+			PG_END_TRY();
+		}
+		else if (strcmp(o.format, "parquet") == 0)
 		{
 			MemoryContext oldcxt = CurrentMemoryContext;
 
@@ -1383,8 +1626,16 @@ fdw_begin(ForeignScanState *node, int eflags)
 	st->q.params = params;
 	if (strstr(ns.reader, "iceberg_scan(") != NULL)
 		st->q.pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
-	else if (strncmp(ns.reader, "gg_ice_", 7) == 0)
-		st->q.pre_sql = list_make1(gg_duckdb_iceberg_attach_sql(GetForeignTable(rte->relid)->serverid));
+	else if (strchr(ns.reader, '(') == NULL)
+	{
+		/* not a reader call but an attached catalog's table name */
+		GGForeignOptions o;
+
+		get_options(rte->relid, &o);
+		if (o.catalog != GG_CATALOG_NONE)
+			st->q.pre_sql = list_make1(gg_duckdb_catalog_attach_sql(GetForeignTable(rte->relid)->serverid,
+																	o.catalog));
+	}
 
 	/* result column k is attribute attnos[k] of the scan tuple */
 	outtypes = palloc0(sizeof(GGTypeInfo) * Max(list_length(ns.attnos), 1));
@@ -1526,10 +1777,30 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 				k;
 	ListCell   *lc;
 
+	GGForeignOptions o;
+	char	   *reader;
+	List	   *file_lists;
+	List	   *attach_sql = NIL;
+
 	*totalrows = 0;
 	*totaldeadrows = 0;
 	if (files == NIL)
 		return 0;
+
+	/*
+	 * A catalog table's reader is the attached table's name: it takes no file
+	 * list, so nothing may be bound to it, and the ATTACH has to be part of
+	 * every query that names it.  A file table's reader takes the list as $1.
+	 */
+	get_options(relid, &o);
+	if (o.catalog != GG_CATALOG_NONE)
+	{
+		file_lists = NIL;
+		attach_sql = list_make1(gg_duckdb_catalog_attach_sql(GetForeignTable(relid)->serverid,
+															 o.catalog));
+	}
+	else
+		file_lists = list_make1(files);
 
 	for (i = 0; i < desc->natts; i++)
 		if (!TupleDescAttr(desc, i)->attisdropped)
@@ -1549,18 +1820,21 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 
 		initStringInfo(&csql);
 		at = strstr(ns.sql, token);
+		reader = file_lists != NIL ? psprintf(ns.reader, "$1") : ns.reader;
 		appendStringInfoString(&csql, "SELECT CAST(count(*) AS VARCHAR) FROM (");
 		appendBinaryStringInfo(&csql, ns.sql, at - ns.sql);
-		appendStringInfoString(&csql, psprintf(ns.reader, "$1"));
+		appendStringInfoString(&csql, reader);
 		appendStringInfoString(&csql, at + strlen(token));
 		appendStringInfoString(&csql, ") AS t");
 		/* the query state must outlive its memory context's reset callback */
 		q = palloc0(sizeof(GGDuckQuery));
 		gg_duckdb_query_init(q, NULL, CurrentMemoryContext, "analyze");
 		q->sql = csql.data;
-		q->file_lists = list_make1(files);
+		q->file_lists = file_lists;
 		if (strstr(ns.reader, "iceberg_scan(") != NULL)
 			q->pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
+		else if (attach_sql != NIL)
+			q->pre_sql = attach_sql;
 		outtypes = palloc0(sizeof(GGTypeInfo));
 		gg_duckdb_type_map(TEXTOID, -1, &outtypes[0]);
 		{
@@ -1581,15 +1855,17 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 	initStringInfo(&sql);
 	at = strstr(ns.sql, token);
 	appendBinaryStringInfo(&sql, ns.sql, at - ns.sql);
-	appendStringInfoString(&sql, psprintf(ns.reader, "$1"));
+	appendStringInfoString(&sql, file_lists != NIL ? psprintf(ns.reader, "$1") : ns.reader);
 	appendStringInfoString(&sql, at + strlen(token));
 	appendStringInfo(&sql, " USING SAMPLE reservoir(%d ROWS) REPEATABLE (42)", targrows);
 	q = palloc0(sizeof(GGDuckQuery));
 	gg_duckdb_query_init(q, NULL, CurrentMemoryContext, "analyze");
 	q->sql = sql.data;
-	q->file_lists = list_make1(files);
+	q->file_lists = file_lists;
 	if (strstr(ns.reader, "iceberg_scan(") != NULL)
 		q->pre_sql = list_make1("SET unsafe_enable_version_guessing = true");
+	else if (attach_sql != NIL)
+		q->pre_sql = attach_sql;
 	outtypes = palloc0(sizeof(GGTypeInfo) * Max(list_length(attnos), 1));
 	colmap = palloc0(sizeof(int) * Max(list_length(attnos), 1));
 	k = 0;
@@ -1706,19 +1982,28 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname)));
 	}
-	if (server_option(server, "iceberg_endpoint") != NULL && strchr(dir, '/') == NULL && !is_remote(dir))
+	if (strchr(dir, '/') == NULL && !is_remote(dir) && catalog_kind(server) != GG_CATALOG_NONE)
 	{
-		/* a namespace of the server's Iceberg catalog: one foreign table per table */
+		/*
+		 * A namespace of the server's catalog (an Iceberg REST namespace or a
+		 * Hive Metastore database): one foreign table per table.  A metastore
+		 * holds tables of every Hive format, and only its Iceberg ones are
+		 * carried, so those are told apart by what the metastore says about
+		 * them: the extension repoints an Iceberg table's storage location at
+		 * its metadata JSON, and the input format names the Iceberg handler.
+		 */
+		GGCatalogKind kind = catalog_kind(server);
+		char	   *alias = gg_duckdb_catalog_alias(serverOid, kind);
 		duckdb_connection conn = gg_duckdb_connect();
 		List	   *tables;
 		GGForeignOptions o;
 
 		memset(&o, 0, sizeof(o));
-		o.catalog = true;
-		ensure_s3_secrets_for_server(serverOid, &o);
+		o.catalog = kind;
+		ensure_secrets_for_server(serverOid, &o);
 		PG_TRY();
 		{
-			gg_duckdb_iceberg_attach(conn, serverOid);
+			gg_duckdb_catalog_attach(conn, serverOid, kind);
 		}
 		PG_CATCH();
 		{
@@ -1727,9 +2012,29 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 		PG_END_TRY();
 		gg_duckdb_disconnect(&conn);
-		tables = duck_text_column(psprintf("SELECT table_name FROM duckdb_tables() WHERE database_name = 'gg_ice_%u' AND schema_name = %s ORDER BY 1",
-										   serverOid, duck_literal(dir)),
-								  "could not list the catalog's tables");
+		if (kind == GG_CATALOG_HMS)
+		{
+			List	   *rows = duck_text_pairs(psprintf("SELECT table_name, CASE WHEN coalesce(list_extract(map_extract(tags, 'hms_storage_location'), 1), '') LIKE '%%.metadata.json' OR lower(coalesce(list_extract(map_extract(tags, 'hms_input_format'), 1), '')) LIKE '%%iceberg%%' THEN 'iceberg' ELSE 'other' END FROM duckdb_tables() WHERE database_name = %s AND schema_name = %s ORDER BY 1",
+																duck_literal(alias), duck_literal(dir)),
+													   "could not list the metastore's tables");
+
+			tables = NIL;
+			foreach(lc, rows)
+			{
+				List	   *row = (List *) lfirst(lc);
+
+				if (strcmp((const char *) lsecond(row), "iceberg") == 0)
+					tables = lappend(tables, linitial(row));
+				else
+					ereport(NOTICE,
+							(errmsg("gg_duckdb: table \"%s\".\"%s\" is not an Iceberg table; skipped",
+									dir, (const char *) linitial(row))));
+			}
+		}
+		else
+			tables = duck_text_column(psprintf("SELECT table_name FROM duckdb_tables() WHERE database_name = %s AND schema_name = %s ORDER BY 1",
+											   duck_literal(alias), duck_literal(dir)),
+									  "could not list the catalog's tables");
 		foreach(lc, tables)
 		{
 			char	   *name = (char *) lfirst(lc);
@@ -1738,8 +2043,8 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			StringInfoData cmd;
 			bool		first = true;
 
-			cols = duck_text_pairs(psprintf("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM gg_ice_%u.%s.%s)",
-											serverOid, duck_ident(dir), duck_ident(name)),
+			cols = duck_text_pairs(psprintf("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM %s.%s.%s)",
+											alias, duck_ident(dir), duck_ident(name)),
 								   "could not describe the catalog table");
 			initStringInfo(&cmd);
 			appendStringInfo(&cmd, "CREATE FOREIGN TABLE %s (", quote_identifier(name));
@@ -1780,7 +2085,7 @@ fdw_import_schema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
 		memset(&o, 0, sizeof(o));
 		o.locations = list_make1(dir);
-		ensure_s3_secrets_for_server(serverOid, &o);
+		ensure_secrets_for_server(serverOid, &o);
 	}
 
 	/* files right in the directory: one table each; subdirectories: one table each */

@@ -457,6 +457,17 @@ extern bool gg_duckdb_deparse_region(PlannedStmt *stmt, Plan *root, GGRegionSpec
 extern double gg_duckdb_region_budget_kb(const GGRegionSpec *spec);
 extern const char *gg_duckdb_type_sql(const GGTypeInfo *ti);
 
+/*
+ * fdw.c: which catalog a foreign table's "namespace.table" location names.
+ * NONE is zero, so a plain file table tests false.
+ */
+typedef enum GGCatalogKind
+{
+	GG_CATALOG_NONE = 0,
+	GG_CATALOG_ICEBERG_REST,	/* an Iceberg REST catalog: gg_ice_<server> */
+	GG_CATALOG_HMS				/* a Hive Metastore: gg_hms_<server> */
+} GGCatalogKind;
+
 /* fdw.c: the options of a foreign table, table over server over wrapper */
 typedef struct GGForeignOptions
 {
@@ -467,16 +478,17 @@ typedef struct GGForeignOptions
 	char	   *json_format;	/* auto, newline_delimited, array, unstructured; NULL: by location */
 	List	   *reader_opts;	/* DefElems passed to the reader: header, delim, ... */
 	Oid			serverid;
-	bool		catalog;		/* an Iceberg table of the server's REST catalog */
+	GGCatalogKind catalog;		/* a table of the server's catalog, if any */
 	char	   *catalog_ref;	/* its DuckDB name: gg_ice_<server>."ns"."table" */
 } GGForeignOptions;
 
 extern void gg_duckdb_foreign_options(Oid relid, GGForeignOptions *o);
-extern void gg_duckdb_iceberg_attach(duckdb_connection conn, Oid serverid);
-extern char *gg_duckdb_iceberg_attach_sql(Oid serverid);
+extern void gg_duckdb_catalog_attach(duckdb_connection conn, Oid serverid, GGCatalogKind kind);
+extern char *gg_duckdb_catalog_attach_sql(Oid serverid, GGCatalogKind kind);
+extern char *gg_duckdb_catalog_alias(Oid serverid, GGCatalogKind kind);
 extern void gg_duckdb_fdw_instance_closed(void);
 extern void gg_duckdb_check_locations(List *locations);
-extern void gg_duckdb_ensure_s3_secrets(Oid relid, GGForeignOptions *o);
+extern void gg_duckdb_ensure_secrets(Oid relid, GGForeignOptions *o);
 extern char *gg_duckdb_duck_literal(const char *s);
 extern char *gg_duckdb_duck_ident(const char *s);
 

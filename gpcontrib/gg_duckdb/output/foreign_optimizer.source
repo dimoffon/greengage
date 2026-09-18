@@ -339,6 +339,29 @@ SELECT k, count(*) FROM one GROUP BY k ORDER BY k LIMIT 3;
 (3 rows)
 
 RESET gg_duckdb.mode;
+-- a Hive Metastore server: the options are checked without a metastore to reach
+CREATE SERVER hms FOREIGN DATA WRAPPER gg_duckdb
+  OPTIONS (hms_uri 'thrift://nowhere.invalid:9083', hms_conf 'metastore.sasl.enabled=false');
+CREATE FOREIGN TABLE hms_tbl (id bigint) SERVER hms OPTIONS (location 'db.events', format 'iceberg');
+-- read only in this version
+INSERT INTO hms_tbl VALUES (1);
+ERROR:  foreign table "hms_tbl" does not allow inserts
+-- a metastore table's data is remote: without a remote prefix allowed, no read
+SELECT count(*) FROM hms_tbl;
+ERROR:  gg_duckdb: catalog table "hms_tbl" needs a remote prefix in gg_duckdb.data_directories  (seg0 slice1 127.0.1.1:9002 pid=629073)
+-- one catalog per server
+CREATE SERVER twocat FOREIGN DATA WRAPPER gg_duckdb
+  OPTIONS (hms_uri 'thrift://nowhere.invalid:9083', iceberg_endpoint 'http://nowhere.invalid:8181');
+CREATE FOREIGN TABLE twocat_tbl (id bigint) SERVER twocat OPTIONS (location 'db.events', format 'iceberg');
+SELECT count(*) FROM twocat_tbl;
+ERROR:  gg_duckdb: server "twocat" has both iceberg_endpoint and hms_uri options
+HINT:  A server attaches one catalog; use a server for each.
+-- a catalog name needs a server that attaches one
+CREATE FOREIGN TABLE nocat (id bigint) SERVER duck OPTIONS (location 'db.events', format 'iceberg');
+SELECT count(*) FROM nocat;
+ERROR:  gg_duckdb: foreign table "nocat" names the catalog table "db.events", but server "duck" has neither an iceberg_endpoint nor an hms_uri option
+DROP FOREIGN TABLE hms_tbl, twocat_tbl, nocat;
+DROP SERVER hms, twocat;
 DROP FUNCTION f_check(text, text);
 DROP SCHEMA imported CASCADE;
 NOTICE:  drop cascades to 6 other objects

@@ -103,6 +103,24 @@ SELECT count(*), min(id), max(id) FROM one;
 SET gg_duckdb.mode = force;
 SELECT k, count(*) FROM one GROUP BY k ORDER BY k LIMIT 3;
 RESET gg_duckdb.mode;
+-- a Hive Metastore server: the options are checked without a metastore to reach
+CREATE SERVER hms FOREIGN DATA WRAPPER gg_duckdb
+  OPTIONS (hms_uri 'thrift://nowhere.invalid:9083', hms_conf 'metastore.sasl.enabled=false');
+CREATE FOREIGN TABLE hms_tbl (id bigint) SERVER hms OPTIONS (location 'db.events', format 'iceberg');
+-- read only in this version
+INSERT INTO hms_tbl VALUES (1);
+-- a metastore table's data is remote: without a remote prefix allowed, no read
+SELECT count(*) FROM hms_tbl;
+-- one catalog per server
+CREATE SERVER twocat FOREIGN DATA WRAPPER gg_duckdb
+  OPTIONS (hms_uri 'thrift://nowhere.invalid:9083', iceberg_endpoint 'http://nowhere.invalid:8181');
+CREATE FOREIGN TABLE twocat_tbl (id bigint) SERVER twocat OPTIONS (location 'db.events', format 'iceberg');
+SELECT count(*) FROM twocat_tbl;
+-- a catalog name needs a server that attaches one
+CREATE FOREIGN TABLE nocat (id bigint) SERVER duck OPTIONS (location 'db.events', format 'iceberg');
+SELECT count(*) FROM nocat;
+DROP FOREIGN TABLE hms_tbl, twocat_tbl, nocat;
+DROP SERVER hms, twocat;
 DROP FUNCTION f_check(text, text);
 DROP SCHEMA imported CASCADE;
 DROP FOREIGN TABLE parts; DROP FOREIGN TABLE items; DROP FOREIGN TABLE tags; DROP FOREIGN TABLE one;
