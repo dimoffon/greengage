@@ -58,11 +58,12 @@ PG_FUNCTION_INFO_V1(gg_duckdb_fdw_handler);
 PG_FUNCTION_INFO_V1(gg_duckdb_fdw_validator);
 PG_FUNCTION_INFO_V1(gg_duckdb_foreign_files);
 
-#define GG_FDW_PRIVATE_VERSION	2
+#define GG_FDW_PRIVATE_VERSION	3
 
 static char *duck_literal(const char *s);
 static char *duck_ident(const char *s);
 static List *duck_text_column(const char *sql, const char *what);
+static List *duck_text_pairs(const char *sql, const char *what);
 
 /* ---------- options ---------- */
 
@@ -517,6 +518,129 @@ hms_metadata_location(Oid serverid, const char *db, const char *tab)
 	if (rows == NIL)
 		return NULL;
 	return (char *) linitial(rows);
+}
+
+/*
+ * The snapshot of a metastore Iceberg table the segments should share, and
+ * whether its files may be read directly at all.  Resolved on the coordinator
+ * while the statement is planned, so that every segment reads one snapshot.
+ *
+ * Reading the data files themselves means leaving the Iceberg reader behind,
+ * which is only the same thing when the table carries no delete files (a
+ * merge-on-read DELETE leaves rows in the data files that only the delete
+ * files remove) and has had one schema all along (a file written under an
+ * older schema is mapped to the current one by field id, which reading the
+ * file by name would not do).  Otherwise there is no pin and the table is
+ * read whole, through the catalog, as before.
+ */
+bool
+gg_duckdb_iceberg_pin(Oid relid, GGIcebergPin *pin, int64 *total_rows)
+{
+	GGForeignOptions o;
+	const char *name;
+	const char *dot;
+	char	   *loc;
+	List	   *rows;
+	bool		one_schema;
+
+	memset(pin, 0, sizeof(*pin));
+	if (total_rows != NULL)
+		*total_rows = 0;
+	if (Gp_role != GP_ROLE_DISPATCH)
+		return false;
+	get_options(relid, &o);
+	if (o.catalog != GG_CATALOG_HMS)
+		return false;			/* a REST catalog tells us no file paths */
+	name = (const char *) linitial(o.locations);
+	dot = strrchr(name, '.');
+
+	{
+		duckdb_connection conn = gg_duckdb_connect();
+
+		PG_TRY();
+		{
+			gg_duckdb_catalog_attach(conn, o.serverid, o.catalog);
+		}
+		PG_CATCH();
+		{
+			gg_duckdb_disconnect(&conn);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		gg_duckdb_disconnect(&conn);
+	}
+	loc = hms_metadata_location(o.serverid, pnstrdup(name, dot - name), dot + 1);
+	if (loc == NULL)
+		return false;
+
+	/*
+	 * One schema ever, and no delete file in the snapshot we are about to
+	 * fix.  The metadata JSON is read as JSON for the first: a table that has
+	 * never been altered has a single entry in its schema list.
+	 */
+	rows = duck_text_column(psprintf("SELECT CAST(len(schemas) AS VARCHAR) FROM read_json(%s)",
+									 duck_literal(loc)),
+							"could not read the Iceberg metadata");
+	one_schema = rows != NIL && linitial(rows) != NULL &&
+		strcmp((char *) linitial(rows), "1") == 0;
+	rows = duck_text_column(psprintf("SELECT CAST(snapshot_id AS VARCHAR) FROM iceberg_snapshots(%s) ORDER BY sequence_number DESC LIMIT 1",
+									 duck_literal(loc)),
+							"could not read the Iceberg snapshots");
+	if (rows == NIL || linitial(rows) == NULL)
+		return false;
+	pin->metadata = pstrdup(loc);
+	pin->snapshot_id = strtoll((char *) linitial(rows), NULL, 10);
+	/*
+	 * One pass over the manifests for everything the decision needs: the data
+	 * files, their rows, and whether the snapshot carries a delete file.
+	 * Reading the manifests is what costs, and it is why this happens here
+	 * rather than on every segment -- and why a small table is better left to
+	 * one reader: below iceberg_shard_min_rows the reading saved does not pay
+	 * for the pass.  The count comes with the file, after its content, both
+	 * of which are words, so the path is what is left of the last two.
+	 */
+	{
+		List	   *entries = duck_text_pairs(psprintf("SELECT file_path, content || ' ' || CAST(record_count AS VARCHAR) FROM iceberg_metadata(%s, snapshot_from_id => %ld) WHERE status <> 'DELETED' ORDER BY file_path",
+													   duck_literal(loc), pin->snapshot_id),
+											  "could not read the Iceberg manifests");
+		ListCell   *lc;
+		int64		total = 0;
+		bool		deletes = false;
+
+		foreach(lc, entries)
+		{
+			List	   *e = (List *) lfirst(lc);
+			char	   *path = (char *) linitial(e);
+			char	   *what = (char *) lsecond(e);
+			char	   *sp = strrchr(what, ' ');
+
+			if (sp == NULL)
+				continue;
+			if (strstr(what, "DELETES") != NULL)
+			{
+				/*
+				 * Only the delete files say which rows are gone, so the table
+				 * must be read through the reader that knows about them.  The
+				 * rows counted so far are the data files' and overstate it.
+				 */
+				deletes = true;
+				continue;
+			}
+			pin->files = lappend(pin->files, path);
+			total += strtoll(sp + 1, NULL, 10);
+		}
+		if (total_rows != NULL)
+			*total_rows = total;
+		if (deletes || pin->files == NIL || !one_schema ||
+			!gg_duckdb_iceberg_file_sharding ||
+			list_length(pin->files) > gg_duckdb_iceberg_max_shard_files ||
+			total < (int64) gg_duckdb_iceberg_shard_min_rows)
+		{
+			memset(pin, 0, sizeof(*pin));
+			return false;
+		}
+	}
+	return true;
 }
 
 /*
@@ -1027,7 +1151,7 @@ duck_text_pairs(const char *sql, const char *what)
  * all of them.  Sorted, so that the assignment is reproducible.
  */
 List *
-gg_duckdb_native_files(Oid relid)
+gg_duckdb_native_files(Oid relid, const GGIcebergPin *pin)
 {
 	GGForeignOptions o;
 	ForeignTable *table = GetForeignTable(relid);
@@ -1077,6 +1201,25 @@ gg_duckdb_native_files(Oid relid)
 		nseg = getgpsegmentCount();
 
 	initStringInfo(&sql);
+	if (pin != NULL && pin->snapshot_id != 0)
+	{
+		/*
+		 * This process's share of the files the coordinator listed, dealt out
+		 * in turn rather than by a hash of the path, which leaves the shares
+		 * within one file of each other however the paths happen to fall.
+		 * The list is already sorted, so every segment deals the same way.
+		 */
+		List	   *mine = NIL;
+		int			i = 0;
+
+		foreach(lc, pin->files)
+		{
+			if (nseg <= 0 || i % nseg == GpIdentity.segindex)
+				mine = lappend(mine, lfirst(lc));
+			i++;
+		}
+		return mine;
+	}
 	appendStringInfoString(&sql, "SELECT file FROM (");
 	foreach(lc, o.locations)
 	{
@@ -1110,12 +1253,23 @@ reader_function(const char *format)
 
 /* "read_parquet(%s, opt=..., ...)" with %s for the file list parameter. */
 static char *
-reader_call(GGForeignOptions *o)
+reader_call(GGForeignOptions *o, const GGIcebergPin *pin)
 {
 	StringInfoData buf;
 	ListCell   *lc;
 
 	initStringInfo(&buf);
+	if (pin != NULL && pin->snapshot_id != 0)
+	{
+		/*
+		 * The snapshot's data files, read as what they are.  Iceberg stores
+		 * the values of an identity-partitioned column in the files, so this
+		 * returns the table's columns; hive_partitioning would add the
+		 * directory names on top of them.
+		 */
+		appendStringInfoString(&buf, "read_parquet(%s, union_by_name=false, hive_partitioning=false)");
+		return buf.data;
+	}
 	if (o->catalog)
 	{
 		/* the attached catalog's table: no file list to bind */
@@ -1184,7 +1338,8 @@ reader_call(GGForeignOptions *o)
  * shape of every fetched attribute, the reader call and the empty relation.
  */
 bool
-gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *info, const char **reject)
+gg_duckdb_native_describe(Oid relid, List *attnos, const GGIcebergPin *pin,
+						  GGNativeInfo *info, const char **reject)
 {
 	Relation	rel = table_open(relid, AccessShareLock);
 	TupleDesc	desc = RelationGetDescr(rel);
@@ -1247,7 +1402,7 @@ gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *info, const cha
 		appendStringInfoString(&empty, "1 AS c0");
 	appendStringInfoString(&empty, " WHERE false)");
 	info->empty = empty.data;
-	info->reader = reader_call(&o);
+	info->reader = reader_call(&o, pin);
 	table_close(rel, AccessShareLock);
 	return true;
 }
@@ -1334,22 +1489,32 @@ gg_duckdb_is_native_scan(ForeignScan *fs, List *rtable)
 	rte = rt_fetch(fs->scan.scanrelid, rtable);
 	if (rte->rtekind != RTE_RELATION || !is_gg_duckdb_table(rte->relid))
 		return false;
-	return list_length(fs->fdw_private) == 3 &&
+	return list_length(fs->fdw_private) == 5 &&
 		IsA(linitial(fs->fdw_private), Const) &&
 		DatumGetInt32(((Const *) linitial(fs->fdw_private))->constvalue) == GG_FDW_PRIVATE_VERSION;
 }
 
 bool
-gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals)
+gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals, GGIcebergPin *pin)
 {
 	ListCell   *lc;
 
-	if (list_length(fs->fdw_private) != 3)
+	if (list_length(fs->fdw_private) != 5)
 		return false;
 	*attnos = NIL;
 	foreach(lc, (List *) lsecond(fs->fdw_private))
 		*attnos = lappend_int(*attnos, DatumGetInt32(((Const *) lfirst(lc))->constvalue));
 	*quals = (List *) lthird(fs->fdw_private);
+	if (pin != NULL)
+	{
+		Const	   *meta = (Const *) list_nth(fs->fdw_private, 3);
+		Const	   *snap = (Const *) list_nth(fs->fdw_private, 4);
+
+		memset(pin, 0, sizeof(*pin));
+		pin->snapshot_id = DatumGetInt64(snap->constvalue);
+		if (pin->snapshot_id != 0)
+			pin->files = gg_duckdb_pin_files_list(TextDatumGetCString(meta->constvalue));
+	}
 	return true;
 }
 
@@ -1359,53 +1524,84 @@ make_int_const(int v)
 	return makeConst(INT4OID, -1, InvalidOid, sizeof(int32), Int32GetDatum(v), false, true);
 }
 
+static Const *
+make_int8_const(int64 v)
+{
+	return makeConst(INT8OID, -1, InvalidOid, sizeof(int64), Int64GetDatum(v),
+					 false, FLOAT8PASSBYVAL);
+}
+
+static Const *
+make_text_const(const char *s)
+{
+	return makeConst(TEXTOID, -1, InvalidOid, -1, CStringGetTextDatum(s), false, false);
+}
+
+/*
+ * The pinned file list travels as one text: a path may hold anything but a
+ * newline, which HDFS and every object store this reads forbid in a name.
+ */
+char *
+gg_duckdb_pin_files_text(List *files)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+	bool		first = true;
+
+	initStringInfo(&buf);
+	foreach(lc, files)
+	{
+		appendStringInfo(&buf, "%s%s", first ? "" : "\n", (const char *) lfirst(lc));
+		first = false;
+	}
+	return buf.data;
+}
+
+List *
+gg_duckdb_pin_files_list(const char *text)
+{
+	List	   *files = NIL;
+	const char *p = text;
+
+	while (p != NULL && *p != '\0')
+	{
+		const char *nl = strchr(p, '\n');
+
+		files = lappend(files, nl ? pnstrdup(p, nl - p) : pstrdup(p));
+		p = nl ? nl + 1 : NULL;
+	}
+	return files;
+}
+
 static void
 fdw_get_rel_size(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
-	if (baserel->tuples <= 0 && Gp_role == GP_ROLE_DISPATCH)
-	{
-		/* no statistics yet: the Parquet metadata knows, when the coordinator sees the files */
-		GGForeignOptions o;
+	GGForeignOptions ho;
 
-		get_options(foreigntableid, &o);
-		if (o.catalog == GG_CATALOG_HMS)
+	/*
+	 * A metastore Iceberg table whose segments may share its files out: one
+	 * pass over the manifests fixes the snapshot they will share, lists the
+	 * files, and counts the rows, and the plan that follows takes all three
+	 * from the relation.  The pass is only made when sharding is on, since it
+	 * costs about as much as a small table's whole scan; the row count a
+	 * plan works from otherwise comes from ANALYZE, as for any table.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH && gg_duckdb_iceberg_file_sharding)
+	{
+		get_options(foreigntableid, &ho);
+		if (ho.catalog == GG_CATALOG_HMS)
 		{
-			/*
-			 * A metastore Iceberg table counts its rows in the manifests of
-			 * its current snapshot: the data files' record counts, without
-			 * reading a data file.  Delete files are ignored, so a
-			 * merge-on-read table reads a little high.
-			 */
 			MemoryContext oldcxt = CurrentMemoryContext;
-			const char *name = (const char *) linitial(o.locations);
-			const char *dot = strrchr(name, '.');
 
 			PG_TRY();
 			{
-				duckdb_connection conn = gg_duckdb_connect();
-				char	   *loc;
+				GGIcebergPin *pin = palloc0(sizeof(GGIcebergPin));
+				int64		total = 0;
 
-				PG_TRY();
-				{
-					gg_duckdb_catalog_attach(conn, o.serverid, o.catalog);
-				}
-				PG_CATCH();
-				{
-					gg_duckdb_disconnect(&conn);
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
-				gg_duckdb_disconnect(&conn);
-				loc = hms_metadata_location(o.serverid, pnstrdup(name, dot - name), dot + 1);
-				if (loc != NULL)
-				{
-					List	   *rows = duck_text_column(psprintf("SELECT CAST(sum(record_count) AS VARCHAR) FROM iceberg_metadata(%s) WHERE content = 'DATA'",
-																 duck_literal(loc)),
-														"could not read the Iceberg manifests");
-
-					if (rows != NIL && linitial(rows) != NULL)
-						baserel->tuples = strtod((const char *) linitial(rows), NULL);
-				}
+				if (gg_duckdb_iceberg_pin(foreigntableid, pin, &total))
+					baserel->fdw_private = (void *) pin;
+				if (total > 0)
+					baserel->tuples = (double) total;
 			}
 			PG_CATCH();
 			{
@@ -1414,13 +1610,20 @@ fdw_get_rel_size(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 			}
 			PG_END_TRY();
 		}
-		else if (strcmp(o.format, "parquet") == 0)
+	}
+	if (baserel->tuples <= 0 && Gp_role == GP_ROLE_DISPATCH)
+	{
+		/* no statistics yet: the Parquet metadata knows, when the coordinator sees the files */
+		GGForeignOptions o;
+
+		get_options(foreigntableid, &o);
+		if (strcmp(o.format, "parquet") == 0 && o.catalog == GG_CATALOG_NONE)
 		{
 			MemoryContext oldcxt = CurrentMemoryContext;
 
 			PG_TRY();
 			{
-				List	   *files = gg_duckdb_native_files(foreigntableid);
+				List	   *files = gg_duckdb_native_files(foreigntableid, NULL);
 
 				if (files != NIL)
 				{
@@ -1513,6 +1716,8 @@ fdw_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 	ListCell   *lc;
 	int			attno;
 
+	GGIcebergPin pin;
+
 	/* the columns the query needs: its target list and every clause */
 	pull_varattnos((Node *) baserel->reltarget->exprs, scan_relid, &attrs_used);
 	foreach(lc, scan_clauses)
@@ -1561,7 +1766,17 @@ fdw_get_plan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 		}
 	}
 
-	fdw_private = list_make3(make_int_const(GG_FDW_PRIVATE_VERSION), attno_consts, pushed);
+	/*
+	 * The snapshot the segments share was fixed while the size of the
+	 * relation was estimated, one pass over the manifests doing both.
+	 */
+	if (baserel->fdw_private != NULL)
+		pin = *(GGIcebergPin *) baserel->fdw_private;
+	else
+		memset(&pin, 0, sizeof(pin));
+	fdw_private = list_make5(make_int_const(GG_FDW_PRIVATE_VERSION), attno_consts, pushed,
+							 make_text_const(gg_duckdb_pin_files_text(pin.files)),
+							 make_int8_const(pin.snapshot_id));
 	return make_foreignscan(tlist, local, scan_relid, NIL, fdw_private, NIL, NIL, outer_plan);
 }
 
@@ -1576,6 +1791,7 @@ typedef struct GGForeignState
 	char	   *reader;
 	char	   *empty;
 	bool		no_files;		/* this node has nothing to read */
+	GGIcebergPin pin;			/* the snapshot the coordinator fixed, if any */
 } GGForeignState;
 
 static void
@@ -1612,8 +1828,9 @@ fdw_begin(ForeignScanState *node, int eflags)
 	memset(&ns, 0, sizeof(ns));
 	ns.relid = rte->relid;
 	ns.scanrelid = fs->scan.scanrelid;
-	if (!gg_duckdb_foreign_scan_private(fs, &ns.attnos, &ns.quals))
+	if (!gg_duckdb_foreign_scan_private(fs, &ns.attnos, &ns.quals, &st->pin))
 		elog(ERROR, "gg_duckdb: malformed foreign scan");
+	ns.pin = st->pin.snapshot_id != 0 ? &st->pin : NULL;
 	if (!gg_duckdb_native_scan_sql(&ns, psprintf(GG_NATIVE_TOKEN_FMT, 0), &params))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1669,7 +1886,7 @@ fdw_begin(ForeignScanState *node, int eflags)
 static void
 fdw_start(GGForeignState *st)
 {
-	List	   *files = gg_duckdb_native_files(st->relid);
+	List	   *files = gg_duckdb_native_files(st->relid, st->pin.snapshot_id != 0 ? &st->pin : NULL);
 	char	   *token = psprintf(GG_NATIVE_TOKEN_FMT, 0);
 	char	   *at = strstr(st->sql, token);
 	StringInfoData sql;
@@ -1761,7 +1978,7 @@ fdw_acquire_sample_rows(Relation onerel, int elevel, HeapTuple *rows, int targro
 {
 	Oid			relid = RelationGetRelid(onerel);
 	TupleDesc	desc = RelationGetDescr(onerel);
-	List	   *files = gg_duckdb_native_files(relid);
+	List	   *files = gg_duckdb_native_files(relid, NULL);
 	GGNativeScan ns;
 	List	   *params = NIL;
 	List	   *attnos = NIL;
@@ -2213,7 +2430,7 @@ gg_duckdb_foreign_files(PG_FUNCTION_ARGS)
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-		funcctx->user_fctx = gg_duckdb_native_files(relid);
+		funcctx->user_fctx = gg_duckdb_native_files(relid, NULL);
 		MemoryContextSwitchTo(oldcxt);
 	}
 	funcctx = SRF_PERCALL_SETUP();

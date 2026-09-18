@@ -67,6 +67,22 @@ SELECT count(*) AS n, count(*) FILTER (WHERE id % 7 = 0) AS should_be_zero FROM 
 \echo === which segments read the table
 SELECT count(*) AS files, count(DISTINCT segment) AS segments FROM gg_duckdb.foreign_files('hdfs_gg.events');
 
+\echo === the segments share the files out, and read the same rows either way
+SET gg_duckdb.iceberg_file_sharding = on;
+SET gg_duckdb.iceberg_shard_min_rows = 0;   -- the fixture's tables are small
+SET gg_duckdb.mode = off;
+SELECT count(*) AS n, sum(amount) AS amount, count(DISTINCT day) AS days FROM hdfs_gg.events;
+SET gg_duckdb.mode = force;
+SELECT count(*) AS n, sum(amount) AS amount, count(DISTINCT day) AS days FROM hdfs_gg.events;
+\echo --- the busiest segment reads a share of the rows, not all of them
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM hdfs_gg.events;
+\echo --- a table with delete files is read whole, by one reader, and stays right
+SELECT count(*) AS n, count(*) FILTER (WHERE id % 7 = 0) AS should_be_zero FROM hdfs_gg.events_mor;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM hdfs_gg.events_mor;
+RESET gg_duckdb.iceberg_shard_min_rows;
+RESET gg_duckdb.iceberg_file_sharding;
+SET gg_duckdb.mode = off;
+
 \echo === the row estimate comes from the manifests, not from a scan
 ANALYZE hdfs_gg.events;
 SELECT reltuples::bigint AS estimate FROM pg_class WHERE oid = 'hdfs_gg.events'::regclass;

@@ -140,7 +140,9 @@ over float4/float8 inside regions, off: DuckDB's summation order differs, so
 the last digits of a float sum can differ from the standard executor's),
 `data_directories` and `http_proxy` (see the foreign data wrapper),
 `jvm_options`, `hadoop_conf_dir` and `kerberos_ccache` (the embedded JVM that
-reads HDFS, see Iceberg in a Hive Metastore), and the
+reads HDFS), `iceberg_file_sharding`, `iceberg_shard_min_rows` and
+`iceberg_max_shard_files` (the segments sharing a metastore table's files
+out; see Iceberg in a Hive Metastore), and the
 development aids `debug_wrap` and `debug_region_sql`.
 
 ## Hints
@@ -269,6 +271,31 @@ SET gg_duckdb.kerberos_ccache = '/tmp/krb5cc_gpadmin';
 SET gg_duckdb.data_directories = 'hdfs://nn.example:8020/';
 IMPORT FOREIGN SCHEMA "warehouse" FROM SERVER hms INTO lake;
 ```
+
+By default one segment reads a metastore table, through the catalog, at
+whatever snapshot it finds. With `gg_duckdb.iceberg_file_sharding` the
+segments share its data files out instead: while the statement is planned
+the coordinator makes one pass over the current snapshot's manifests,
+which fixes the snapshot, lists its data files and counts its rows, and
+the plan carries the list, so no segment reads a manifest or asks the
+metastore. Each segment then reads its share of the files as Parquet.
+Measured on a three-segment cluster against a 20 million row table:
+`count(*)` with a `sum` 2.5 times faster under the Postgres planner and
+1.7 times under GPORCA, a grouped aggregate 1.5 and 1.35 times.
+
+Three things follow, and they are why it is off by default. The snapshot
+is fixed when the statement is planned, so a statement whose plan is
+cached keeps reading the snapshot it was planned against, where the
+single reader always sees the newest. The pass over the manifests costs
+about as much as a small table's entire scan, so it is only made for
+tables of at least `gg_duckdb.iceberg_shard_min_rows` (a million by
+default; the same pass then also gives the planner a real row count) and
+at most `gg_duckdb.iceberg_max_shard_files` files, whose paths the plan
+has to carry. And a table that carries delete files, or whose schema has
+ever changed, is read by one segment through the catalog whatever the
+setting says: only the Iceberg reader applies a merge-on-read delete, and
+only it maps a file written under an older schema to the current one by
+field id.
 
 HDFS is reached through JNI libhdfs, which starts a **JVM inside the
 backend**: one per process, at the first HDFS or metastore access, never

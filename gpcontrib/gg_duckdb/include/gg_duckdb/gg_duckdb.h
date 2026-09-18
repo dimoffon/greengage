@@ -58,6 +58,9 @@ extern char *gg_duckdb_http_proxy;
 extern char *gg_duckdb_jvm_options;
 extern char *gg_duckdb_hadoop_conf_dir;
 extern char *gg_duckdb_kerberos_ccache;
+extern bool gg_duckdb_iceberg_file_sharding;
+extern int	gg_duckdb_iceberg_max_shard_files;
+extern int	gg_duckdb_iceberg_shard_min_rows;
 extern bool gg_duckdb_allow_float_aggregates;
 extern double gg_duckdb_cost_fixed;
 extern double gg_duckdb_cost_convert_factor;
@@ -161,7 +164,7 @@ extern Datum gg_duckdb_read_datum(const GGTypeInfo *ti, duckdb_type vt, int widt
 #define GG_DUCKDB_LEAF_FUNCTION		"gg_leaf"
 #define GG_DUCKDB_LEAF_PLACEHOLDER "_gg_row"
 #define GG_DUCKDB_REL_FUNCTION		"gg_rel"
-#define GG_DUCKDB_PRIVATE_VERSION	5
+#define GG_DUCKDB_PRIVATE_VERSION	6
 
 /*
  * Positions in CustomScan.custom_private, a flat List of Const (the only
@@ -304,11 +307,27 @@ extern void gg_duckdb_query_explain_end(GGDuckQuery *q, StringInfo buf);
  */
 #define GG_NATIVE_TOKEN_FMT "__GG_NATIVE_%d__"
 
+/*
+ * The snapshot of an Iceberg table every process reading it must use, and the
+ * metadata file it lives in, both resolved once by the coordinator when the
+ * statement is planned.  Without it two segments listing the table's files
+ * could land either side of a commit and return a mixture of two snapshots.
+ * A zero snapshot_id means no pin: the table is read whole, by one process,
+ * at whatever snapshot it finds.
+ */
+typedef struct GGIcebergPin
+{
+	char	   *metadata;		/* the table's metadata JSON */
+	int64		snapshot_id;
+	List	   *files;			/* of char *: the snapshot's data files, sorted */
+} GGIcebergPin;
+
 typedef struct GGNativeLeaf
 {
 	Oid			relid;			/* the foreign table */
 	char	   *reader;			/* "read_parquet(%s, ...)" with %s for the file list parameter */
 	char	   *empty;			/* the empty relation of the same columns */
+	GGIcebergPin pin;			/* the snapshot the coordinator fixed, if any */
 } GGNativeLeaf;
 
 typedef struct GGRegionState
@@ -432,6 +451,7 @@ typedef struct GGNativeScan
 	Index		scanrelid;		/* in: varno of the quals' Vars */
 	List	   *attnos;			/* in: fetched attributes, ascending */
 	List	   *quals;			/* in: quals DuckDB evaluates */
+	const GGIcebergPin *pin;	/* in: the snapshot to read, or NULL */
 	char	   *sql;			/* out: the scan query with the reader token */
 	char	   *reader;
 	char	   *empty;
@@ -446,10 +466,15 @@ extern bool gg_duckdb_native_scan_sql(GGNativeScan *ns, const char *token, List 
 extern bool gg_duckdb_native_qual_ok(Oid relid, Index scanrelid, List *attnos, Node *qual);
 
 /* fdw.c */
-extern List *gg_duckdb_native_files(Oid relid);
-extern bool gg_duckdb_native_describe(Oid relid, List *attnos, GGNativeInfo *info, const char **reject);
+extern List *gg_duckdb_native_files(Oid relid, const GGIcebergPin *pin);
+extern bool gg_duckdb_native_describe(Oid relid, List *attnos, const GGIcebergPin *pin,
+									  GGNativeInfo *info, const char **reject);
+extern bool gg_duckdb_iceberg_pin(Oid relid, GGIcebergPin *pin, int64 *total_rows);
+extern char *gg_duckdb_pin_files_text(List *files);
+extern List *gg_duckdb_pin_files_list(const char *text);
 extern bool gg_duckdb_is_native_scan(ForeignScan *fs, List *rtable);
-extern bool gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals);
+extern bool gg_duckdb_foreign_scan_private(ForeignScan *fs, List **attnos, List **quals,
+										   GGIcebergPin *pin);
 extern char *gg_duckdb_native_location_text(Oid relid);
 extern List *gg_duckdb_native_pre_sql(List *natives);
 

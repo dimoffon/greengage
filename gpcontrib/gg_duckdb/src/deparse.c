@@ -1389,7 +1389,7 @@ gg_duckdb_deparse_native_scan(DeparseCtx *ctx, GGNativeScan *ns, const char *tok
 	GGTypeInfo *saved_types = ctx->scan_types;
 	int			saved_natts = ctx->scan_natts;
 
-	if (!gg_duckdb_native_describe(ns->relid, ns->attnos, &info, &ns->reject))
+	if (!gg_duckdb_native_describe(ns->relid, ns->attnos, ns->pin, &info, &ns->reject))
 		REJECT(ctx, "%s", ns->reject);
 
 	initStringInfo(&inner);
@@ -1496,6 +1496,7 @@ deparse_native_leaf(DeparseCtx *ctx, ForeignScan *fs, StringInfo out, NodeCols *
 {
 	GGNativeScan ns;
 	GGNativeLeaf *nl;
+	GGIcebergPin pin;
 	RangeTblEntry *rte = rt_fetch(fs->scan.scanrelid, ctx->spec->rtable);
 	char	   *token;
 	StringInfoData proj;
@@ -1509,8 +1510,9 @@ deparse_native_leaf(DeparseCtx *ctx, ForeignScan *fs, StringInfo out, NodeCols *
 	memset(&ns, 0, sizeof(ns));
 	ns.relid = rte->relid;
 	ns.scanrelid = fs->scan.scanrelid;
-	if (!gg_duckdb_foreign_scan_private(fs, &ns.attnos, &ns.quals))
+	if (!gg_duckdb_foreign_scan_private(fs, &ns.attnos, &ns.quals, &pin))
 		REJECT(ctx, "foreign scan carries no native reader");
+	ns.pin = pin.snapshot_id != 0 ? &pin : NULL;
 	token = psprintf(GG_NATIVE_TOKEN_FMT, list_length(ctx->spec->natives));
 	if (!gg_duckdb_deparse_native_scan(ctx, &ns, token))
 		return false;
@@ -1570,6 +1572,7 @@ deparse_native_leaf(DeparseCtx *ctx, ForeignScan *fs, StringInfo out, NodeCols *
 	nl->relid = ns.relid;
 	nl->reader = ns.reader;
 	nl->empty = ns.empty;
+	nl->pin = pin;
 	ctx->spec->natives = lappend(ctx->spec->natives, nl);
 	ctx->spec->rows_in += fs->scan.plan.plan_rows;
 	ctx->spec->rows_native += fs->scan.plan.plan_rows;

@@ -143,6 +143,8 @@ gg_duckdb_make_private(const char *sql, int flags, List *leaves, const char *lab
 		priv = lappend(priv, make_int_const((int) nl->relid));
 		priv = lappend(priv, make_text_const(nl->reader));
 		priv = lappend(priv, make_text_const(nl->empty));
+		priv = lappend(priv, make_text_const(gg_duckdb_pin_files_text(nl->pin.files)));
+		priv = lappend(priv, make_text_const(psprintf(INT64_FORMAT, nl->pin.snapshot_id)));
 	}
 	return priv;
 }
@@ -267,7 +269,7 @@ region_create_state(CustomScan *cscan)
 		elog(ERROR, "gg_duckdb: malformed region node");
 	nnatives = private_int(priv, pos);
 	pos++;
-	if (list_length(priv) < pos + 3 * nnatives)
+	if (list_length(priv) < pos + 5 * nnatives)
 		elog(ERROR, "gg_duckdb: malformed region node");
 	for (i = 0; i < nnatives; i++)
 	{
@@ -276,8 +278,11 @@ region_create_state(CustomScan *cscan)
 		nl->relid = (Oid) private_int(priv, pos);
 		nl->reader = private_text(priv, pos + 1);
 		nl->empty = private_text(priv, pos + 2);
+		nl->pin.snapshot_id = strtoll(private_text(priv, pos + 4), NULL, 10);
+		if (nl->pin.snapshot_id != 0)
+			nl->pin.files = gg_duckdb_pin_files_list(private_text(priv, pos + 3));
 		st->natives = lappend(st->natives, nl);
-		pos += 3;
+		pos += 5;
 	}
 
 	return (Node *) st;
@@ -473,7 +478,8 @@ gg_duckdb_region_sql(const char *sql, List *natives, int nconst_params, bool res
 		GGNativeLeaf *nl = (GGNativeLeaf *) lfirst(lc);
 		char	   *token = psprintf(GG_NATIVE_TOKEN_FMT, i);
 		char	   *at = strstr(out.data, token);
-		List	   *files = resolve ? gg_duckdb_native_files(nl->relid) : NIL;
+		List	   *files = resolve ? gg_duckdb_native_files(nl->relid,
+															 nl->pin.snapshot_id != 0 ? &nl->pin : NULL) : NIL;
 		char	   *replacement;
 		StringInfoData rebuilt;
 
