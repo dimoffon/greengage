@@ -48,6 +48,11 @@ The extension is pure C against `libduckdb.so` (pinned: 1.5.5, built by
 `gpcontrib/gg_duckdb/duckdb/build.sh` with the `icu`, `json`, `parquet`,
 `core_functions` and, when asked, `httpfs`, `avro` and `iceberg` extensions statically
 linked; `configure --with-duckdb=PREFIX`; the library is installed into `$GPHOME/lib`).
+A build made with `DUCKDB_HDFS_DIR` links Arenadata's `duckdb-hdfs` instead of the
+upstream `iceberg` extension, which it contains as a fork: that build reads `hdfs://`
+and attaches a Hive Metastore (D7, and the JVM paragraph below), and packages the JNI
+runtime it needs into `PREFIX/lib/hdfs-runtime`, beside the library, where the extension
+finds it by `dladdr()` on its own code.
 It must be in `shared_preload_libraries`: the region plan node is resolved by name on the
 QE that receives the plan, so every process must know it.
 
@@ -64,6 +69,31 @@ external file access is off except for `gg_duckdb.data_directories` (applied as
 `allowed_directories`; a remote prefix such as `s3://` keeps external access on), and the
 HTTP proxy comes from `gg_duckdb.http_proxy`, never from the process environment. An
 instance that DuckDB invalidates after an INTERNAL error is reopened on next use.
+
+**Revised 2026-09-18 — a JVM in the backend.** HDFS is reached through JNI libhdfs,
+which creates a JVM inside the calling process: lazily at the first `hdfs://` or metastore
+access, once per process, never destroyed, and in every segment backend that reads HDFS.
+`gg_duckdb.jvm_options`, `gg_duckdb.hadoop_conf_dir` and `gg_duckdb.kerberos_ccache` are
+put into the environment in `open_instance()`, which cannot run in the postmaster, so a
+JVM can only appear after the fork; libhdfs reads them when it starts one.
+
+Three things had to be settled before this could be allowed in a backend, and all three
+were measured rather than assumed. **Signals:** HotSpot otherwise takes SIGINT, SIGTERM,
+SIGHUP and SIGQUIT, which PostgreSQL needs, and SIGUSR2, which a backend ignores and the
+postmaster sends its children; the default `jvm_options` pass `-Xrs` and the environment
+carries `_JAVA_SR_SIGNUM`, after which `/proc/<pid>/status` `SigCgt` shows the JVM adding
+only SIGPIPE, SIGXFSZ and that real-time signal. Greengage's own SIGSEGV handler survives
+too: a fault injected into a segment backend holding a JVM produced the usual PANIC with
+`StandardHandlerForSigillSigsegvSigbus_OnMainThread` on the stack and no JVM error file,
+so `libjsig` is not needed. **Memory:** a backend grows by about 106 MB of RSS and from 2
+to 14 threads with the shipped options (256 MB heap, serial GC, one compiler thread), and
+that memory is outside `gg_duckdb.max_memory`, which bounds DuckDB alone; on a host with
+strict overcommit it is charged to every backend that reads HDFS. **Cancellation:** a
+backend inside a Hadoop call is not interruptible. With Hadoop's default retry policy a
+connect to an unreachable name node ignored `pg_cancel_backend` *and*
+`pg_terminate_backend` for over eleven minutes; with a three second connect timeout and
+one retry the same read failed in seven. The client timeouts in the Hadoop configuration
+are what bounds a cancelled query, and the shipped test configuration sets them.
 
 **Why the C API.** It is DuckDB's stable client surface across minor versions and the
 announced 2.0 ABI freeze, works with a prebuilt shared library, and keeps the extension in
@@ -196,6 +226,39 @@ one file per segment and transaction for file tables (the location must be a pat
 one `*`), one `INSERT` and one snapshot from the coordinator for Iceberg catalog tables,
 which are therefore `mpp_execute 'coordinator'` and locked for the transaction, because
 DuckDB's Iceberg commits do not detect concurrent writers.
+
+**Revised 2026-09-18 — a Hive Metastore as a catalog.** A server with `hms_uri` attaches
+a Hive Metastore (`hms_conf` passes settings to the Java client verbatim, which is how
+SASL and the service principal are given, since the ATTACH has no option for them;
+`hms_config_dir`, `hdfs_user`, `hdfs_authentication` and `hdfs_conf` complete the
+identity), and a table whose `location` is `database.table` with `format 'iceberg'` is
+that metastore's table, read exactly as a REST catalog's is. A server names one catalog,
+not both. `IMPORT FOREIGN SCHEMA` over a metastore database creates a foreign table per
+**Iceberg** table and reports which others it skipped: only Iceberg tables are carried,
+and they are told apart by what the metastore says (an Iceberg table's storage location
+is repointed at its metadata JSON) rather than by opening them. A metastore table is read
+only; unlike the REST catalog, whose single-writer rule forces
+`mpp_execute 'coordinator'`, a metastore commit takes the metastore's own table lock, so
+several writers would be safe and writing is a matter of doing the work, not of a rule.
+
+Such a table is read by one segment, as a REST catalog's is, unless
+`gg_duckdb.iceberg_file_sharding` is on. Then the coordinator makes one pass over the
+current snapshot's manifests while the statement is planned, which fixes the snapshot,
+lists its data files and counts its rows; the plan carries the list, and each segment
+reads the files dealt to it as Parquet, asking neither the metastore nor a manifest. The
+snapshot must be fixed for them rather than found by each: two segments listing the table
+either side of a commit would return a mixture of two snapshots. **Accepted costs:** a
+statement whose plan is cached keeps reading the snapshot it was planned against, where
+the single reader always finds the newest — which is why this is off by default; and the
+manifest pass costs about as much as a small table's entire scan, so it is made only for
+tables of at least `iceberg_shard_min_rows` (a million) and at most
+`iceberg_max_shard_files` files, whose paths the plan has to carry. Measured on three
+segments against a 20 million row table: 2.5x under the Postgres planner and 1.7x under
+GPORCA for a count with a sum, 1.5x and 1.35x for a grouped aggregate, while a 400
+thousand row table took twice as long before the row floor existed. Two tables are never
+shared out whatever the settings say: one carrying delete files, since only the Iceberg
+reader applies a merge-on-read delete, and one whose schema has ever changed, since only
+it maps a file written under an older schema to the current one by field id.
 
 ### D8 — What stays out
 
@@ -478,12 +541,15 @@ any other partial aggregate whose transition state is internal, `avg` in the fin
 (it stays with the executor, whose scale rules it needs), float aggregates without the
 opt-in.
 
-**Foreign tables.** Formats other than Parquet, CSV, JSON and Iceberg; DuckDB-native
+**Foreign tables.** Formats other than Parquet, CSV, JSON and Iceberg (a Hive Metastore
+holds tables of every Hive format; only its Iceberg ones are read); DuckDB-native
 database files and attached databases as tables; Iceberg writes from more than one
-process (by design: single writer); Iceberg `UPDATE`/`DELETE`; row-group or data-file
-level sharding (sharding is per file, so one huge file is read by one segment); files
-outside `gg_duckdb.data_directories`; HNSW/vector indexes (the `vss` extension is not
-built and indexes only DuckDB-native tables).
+process (by design: single writer) and writes to a metastore table at all; Iceberg
+`UPDATE`/`DELETE`; row-group sharding (sharding is per file, so one huge file is read by
+one segment; a metastore Iceberg table's files are shared out between segments, see D7);
+files outside `gg_duckdb.data_directories`; HNSW/vector indexes (the `vss` extension is
+not built and indexes only DuckDB-native tables); Ozone (`ofs://`) and Paimon, which
+`duckdb-hdfs` can do but this build leaves out.
 
 **Runtime.** DuckDB worker threads (one thread per QE), per-allocation memory
 accounting, runtime fallback to the original subtree after a region has started, region
@@ -544,6 +610,17 @@ through user mappings.
   small (an actual bind failure) and turns it into "no region".
 - **Store data in DuckDB** (tables, database files). Out of scope: the extension is an
   executor and a reader, not a storage engine.
+- **List a sharded Iceberg table's files on each segment** rather than in the plan.
+  Rejected on measurement: reading the manifests is what the listing costs, and paying it
+  per segment made a small table twice as slow and left a large one barely faster than
+  one reader.
+- **Map a sharded table's files by field id** (`read_parquet`'s `schema` argument, which
+  this build accepts) so that a table whose schema has changed could be shared out too.
+  Deferred: it needs the current schema's field ids and their DuckDB types out of the
+  metadata; until then such a table falls back to the Iceberg reader, which is correct
+  and slower.
+- **`libjsig` for signal chaining** under the embedded JVM. Not needed: with `-Xrs` the
+  backend's own SIGSEGV handler still runs (D1).
 
 ---
 

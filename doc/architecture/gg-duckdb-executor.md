@@ -159,7 +159,46 @@ deferred) — M7 writes (INSERT into file tables and Iceberg catalog tables). Ou
 through DuckDB, MotherDuck, runtime fallback to the original subtree. Direct scans
 (2026-09-15): heap and append-optimized tables under a region's sequential scans are read
 directly, GPORCA's Dynamic Seq Scans partition by partition; bulk AOCO block decoding is
-next.
+next. HDFS and the Hive Metastore (2026-09-18): an ADH lake's Iceberg tables are read
+through `duckdb-hdfs` and a JVM in the backend, with their files optionally shared out
+between the segments.
+
+## HDFS and Hive Metastore findings (2026-09-18)
+
+Reading an ADH lake: Iceberg tables registered in a Hive Metastore, data on HDFS, through
+Arenadata's `duckdb-hdfs` linked into `libduckdb.so` (`DUCKDB_HDFS_DIR`, which also
+replaces the upstream iceberg extension with the fork inside it). The extension's own
+DuckDB pin moved 1.5.4 -> 1.5.5 with no source change.
+
+- **The JVM is the integration.** libhdfs creates one inside the backend, lazily and once
+  per process. Measured: `-Xrs` plus `_JAVA_SR_SIGNUM` leave PostgreSQL's signals alone
+  (the JVM adds only SIGPIPE, SIGXFSZ and the moved suspend signal to `SigCgt`), a SIGSEGV
+  in a JVM-carrying segment still produces Greengage's PANIC and stack trace with no JVM
+  error file, and a backend costs about 106 MB of RSS and twelve extra threads more than
+  before. A backend inside a Hadoop call cannot be cancelled or terminated: with Hadoop's
+  defaults an unreachable name node held one for eleven minutes, with a three second
+  connect timeout seven seconds. Client timeouts are the only bound.
+- **A metastore is a catalog** (`hms_uri` on the server, `database.table` as the
+  location), attached per server and backend as the REST catalog is. IMPORT carries the
+  Iceberg tables and names the rest. Reads only.
+- **Sharing a table's files out** (`gg_duckdb.iceberg_file_sharding`, off by default)
+  turns one segment reading a table into three reading a third of it each: 2.5x under the
+  planner and 1.7x under GPORCA for a count with a sum over 20 million rows, 1.5x and
+  1.35x for a grouped aggregate. What made it work was moving the manifest pass to the
+  coordinator, into the size estimate, and making it once per plan: listing per segment
+  made a 400 thousand row table twice as slow, and the pass made per query but then
+  refused cost as much again. The snapshot is fixed by that pass so every segment reads
+  one, which a cached plan then holds on to.
+- **`baserel->tuples` is not zero for a foreign table**: the planner's own guess (39900
+  here) is already there, so an estimate written as "only when there are no statistics"
+  never runs. The metastore row count is taken in the pass that sharding needs anyway.
+- **ANALYZE of a catalog table never worked**, in this catalog or the REST one: the
+  sampling queries bound a file list into a reader that is an attached table's name with
+  no parameter. Found by running it; fixed.
+- The stand is seven services of the ADH 4.3 demo compose project, kerberized as it
+  ships, in `test/hdfs`. It needs no root: the backend's JVM resolves the stand's names
+  from a hosts file of ours (`-Djdk.net.hosts.file`), and the ticket comes from `kinit`
+  inside the KDC container.
 
 ## Direct scans findings (2026-09-15)
 
@@ -595,9 +634,10 @@ next.
   it on the coordinator. A table read by its directory needs DuckDB's
   `unsafe_enable_version_guessing` (catalog-written tables have no `version-hint.text`;
   DuckDB picks the lexicographically newest `metadata/*.metadata.json`), which the scan's
-  connection sets; a metadata file as the location reads exactly that version. Sharding
-  an Iceberg table by data file (possible when its snapshot carries no delete files) and
-  reading through a REST catalog (`ATTACH ... (TYPE ICEBERG)`) are later refinements.
+  connection sets; a metadata file as the location reads exactly that version. Reading
+  through a REST catalog (`ATTACH ... (TYPE ICEBERG)`) was added after this, and sharding
+  an Iceberg table by data file after that, for tables of a Hive Metastore (see the HDFS
+  and Hive Metastore findings).
   Verified against the stack under both optimizers: six Parquet parts read by three
   segments with none read twice, results equal to the reference through the scan and
   through regions, CSV and JSON, the Iceberg table's current snapshot (5900 rows after
