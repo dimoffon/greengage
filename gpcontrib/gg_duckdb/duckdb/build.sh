@@ -12,7 +12,7 @@
 # built in), DUCKDB_REMOTE_EXTENSIONS (1: also link httpfs, avro and iceberg
 # from extensions.cmake, fetched from GitHub at the pinned commits) and
 # DUCKDB_VCPKG (the vcpkg checkout their native dependencies come from:
-# OpenSSL, curl, the AWS SDK, avro-c, roaring; DuckDB 1.5.5 expects vcpkg at
+# OpenSSL, curl, the AWS SDK, avro-c, roaring; DuckDB 1.5.4 expects vcpkg at
 # tag 2025.12.12, bootstrapped, and the build then takes long).
 #
 # DUCKDB_HDFS_DIR (a duckdb-hdfs checkout, with DUCKDB_HDFS_HADOOP_JOBS

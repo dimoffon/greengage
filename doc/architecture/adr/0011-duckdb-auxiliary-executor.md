@@ -44,7 +44,7 @@ and exact results. Four constraints shaped the answer:
 
 ### D1 — DuckDB is embedded in each backend through its C API, one instance per process, driven only by the backend thread
 
-The extension is pure C against `libduckdb.so` (pinned: 1.5.5, built by
+The extension is pure C against `libduckdb.so` (pinned: 1.5.4, built by
 `gpcontrib/gg_duckdb/duckdb/build.sh` with the `icu`, `json`, `parquet`,
 `core_functions` and, when asked, `httpfs`, `avro` and `iceberg` extensions statically
 linked; `configure --with-duckdb=PREFIX`; the library is installed into `$GPHOME/lib`).

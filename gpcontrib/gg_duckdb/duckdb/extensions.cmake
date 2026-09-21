@@ -2,12 +2,12 @@
 # DUCKDB_REMOTE_EXTENSIONS=1.  A configuration file replaces DuckDB's default
 # list, so the in-tree ones every build needs come first; then httpfs (S3 and
 # HTTP file systems), avro and iceberg (Apache Iceberg tables), out of tree
-# at the commits DuckDB v1.5.5 pins in .github/config/extensions/*.cmake.
+# at the commits DuckDB v1.5.4 pins in .github/config/extensions/*.cmake.
 duckdb_extension_load(core_functions)
 duckdb_extension_load(parquet)
 duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 827222fb45a043a7a852d1f7aae46901492a3cda
+    GIT_TAG c3f215ab360f04dc3d3d5305fa81849c0121f111
 )
 
 if(DEFINED ENV{DUCKDB_HDFS_DIR})
@@ -35,6 +35,6 @@ else()
     )
     duckdb_extension_load(iceberg
         GIT_URL https://github.com/duckdb/duckdb-iceberg
-        GIT_TAG 45163a28e0ed6a2071a82a1bf1dd432d0216cf9c
+        GIT_TAG e6fe0a4b28ed13f4a1ae5c7e12bad338c6fc13c7
     )
 endif()

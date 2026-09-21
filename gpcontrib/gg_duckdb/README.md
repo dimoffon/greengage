@@ -70,8 +70,8 @@ DuckDB is built once, from the release pinned in `duckdb/duckdb.version`, into a
 prefix, and the tree is configured against that prefix:
 
 ```sh
-gpcontrib/gg_duckdb/duckdb/build.sh $HOME/duckdb-1.5.5      # cmake + make/ninja, ~15 min
-./configure ... --with-duckdb=$HOME/duckdb-1.5.5
+gpcontrib/gg_duckdb/duckdb/build.sh $HOME/duckdb-1.5.4      # cmake + make/ninja, ~15 min
+./configure ... --with-duckdb=$HOME/duckdb-1.5.4
 make && make install                                       # copies libduckdb.so into $GPHOME/lib
 ```
 
@@ -79,14 +79,14 @@ Without `--with-duckdb` the directory is skipped entirely. `build.sh` builds the
 `core_functions`, `parquet`, `icu` and `json` extensions statically, disables
 runtime extension loading, sanitizers and `OVERRIDE_NEW_DELETE`, and keeps the
 DuckDB CLI in `PREFIX/bin` for data generation. For S3 and Apache Iceberg
-add DuckDB's `httpfs`, `avro` and `iceberg` extensions at the commits 1.5.5
+add DuckDB's `httpfs`, `avro` and `iceberg` extensions at the commits 1.5.4
 pins (`duckdb/extensions.cmake`); their native dependencies come from vcpkg
 at the tag DuckDB pins, and the static archives' symbols are hidden so the
 bundled OpenSSL and curl never meet the backend's own:
 
 ```sh
 git clone --branch 2025.12.12 https://github.com/microsoft/vcpkg $HOME/vcpkg && $HOME/vcpkg/bootstrap-vcpkg.sh -disableMetrics
-DUCKDB_REMOTE_EXTENSIONS=1 DUCKDB_VCPKG=$HOME/vcpkg gpcontrib/gg_duckdb/duckdb/build.sh $HOME/duckdb-1.5.5   # ~15 min more
+DUCKDB_REMOTE_EXTENSIONS=1 DUCKDB_VCPKG=$HOME/vcpkg gpcontrib/gg_duckdb/duckdb/build.sh $HOME/duckdb-1.5.4   # ~15 min more
 ```
 
 ## Running

@@ -167,8 +167,19 @@ between the segments.
 
 Reading an ADH lake: Iceberg tables registered in a Hive Metastore, data on HDFS, through
 Arenadata's `duckdb-hdfs` linked into `libduckdb.so` (`DUCKDB_HDFS_DIR`, which also
-replaces the upstream iceberg extension with the fork inside it). The extension's own
-DuckDB pin moved 1.5.4 -> 1.5.5 with no source change.
+replaces the upstream iceberg extension with the fork inside it). One `libduckdb.so`
+has to carry both, so the two DuckDB pins must agree: this extension moved 1.5.5 ->
+1.5.4 to meet `duckdb-hdfs` where it already is. The direction is deliberate — the
+shared extension is what other connectors link against, and bumping it would force
+their binaries and packages to be rebuilt, while `gg_duckdb` is new and costs nothing
+to move. No source change was needed in either direction: the 1.5.4/1.5.5 difference
+is confined to storage, transaction and compression internals, and the C API surface
+used here (table-function registration, prepared statements, pending results,
+streaming chunks, vectors and validity) is identical in the two releases. Checked
+rather than assumed: the whole C API delta is three new `duckdb_statement_type`
+enum values and an exception guard in `duckdb_scalar_function_bind_get_argument`,
+every `duckdb_*` symbol this extension uses exists in 1.5.4's header, and on 1.5.4
+regress is 11/11 and isolation2 10/10 under both optimizers.
 
 - **The JVM is the integration.** libhdfs creates one inside the backend, lazily and once
   per process. Measured: `-Xrs` plus `_JAVA_SR_SIGNUM` leave PostgreSQL's signals alone
@@ -530,7 +541,8 @@ DuckDB pin moved 1.5.4 -> 1.5.5 with no source change.
   suite restarts the cluster around itself like the regress suite does, and its
   answer files are the same under both optimizers.
 - **DuckDB 2.0 has not shipped** (checked 2026-09-10: the newest release is 1.5.5 of
-  2026-07-22; no 2.0 tag or release candidate). The pin stays at 1.5.5; the C-API
+  2026-07-22; no 2.0 tag or release candidate). The pin is 1.5.4, held there by
+  `duckdb-hdfs` rather than by anything in this extension (2026-09-18); the C-API
   surface in use is the table-function registration, prepared statements with bound
   values (LIST included), pending results, streaming chunks, vectors and validity, all
   of which are in the documented stable subset. Per-allocation memory accounting (D5)
@@ -612,7 +624,7 @@ DuckDB pin moved 1.5.4 -> 1.5.5 with no source change.
   sharding of a single large file, writes through DuckDB.
 - **S3 and Apache Iceberg.** `duckdb/build.sh` with `DUCKDB_REMOTE_EXTENSIONS=1` and
   `DUCKDB_VCPKG=<checkout>` links DuckDB's `httpfs`, `avro` and `iceberg` extensions at
-  the commits 1.5.5 pins; their native dependencies (OpenSSL, curl, the AWS SDK, avro-c,
+  the commits 1.5.4 pins; their native dependencies (OpenSSL, curl, the AWS SDK, avro-c,
   roaring) come from vcpkg at the tag DuckDB pins, as in DuckDB's own extension builds
   (`httpfs` insists on a static OpenSSL, so vcpkg's 3.6 is linked in; the library is
   linked with `--exclude-libs,ALL`, which leaves the 1300 `duckdb_*` C API symbols

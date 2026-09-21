@@ -1,3 +1,9 @@
 # Pinned DuckDB release built by build.sh for --with-duckdb=PREFIX.
-DUCKDB_VERSION=v1.5.5
-DUCKDB_SHA256=f33155ff962e6e1e08fd1e9caffa487d4325aa60999e2eabc76feff534d6558b
+#
+# 1.5.4, not the newer 1.5.5, because duckdb-hdfs pins 1.5.4 and one
+# libduckdb.so carries both: the extension is shared with connectors whose
+# binaries and packages a bump would force to be rebuilt, while this
+# extension is new and cheap to move.  The C API surface used here is
+# identical in the two releases.
+DUCKDB_VERSION=v1.5.4
+DUCKDB_SHA256=99c36e4bf415f295e19ed67401adb72e075e63e6a0dc3a14312c986e29781fd0
